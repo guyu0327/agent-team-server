@@ -27,9 +27,12 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -52,6 +55,8 @@ public class OrchestrationService {
     private final ConversationService conversationService;
     private final AgentModelFactory modelFactory;
     private final WorkspaceFileTools fileTools;
+    /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
+    private final Map<String, RunHandle> runs = new ConcurrentHashMap<>();
 
     public OrchestrationService(AgentRepository agents, ConversationMemberRepository members,
                                 ConversationStreamSupport support, ConversationService conversationService,
@@ -68,13 +73,16 @@ public class OrchestrationService {
         List<Agent> team = teamPool(conv, orchestrator);
         ConversationStreamSupport.SegState seg = new ConversationStreamSupport.SegState();
         AtomicBoolean finished = new AtomicBoolean(false);
+        RunHandle handle = new RunHandle();
+        handle.keys.add(conv.getId());
+        runs.put(conv.getId(), handle);
         // 协作目标会话：默认是当前会话，create_team 后切到项目群
         AtomicReference<Conversation> target = new AtomicReference<>(conv);
         AtomicReference<String> createdGroupId = new AtomicReference<>();
 
         Toolkit toolkit = new Toolkit();
         toolkit.registerTool(fileTools);
-        toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId));
+        toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId, handle));
 
         sendCoordination(emitter, "coordination_start", orchestrator, conv.getId());
 
@@ -87,6 +95,7 @@ public class OrchestrationService {
                 .build()) {
             agent.streamEvents(support.historyMsgs(conv.getId()))
                     .doOnNext(e -> {
+                        if (handle.cancelled.get()) throw new CancelledException();
                         if (e.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
                             if (finished.get()) return;
                             String delta = ((TextBlockDeltaEvent) e).getDelta();
@@ -105,7 +114,18 @@ public class OrchestrationService {
             support.closeSegment(emitter, target.get(), orchestrator, seg);
         } catch (UncheckedIOException e) {
             // 客户端断开，SSE 已不可用
+            handle.keys.forEach(runs::remove);
             throw e;
+        } catch (CancelledException e) {
+            support.closeSegment(emitter, target.get(), orchestrator, seg);
+            // finish 已提交过总结就不补终止提示，避免画蛇添足
+            if (!finished.get()) {
+                support.persistError(conv, orchestrator, "协作已被用户手动终止");
+                support.send(emitter, "reply_error", Map.of(
+                        "agentId", orchestrator.getId(),
+                        "error", "协作已被用户手动终止",
+                        "conversationId", conv.getId()));
+            }
         } catch (Exception e) {
             support.closeSegment(emitter, target.get(), orchestrator, seg);
             String err = ConversationStreamSupport.isBlockingTimeout(e) ? "编排超时，已中止"
@@ -121,6 +141,26 @@ public class OrchestrationService {
         if (groupId != null) {
             sendCoordination(emitter, "coordination_end", orchestrator, groupId);
         }
+        handle.keys.forEach(runs::remove);
+    }
+
+    /** 终止指定会话进行中的编排协作，返回是否找到了运行中的协作 */
+    public boolean stop(String conversationId) {
+        RunHandle handle = runs.get(conversationId);
+        if (handle == null) return false;
+        handle.cancelled.set(true);
+        return true;
+    }
+
+    /** 一次编排运行的取消句柄：cancelled 置位后，流式回调在下一个事件处中止 */
+    private static final class RunHandle {
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        /** 该运行注册过的所有会话ID（发起请求的单聊 + 协作中创建的项目群） */
+        final Set<String> keys = ConcurrentHashMap.newKeySet();
+    }
+
+    /** 用户终止协作时向流中抛出的控制流异常 */
+    private static final class CancelledException extends RuntimeException {
     }
 
     /** 协调状态事件：客户端断开后静默忽略 */
@@ -158,7 +198,7 @@ public class OrchestrationService {
                 .append("），职责是理解用户需求，协调团队成员分工完成，并给出最终总结。\n")
                 .append("协作规范：\n")
                 .append("1. 先调用 list_team 了解可委派的成员及其职责。\n")
-                .append("2. 如果任务需要多个成员配合，先调用 create_team 把所需成员拉进项目群，之后协作过程在群里进行；简单任务无需建群。\n")
+                .append("2. 只要本次任务需要 2 个及以上成员配合（例如一人开发、另一人测试或评审），就必须在第一次 delegate 之前先调用 create_team 创建项目群，之后所有安排和委派都在群里进行。只有确定全程只需要 1 个成员独立完成时，才可以不建群。\n")
                 .append("3. 把需求拆解为子任务，用 delegate 依次委派给合适的成员；任务描述要完整明确，包含必要的上下文、要求和期望产出。\n")
                 .append("4. 成员的输出会直接展示给用户，不要复述成员的完整输出；你只需在每次委派前后简短说明你的安排和判断。\n")
                 .append("5. 单次只委派一个成员，等他的结果返回后再决定下一步（例如先实现再验证）。\n");
@@ -185,10 +225,13 @@ public class OrchestrationService {
         private final ConversationStreamSupport.SegState seg;
         private final AtomicBoolean finished;
         private final AtomicReference<String> createdGroupId;
+        private final RunHandle handle;
+        /** 本次协作已委派过的成员 ID：用于强制「单聊未建群时只能委派一个成员」 */
+        private final Set<String> delegatedMembers = new LinkedHashSet<>();
 
         TeamTools(SseEmitter emitter, Conversation originConv, AtomicReference<Conversation> target,
                   Agent orchestrator, List<Agent> team, ConversationStreamSupport.SegState seg,
-                  AtomicBoolean finished, AtomicReference<String> createdGroupId) {
+                  AtomicBoolean finished, AtomicReference<String> createdGroupId, RunHandle handle) {
             this.emitter = emitter;
             this.originConv = originConv;
             this.target = target;
@@ -197,6 +240,7 @@ public class OrchestrationService {
             this.seg = seg;
             this.finished = finished;
             this.createdGroupId = createdGroupId;
+            this.handle = handle;
         }
 
         @Tool(name = "list_team", description = "查看当前可委派的团队成员名单及其职责", readOnly = true)
@@ -216,8 +260,9 @@ public class OrchestrationService {
         }
 
         @Tool(name = "create_team", description =
-                "创建一个项目群，把完成该任务所需的成员拉进群里协作。创建后你的安排和委派的成员输出都会展示在群里，"
-                        + "最终总结仍会发回用户发起请求的会话。适合需要多个成员配合的复杂任务；简单任务无需建群")
+                "创建一个项目群，把完成该任务所需的成员拉进群里协作。需要 2 个及以上成员配合的任务必须先创建项目群再开始委派"
+                        + "（例如开发完成后需要另一个人测试或评审）。创建后你的安排和委派的成员输出都会展示在群里，"
+                        + "最终总结仍会发回用户发起请求的会话")
         public String createTeam(
                 @ToolParam(name = "name", required = true, description = "群名称，简洁明了，如：排序功能开发群") String name,
                 @ToolParam(name = "members", required = true, description = "要拉入群的成员名称，多个用逗号分隔，必须来自 list_team 名单") String members) {
@@ -252,6 +297,9 @@ public class OrchestrationService {
             ConversationDto dto = conversationService.createGroup(
                     originConv.getUserId(), new GroupChatRequest(name.trim(), memberIds));
             createdGroupId.set(dto.id());
+            // 项目群也纳入终止注册表：在群里也能终止本次协作
+            handle.keys.add(dto.id());
+            runs.put(dto.id(), handle);
             target.set(conversationService.getEntity(dto.id()));
             support.send(emitter, "conversation_created", dto);
             sendCoordination(emitter, "coordination_start", orchestrator, dto.id());
@@ -278,6 +326,14 @@ public class OrchestrationService {
                 String names = team.stream().map(Agent::getName).collect(Collectors.joining("、"));
                 return "找不到成员「" + member + "」。可用成员：" + (names.isEmpty() ? "（无）" : names);
             }
+            // 硬性约束：单聊未建群时只允许委派同一个成员，引入第二个成员必须先 create_team
+            if ("single".equals(originConv.getType()) && createdGroupId.get() == null
+                    && team.size() > 1 && !delegatedMembers.isEmpty()
+                    && !delegatedMembers.contains(targetAgent.getId())) {
+                return "单聊中只能委派一个成员。要引入其他成员协作，必须先调用 create_team 创建项目群，"
+                        + "把所需成员拉进群后再继续委派。";
+            }
+            delegatedMembers.add(targetAgent.getId());
             Conversation conv = target.get();
             Optional<ModelPreset> p = support.presetOf(targetAgent);
             if (p.isEmpty() || support.isBlank(p.get().getApiKey()) || support.isBlank(p.get().getBaseUrl())) {
@@ -312,6 +368,7 @@ public class OrchestrationService {
                     .build()) {
                 memberAgent.streamEvents(new UserMessage(task))
                         .doOnNext(ev -> {
+                            if (handle.cancelled.get()) throw new CancelledException();
                             if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
                                 String d = ((TextBlockDeltaEvent) ev).getDelta();
                                 acc.append(d);
@@ -326,6 +383,26 @@ public class OrchestrationService {
                         .blockLast(MEMBER_TIMEOUT);
             } catch (UncheckedIOException e) {
                 throw e;
+            } catch (CancelledException e) {
+                // 用户终止：保留成员已流出的部分内容，无内容则标记为错误
+                if (acc.isEmpty()) {
+                    support.markError(placeholder, "（协作已被用户终止）");
+                    support.send(emitter, "reply_error", Map.of(
+                            "messageId", placeholder.getId(),
+                            "agentId", targetAgent.getId(),
+                            "error", "协作已被用户终止",
+                            "conversationId", conv.getId()));
+                } else {
+                    placeholder.setContent(acc.toString());
+                    support.persist(placeholder);
+                    support.touchConversation(conv, targetAgent, acc.toString());
+                    support.send(emitter, "reply_end", Map.of(
+                            "messageId", placeholder.getId(),
+                            "agentId", targetAgent.getId(),
+                            "content", acc.toString(),
+                            "conversationId", conv.getId()));
+                }
+                return "协作已被用户终止。";
             } catch (Exception e) {
                 String err = ConversationStreamSupport.isBlockingTimeout(e) ? "执行超时"
                         : (e.getMessage() == null ? e.toString() : e.getMessage());

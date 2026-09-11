@@ -15,6 +15,7 @@ import com.guyu.agentteam.entity.Message;
 import com.guyu.agentteam.service.ChatStreamService;
 import com.guyu.agentteam.service.ConversationService;
 import com.guyu.agentteam.service.MessageService;
+import com.guyu.agentteam.service.orchestration.OrchestrationService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -39,12 +40,14 @@ public class ConversationController {
     private final ConversationService conversationService;
     private final MessageService messageService;
     private final ChatStreamService chatStreamService;
+    private final OrchestrationService orchestrationService;
 
     public ConversationController(ConversationService conversationService, MessageService messageService,
-                                  ChatStreamService chatStreamService) {
+                                  ChatStreamService chatStreamService, OrchestrationService orchestrationService) {
         this.conversationService = conversationService;
         this.messageService = messageService;
         this.chatStreamService = chatStreamService;
+        this.orchestrationService = orchestrationService;
     }
 
     @GetMapping
@@ -122,5 +125,11 @@ public class ConversationController {
         SseEmitter emitter = new SseEmitter(0L);
         chatStreamService.stream(emitter, conv, userMsg);
         return emitter;
+    }
+
+    /** 终止该会话进行中的编排协作（在协作创建的项目群里调用同样有效） */
+    @PostMapping("/{id}/stop")
+    public Map<String, Object> stop(@PathVariable String id) {
+        return Map.of("stopped", orchestrationService.stop(id));
     }
 }
