@@ -1,3 +1,18 @@
+server:
+  port: 8080
+
 spring:
-  application:
-    name: agent-team-server
+  datasource:
+    url: jdbc:mysql://localhost:3306/agent_team?characterEncoding=UTF-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
+    username: root
+    password: "123456"
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none
+
+# 智能体文件工具的工作区根目录（沙箱）：所有文件操作只能发生在这个目录内
+app:
+  workspace:
+    root: ./workspace

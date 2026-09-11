@@ -4,6 +4,12 @@ target/
 !**/src/main/**/target/
 !**/src/test/**/target/
 
+# Maven / Gradle local
+!.mvn/wrapper/maven-wrapper.properties
+.mvn/timing.properties
+.flattened-pom.xml
+dependency-reduced-pom.xml
+
 ### STS ###
 .apt_generated
 .classpath
@@ -31,3 +37,19 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Environment files ###
+.env
+.env.*
+!.env.example
+
+### JVM / logs ###
+*.log
+logs/
+hs_err_pid*
+replay_pid*
+.attach_pid*
+.java-version
+
+### agent workspace ###
+/workspace/

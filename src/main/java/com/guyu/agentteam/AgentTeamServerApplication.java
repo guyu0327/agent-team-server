@@ -9,5 +9,4 @@ public class AgentTeamServerApplication {
     public static void main(String[] args) {
         SpringApplication.run(AgentTeamServerApplication.class, args);
     }
-
 }
