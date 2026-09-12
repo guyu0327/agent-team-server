@@ -4,16 +4,21 @@ import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.common.CurrentUser;
 import com.guyu.agentteam.dto.AddMembersRequest;
 import com.guyu.agentteam.dto.ConversationDto;
+import com.guyu.agentteam.dto.FileGrantDto;
+import com.guyu.agentteam.dto.GrantFilesRequest;
 import com.guyu.agentteam.dto.GroupChatRequest;
 import com.guyu.agentteam.dto.MessagePageDto;
+import com.guyu.agentteam.dto.ModeRequest;
 import com.guyu.agentteam.dto.NameRequest;
 import com.guyu.agentteam.dto.PinRequest;
 import com.guyu.agentteam.dto.SendRequest;
 import com.guyu.agentteam.dto.SingleChatRequest;
 import com.guyu.agentteam.entity.Conversation;
+import com.guyu.agentteam.entity.ConversationFileGrant;
 import com.guyu.agentteam.entity.Message;
 import com.guyu.agentteam.service.ChatStreamService;
 import com.guyu.agentteam.service.ConversationService;
+import com.guyu.agentteam.service.FileGrantService;
 import com.guyu.agentteam.service.MessageService;
 import com.guyu.agentteam.service.orchestration.OrchestrationService;
 import org.springframework.http.HttpStatus;
@@ -41,13 +46,16 @@ public class ConversationController {
     private final MessageService messageService;
     private final ChatStreamService chatStreamService;
     private final OrchestrationService orchestrationService;
+    private final FileGrantService fileGrantService;
 
     public ConversationController(ConversationService conversationService, MessageService messageService,
-                                  ChatStreamService chatStreamService, OrchestrationService orchestrationService) {
+                                  ChatStreamService chatStreamService, OrchestrationService orchestrationService,
+                                  FileGrantService fileGrantService) {
         this.conversationService = conversationService;
         this.messageService = messageService;
         this.chatStreamService = chatStreamService;
         this.orchestrationService = orchestrationService;
+        this.fileGrantService = fileGrantService;
     }
 
     @GetMapping
@@ -75,6 +83,13 @@ public class ConversationController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void pin(@PathVariable String id, @RequestBody PinRequest req) {
         conversationService.setPinned(id, req.pinned());
+    }
+
+    /** 群聊聊天模式：passive（@谁谁回）| free（成员接龙自由讨论） */
+    @PutMapping("/{id}/mode")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void setMode(@PathVariable String id, @RequestBody ModeRequest req) {
+        conversationService.setMode(id, req.mode());
     }
 
     @PostMapping("/{id}/read")
@@ -117,19 +132,47 @@ public class ConversationController {
      */
     @PostMapping(value = "/{id}/messages", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter send(@PathVariable String id, @RequestBody SendRequest req) {
-        if (req == null || req.content() == null || req.content().isBlank()) {
+        List<String> paths = req == null || req.attachments() == null ? List.of()
+                : req.attachments().stream().map(SendRequest.AttachmentInput::path).toList();
+        boolean hasContent = req != null && req.content() != null && !req.content().isBlank();
+        if (!hasContent && paths.isEmpty()) {
             throw ApiException.badRequest("消息内容不能为空");
         }
         Conversation conv = conversationService.getEntity(id);
-        Message userMsg = messageService.createUserMessage(conv, req.content().trim());
+        long now = System.currentTimeMillis();
+        // 附件全部校验通过才继续：任何一个路径无效都直接拒绝，避免半发送状态
+        List<ConversationFileGrant> grants = paths.stream()
+                .map(p -> fileGrantService.validate(conv.getId(), p, now))
+                .toList();
+        if (!grants.isEmpty()) {
+            fileGrantService.registerAll(grants);
+        }
+        Message userMsg = messageService.createUserMessage(conv, hasContent ? req.content().trim() : "", grants);
         SseEmitter emitter = new SseEmitter(0L);
         chatStreamService.stream(emitter, conv, userMsg);
         return emitter;
     }
 
-    /** 终止该会话进行中的编排协作（在协作创建的项目群里调用同样有效） */
+    /** 本会话已授权的文件/目录（智能体文件工具可读写的范围） */
+    @GetMapping("/{id}/files")
+    public List<FileGrantDto> listFiles(@PathVariable String id) {
+        return fileGrantService.list(id);
+    }
+
+    /** 登记文件/目录授权（文件选择弹窗中撤销前的单独授权） */
+    @PostMapping("/{id}/files")
+    public List<FileGrantDto> grantFiles(@PathVariable String id, @RequestBody GrantFilesRequest req) {
+        return fileGrantService.grant(id, req.paths());
+    }
+
+    @DeleteMapping("/{id}/files")
+    public Map<String, Object> revokeFile(@PathVariable String id, @RequestParam String path) {
+        return Map.of("deleted", fileGrantService.revoke(id, path));
+    }
+
+    /** 终止该会话进行中的编排协作或自由讨论（在协作创建的项目群里调用同样有效） */
     @PostMapping("/{id}/stop")
     public Map<String, Object> stop(@PathVariable String id) {
-        return Map.of("stopped", orchestrationService.stop(id));
+        return Map.of("stopped", orchestrationService.stop(id) | chatStreamService.stop(id));
     }
 }

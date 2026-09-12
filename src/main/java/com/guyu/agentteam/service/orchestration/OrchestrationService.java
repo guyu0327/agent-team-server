@@ -11,6 +11,7 @@ import com.guyu.agentteam.repository.AgentRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.service.ConversationService;
 import com.guyu.agentteam.service.ConversationStreamSupport;
+import com.guyu.agentteam.service.FileGrantService;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.ReActAgent;
 import io.agentscope.core.event.AgentEventType;
@@ -55,18 +56,21 @@ public class OrchestrationService {
     private final ConversationService conversationService;
     private final AgentModelFactory modelFactory;
     private final WorkspaceFileTools fileTools;
+    private final FileGrantService fileGrants;
     /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
     private final Map<String, RunHandle> runs = new ConcurrentHashMap<>();
 
     public OrchestrationService(AgentRepository agents, ConversationMemberRepository members,
                                 ConversationStreamSupport support, ConversationService conversationService,
-                                AgentModelFactory modelFactory, WorkspaceFileTools fileTools) {
+                                AgentModelFactory modelFactory, WorkspaceFileTools fileTools,
+                                FileGrantService fileGrants) {
         this.agents = agents;
         this.members = members;
         this.support = support;
         this.conversationService = conversationService;
         this.modelFactory = modelFactory;
         this.fileTools = fileTools;
+        this.fileGrants = fileGrants;
     }
 
     public void run(SseEmitter emitter, Conversation conv, Agent orchestrator, ModelPreset preset) {
@@ -81,14 +85,15 @@ public class OrchestrationService {
         AtomicReference<String> createdGroupId = new AtomicReference<>();
 
         Toolkit toolkit = new Toolkit();
-        toolkit.registerTool(fileTools);
+        // 文件工具作用域跟随当前协作目标会话：建群前用发起会话授权，建群后切到项目群，群里的撤销立即生效
+        toolkit.registerTool(fileTools.scoped(() -> target.get().getId()));
         toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId, handle));
 
         sendCoordination(emitter, "coordination_start", orchestrator, conv.getId());
 
         try (ReActAgent agent = ReActAgent.builder()
                 .name(orchestrator.getName())
-                .sysPrompt(buildSysPrompt(orchestrator, team))
+                .sysPrompt(buildSysPrompt(orchestrator, team, conv.getId()))
                 .model(modelFactory.create(orchestrator, preset))
                 .toolkit(toolkit)
                 .maxIters(MAX_ITERS)
@@ -188,7 +193,7 @@ public class OrchestrationService {
                 .toList();
     }
 
-    private String buildSysPrompt(Agent orchestrator, List<Agent> team) {
+    private String buildSysPrompt(Agent orchestrator, List<Agent> team, String conversationId) {
         StringBuilder sb = new StringBuilder();
         String base = orchestrator.getSystemPrompt();
         if (!support.isBlank(base)) {
@@ -208,7 +213,7 @@ public class OrchestrationService {
             sb.append("6. 所有工作完成后必须调用 finish，summary 写给用户的最终总结答复，总结会发回用户发起请求的会话。\n");
         }
         sb.append("7. 如果任务要求把成果写到文件，委派时要把期望的输出路径（相对工作区根目录）写进任务描述，并提醒成员调用 write_file 完成写入。\n");
-        sb.append(fileTools.promptNote()).append("\n");
+        sb.append(fileTools.promptNote(conversationId)).append("\n");
         return sb.toString();
     }
 
@@ -295,8 +300,10 @@ public class OrchestrationService {
                 memberIds.add(orchestrator.getId());
             }
             ConversationDto dto = conversationService.createGroup(
-                    originConv.getUserId(), new GroupChatRequest(name.trim(), memberIds));
+                    originConv.getUserId(), new GroupChatRequest(name.trim(), memberIds, null));
             createdGroupId.set(dto.id());
+            // 项目群沿用发起会话的文件授权：群里可见、直接 @ 成员时也能访问同一批目录
+            fileGrants.copyGrants(originConv.getId(), dto.id());
             // 项目群也纳入终止注册表：在群里也能终止本次协作
             handle.keys.add(dto.id());
             runs.put(dto.id(), handle);
@@ -354,11 +361,13 @@ public class OrchestrationService {
 
             StringBuilder acc = new StringBuilder();
             AtomicReference<Msg> result = new AtomicReference<>();
+            // 成员的文件工具跟随当前协作会话：建群后用群内授权副本，群里撤销对成员立即生效
             Toolkit memberToolkit = new Toolkit();
-            memberToolkit.registerTool(fileTools);
+            memberToolkit.registerTool(fileTools.scoped(conv.getId()));
+            String memberNote = fileTools.promptNote(conv.getId());
             String memberSysPrompt = support.isBlank(targetAgent.getSystemPrompt())
-                    ? fileTools.promptNote()
-                    : targetAgent.getSystemPrompt().trim() + "\n\n" + fileTools.promptNote();
+                    ? memberNote
+                    : targetAgent.getSystemPrompt().trim() + "\n\n" + memberNote;
             try (ReActAgent memberAgent = ReActAgent.builder()
                     .name(targetAgent.getName())
                     .sysPrompt(memberSysPrompt)

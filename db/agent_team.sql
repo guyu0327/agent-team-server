@@ -11,7 +11,7 @@
  Target Server Version : 80018 (8.0.18)
  File Encoding         : 65001
 
- Date: 11/09/2026 17:25:57
+ Date: 13/09/2026 01:05:23
 */
 
 SET NAMES utf8mb4;
@@ -50,6 +50,19 @@ CREATE TABLE `app_settings`  (
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = '搴旂敤璁剧疆' ROW_FORMAT = Dynamic;
 
 -- ----------------------------
+-- Table structure for conversation_file_grants
+-- ----------------------------
+DROP TABLE IF EXISTS `conversation_file_grants`;
+CREATE TABLE `conversation_file_grants`  (
+  `conversation_id` varchar(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '浼氳瘽ID',
+  `path` varchar(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '鎺堟潈鐨勭粷瀵硅矾寰勶紙鏂囦欢鎴栫洰褰曪級',
+  `type` varchar(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '绫诲瀷锛歠ile | dir',
+  `name` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT '鏂囦欢/鐩?綍鍚',
+  `granted_at` bigint(20) NOT NULL COMMENT '鎺堟潈鏃堕棿鎴筹紙姣??锛',
+  PRIMARY KEY (`conversation_id`, `path`) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '浼氳瘽鏂囦欢鎺堟潈琛' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
 -- Table structure for conversation_members
 -- ----------------------------
 DROP TABLE IF EXISTS `conversation_members`;
@@ -76,6 +89,7 @@ CREATE TABLE `conversations`  (
   `last_read_at` bigint(20) NULL DEFAULT NULL COMMENT '已读水位；unread = 之后非本人的消息数',
   `created_at` bigint(20) NOT NULL,
   `updated_at` bigint(20) NOT NULL,
+  `chat_mode` varchar(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'passive' COMMENT '鑱婂ぉ妯″紡锛歱assive | free锛堜粎缇よ亰鏈夋剰涔夛級',
   PRIMARY KEY (`id`) USING BTREE,
   INDEX `idx_conv_list`(`user_id` ASC, `pinned` ASC, `last_message_at` ASC) USING BTREE
 ) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '会话表' ROW_FORMAT = Dynamic;
@@ -90,6 +104,7 @@ CREATE TABLE `messages`  (
   `sender_type` varchar(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '发送者类型：user | agent | system',
   `sender_id` varchar(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT '用户ID或智能体ID',
   `content` mediumtext CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL COMMENT '内容',
+  `attachments` text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL COMMENT '闄勪欢 JSON锛歔{path,type,name}]',
   `type` varchar(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'text' COMMENT '类型：text | error | image',
   `created_at` bigint(20) NOT NULL COMMENT '时间戳（毫秒）',
   PRIMARY KEY (`id`) USING BTREE,

@@ -18,6 +18,8 @@ public class Message {
     private String senderType;
     private String senderId;
     private String content;
+    /** 附件 JSON：[{"path":"D:\\a\\b.py","type":"file","name":"b.py"}]，无附件为 null */
+    private String attachments;
     private String type;
     private Long createdAt;
 }

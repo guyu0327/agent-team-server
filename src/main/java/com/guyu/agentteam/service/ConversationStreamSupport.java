@@ -1,6 +1,7 @@
 package com.guyu.agentteam.service;
 
 import com.guyu.agentteam.common.Ids;
+import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.entity.Agent;
 import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.entity.Message;
@@ -93,11 +94,44 @@ public class ConversationStreamSupport {
     /** 会话文本历史转成 AgentScope 消息（新用户消息已包含在内） */
     public List<Msg> historyMsgs(String conversationId) {
         return messages.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
-                .filter(m -> "text".equals(m.getType()) && m.getContent() != null && !m.getContent().isBlank())
+                .filter(m -> "text".equals(m.getType()))
+                .filter(m -> hasContent(m) || ("user".equals(m.getSenderType()) && !Json.readAttachments(m.getAttachments()).isEmpty()))
                 .<Msg>map(m -> "user".equals(m.getSenderType())
-                        ? new UserMessage(m.getContent())
+                        ? new UserMessage(effectiveUserText(m))
                         : new AssistantMessage(m.getContent()))
                 .toList();
+    }
+
+    /** 会话内全部有内容的文本消息（按时间先后），供转写成讨论记录 */
+    public List<Message> recentTextMessages(String conversationId) {
+        return messages.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
+                .filter(m -> "text".equals(m.getType()))
+                .filter(this::hasContent)
+                .toList();
+    }
+
+    /** 转写用文本：用户消息保留附件注记，成员消息用原始内容 */
+    public String transcriptText(Message m) {
+        return "user".equals(m.getSenderType()) ? effectiveUserText(m) : m.getContent();
+    }
+
+    /** 用户消息带上附件说明，模型才知道该条消息在指哪些文件/文件夹 */
+    private String effectiveUserText(Message m) {
+        List<Json.Attachment> atts = Json.readAttachments(m.getAttachments());
+        String content = m.getContent() == null ? "" : m.getContent();
+        if (atts.isEmpty()) return content;
+        StringBuilder sb = new StringBuilder(content);
+        if (!content.isBlank()) sb.append("\n\n");
+        sb.append("（本条消息附带了以下").append(atts.size() > 1 ? atts.size() + "项" : "").append("文件/文件夹，可用文件工具直接读写：");
+        for (Json.Attachment a : atts) {
+            sb.append("\n- ").append("dir".equals(a.type()) ? "[文件夹] " : "[文件] ").append(a.path());
+        }
+        sb.append("）");
+        return sb.toString();
+    }
+
+    private boolean hasContent(Message m) {
+        return m.getContent() != null && !m.getContent().isBlank();
     }
 
     public boolean isBlank(String s) {

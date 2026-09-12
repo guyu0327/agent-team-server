@@ -13,6 +13,7 @@ import com.guyu.agentteam.entity.ConversationMember;
 import com.guyu.agentteam.entity.ConversationMemberId;
 import com.guyu.agentteam.entity.Message;
 import com.guyu.agentteam.repository.AgentRepository;
+import com.guyu.agentteam.repository.ConversationFileGrantRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.repository.ConversationRepository;
 import com.guyu.agentteam.repository.MessageRepository;
@@ -32,13 +33,16 @@ public class ConversationService {
     private final ConversationMemberRepository members;
     private final MessageRepository messages;
     private final AgentRepository agents;
+    private final ConversationFileGrantRepository fileGrants;
 
     public ConversationService(ConversationRepository conversations, ConversationMemberRepository members,
-                               MessageRepository messages, AgentRepository agents) {
+                               MessageRepository messages, AgentRepository agents,
+                               ConversationFileGrantRepository fileGrants) {
         this.conversations = conversations;
         this.members = members;
         this.messages = messages;
         this.agents = agents;
+        this.fileGrants = fileGrants;
     }
 
     @Transactional(readOnly = true)
@@ -83,6 +87,7 @@ public class ConversationService {
         Conversation c = baseConversation(userId, now);
         c.setType("group");
         c.setName(req.name() == null ? "" : req.name().trim());
+        c.setChatMode(validateMode(req.chatMode()));
         conversations.save(c);
         for (String agentId : req.memberIds().stream().distinct().toList()) {
             members.save(new ConversationMember(c.getId(), agentId, now));
@@ -104,6 +109,28 @@ public class ConversationService {
         c.setPinned(pinned);
         c.setUpdatedAt(System.currentTimeMillis());
         conversations.save(c);
+    }
+
+    @Transactional
+    public void setMode(String id, String mode) {
+        Conversation c = getEntity(id);
+        if (!"group".equals(c.getType())) {
+            throw ApiException.badRequest("仅群聊支持设置聊天模式");
+        }
+        c.setChatMode(validateMode(mode));
+        c.setUpdatedAt(System.currentTimeMillis());
+        conversations.save(c);
+    }
+
+    /** 聊天模式取值校验：null 视为默认 passive */
+    private String validateMode(String mode) {
+        if (mode == null || mode.isBlank()) {
+            return "passive";
+        }
+        if (!"passive".equals(mode) && !"free".equals(mode)) {
+            throw ApiException.badRequest("未知的聊天模式：" + mode);
+        }
+        return mode;
     }
 
     @Transactional
@@ -155,6 +182,7 @@ public class ConversationService {
     public void reset(String id) {
         Conversation c = getEntity(id);
         messages.deleteByConversationId(id);
+        fileGrants.deleteByConversationId(id);
         long now = System.currentTimeMillis();
         c.setLastMessage("");
         c.setLastMessageAt(null);
@@ -180,7 +208,8 @@ public class ConversationService {
         long lastRead = c.getLastReadAt() == null ? 0L : c.getLastReadAt();
         long unread = messages.countByConversationIdAndCreatedAtGreaterThanAndSenderTypeNot(c.getId(), lastRead, "user");
         return new ConversationDto(c.getId(), c.getType(), c.getName() == null ? "" : c.getName(), agentId,
-                ids, c.isPinned(), c.getLastMessage() == null ? "" : c.getLastMessage(),
+                ids, c.getChatMode() == null ? "passive" : c.getChatMode(), c.isPinned(),
+                c.getLastMessage() == null ? "" : c.getLastMessage(),
                 c.getLastMessageAt(), unread);
     }
 
@@ -190,6 +219,7 @@ public class ConversationService {
         c.setUserId(userId);
         c.setType("single");
         c.setName("");
+        c.setChatMode("passive");
         c.setPinned(false);
         c.setLastMessage("");
         c.setCreatedAt(now);
@@ -205,6 +235,7 @@ public class ConversationService {
     private void deleteAll(Conversation c) {
         messages.deleteByConversationId(c.getId());
         members.deleteByConversationId(c.getId());
+        fileGrants.deleteByConversationId(c.getId());
         conversations.delete(c);
     }
 }

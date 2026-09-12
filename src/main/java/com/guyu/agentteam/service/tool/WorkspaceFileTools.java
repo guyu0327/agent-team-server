@@ -2,7 +2,9 @@ package com.guyu.agentteam.service.tool;
 
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.entity.AppSetting;
+import com.guyu.agentteam.entity.ConversationFileGrant;
 import com.guyu.agentteam.repository.AppSettingRepository;
+import com.guyu.agentteam.repository.ConversationFileGrantRepository;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.core.tool.ToolParam;
 import jakarta.annotation.PostConstruct;
@@ -21,12 +23,15 @@ import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 /**
- * 智能体文件工具：路径沙箱 = 主工作区目录 + 可选白名单目录，通过设置 API 运行时可改。
- * 规则：相对路径解析到主工作区；绝对路径必须落在主工作区或任一白名单目录内。
+ * 智能体文件工具：路径沙箱 = 主工作区目录 + 白名单目录 + 当前会话的文件授权，
+ * 前两者通过设置 API 运行时可改，会话授权来自聊天中附加的文件/文件夹。
+ * 规则：相对路径解析到主工作区；绝对路径必须落在允许范围内。
  * 越界/非法路径返回错误说明而非抛异常，让模型能自行纠正。
+ * 注册给 Toolkit 时使用 {@link #scoped(String)} 返回的会话作用域对象，工具实现按会话合并授权目录。
  */
 @Service
 public class WorkspaceFileTools {
@@ -40,6 +45,7 @@ public class WorkspaceFileTools {
     public static final String KEY_EXTRA_DIRS = "workspace.extraDirs";
 
     private final AppSettingRepository settings;
+    private final ConversationFileGrantRepository grants;
     /** 未做过任何设置时使用的主工作区目录（来自 yaml） */
     private final Path defaultRoot;
 
@@ -47,8 +53,10 @@ public class WorkspaceFileTools {
     private volatile List<Path> allowedRoots = List.of();
 
     public WorkspaceFileTools(AppSettingRepository settings,
+                              ConversationFileGrantRepository grants,
                               @Value("${app.workspace.root:./workspace}") String defaultRootDir) {
         this.settings = settings;
+        this.grants = grants;
         this.defaultRoot = Paths.get(defaultRootDir).toAbsolutePath().normalize();
     }
 
@@ -133,16 +141,43 @@ public class WorkspaceFileTools {
         return allowedRoots.stream().skip(1).map(Path::toString).toList();
     }
 
-    /** 拼进智能体 system prompt 的文件工具使用说明 */
-    public String promptNote() {
+    /** 全局沙箱 + 会话授权合并后的允许根目录 */
+    public List<Path> allowedRootsFor(String conversationId) {
+        List<Path> roots = new ArrayList<>(allowedRoots);
+        for (ConversationFileGrant g : conversationGrants(conversationId)) {
+            try {
+                roots.add(Paths.get(g.getPath()).normalize());
+            } catch (Exception ignored) {
+                // 授权路径非法时忽略，不影响其他目录
+            }
+        }
+        return roots;
+    }
+
+    private List<ConversationFileGrant> conversationGrants(String conversationId) {
+        return conversationId == null || conversationId.isBlank()
+                ? List.of()
+                : grants.findByConversationIdOrderByGrantedAtAsc(conversationId);
+    }
+
+    /** 拼进智能体 system prompt 的文件工具使用说明（含本会话授权的文件/目录） */
+    public String promptNote(String conversationId) {
         StringBuilder sb = new StringBuilder("文件工具说明：你可以使用 write_file / read_file / list_dir 操作文本文件。")
                 .append("相对路径相对于主工作区根目录 ").append(primaryRoot())
-                .append("；绝对路径允许当且仅当位于主工作区或白名单目录内");
+                .append("；绝对路径允许当且仅当位于主工作区或白名单目录");
         List<String> extras = extraRoots();
         if (extras.isEmpty()) {
             sb.append("。");
         } else {
             sb.append("：").append(String.join("、", extras)).append("。");
+        }
+        List<ConversationFileGrant> mine = conversationGrants(conversationId);
+        if (!mine.isEmpty()) {
+            sb.append("用户已为本会话授权下列文件/目录（通常是用户附加的资料或任务目标），你可以直接读写：\n");
+            for (ConversationFileGrant g : mine) {
+                sb.append("- ").append(ConversationFileGrant.TYPE_DIR.equals(g.getType()) ? "[文件夹] " : "[文件] ")
+                        .append(g.getPath()).append("\n");
+            }
         }
         sb.append("如果任务要求把成果写到文件，必须实际调用 write_file 完成写入，不要只在回复里贴出内容。")
                 .append("文件操作没有记忆或缓存：即使之前写过同一文件，每一次都必须当轮重新调用工具，")
@@ -150,11 +185,47 @@ public class WorkspaceFileTools {
         return sb.toString();
     }
 
-    @Tool(name = "write_file", description = "把文本内容写入沙箱内的文件（整文件覆盖），父目录不存在时自动创建")
-    public String writeFile(
-            @ToolParam(name = "path", required = true, description = "文件路径：相对主工作区根目录（如 demo/hello.py），或沙箱内的绝对路径") String path,
-            @ToolParam(name = "content", required = true, description = "要写入的完整文本内容") String content) {
-        Path p = resolve(path);
+    /** 注册给 Toolkit 的会话作用域工具对象 */
+    public ScopedTools scoped(String conversationId) {
+        return new ScopedTools(() -> conversationId);
+    }
+
+    /** 作用域动态解析：每次工具调用时取当前协作目标会话（编排建群后切到项目群，群内撤销立即生效） */
+    public ScopedTools scoped(Supplier<String> conversationId) {
+        return new ScopedTools(conversationId);
+    }
+
+    /** 会话作用域的文件工具：所有读写都合并该会话用户授权的路径 */
+    public class ScopedTools {
+
+        private final Supplier<String> conversationId;
+
+        public ScopedTools(Supplier<String> conversationId) {
+            this.conversationId = conversationId;
+        }
+
+        @Tool(name = "write_file", description = "把文本内容写入沙箱内的文件（整文件覆盖），父目录不存在时自动创建")
+        public String writeFile(
+                @ToolParam(name = "path", required = true, description = "文件路径：相对主工作区根目录（如 demo/hello.py），或允许范围内的绝对路径") String path,
+                @ToolParam(name = "content", required = true, description = "要写入的完整文本内容") String content) {
+            return doWriteFile(path, content, conversationId.get());
+        }
+
+        @Tool(name = "read_file", description = "读取沙箱内文本文件的内容")
+        public String readFile(
+                @ToolParam(name = "path", required = true, description = "文件路径：相对主工作区根目录，或允许范围内的绝对路径") String path) {
+            return doReadFile(path, conversationId.get());
+        }
+
+        @Tool(name = "list_dir", description = "列出沙箱内某个目录下的文件和子目录")
+        public String listDir(
+                @ToolParam(name = "path", required = false, description = "目录路径：相对主工作区根目录，缺省为主工作区根目录") String path) {
+            return doListDir(path, conversationId.get());
+        }
+    }
+
+    private String doWriteFile(String path, String content, String conversationId) {
+        Path p = resolve(path, conversationId);
         if (p == null) {
             log.info("write_file REJECTED path={}", path);
             return pathErr(path);
@@ -170,10 +241,8 @@ public class WorkspaceFileTools {
         }
     }
 
-    @Tool(name = "read_file", description = "读取沙箱内文本文件的内容")
-    public String readFile(
-            @ToolParam(name = "path", required = true, description = "文件路径：相对主工作区根目录，或沙箱内的绝对路径") String path) {
-        Path p = resolve(path);
+    private String doReadFile(String path, String conversationId) {
+        Path p = resolve(path, conversationId);
         if (p == null) {
             log.info("read_file REJECTED path={}", path);
             return pathErr(path);
@@ -192,12 +261,11 @@ public class WorkspaceFileTools {
         }
     }
 
-    @Tool(name = "list_dir", description = "列出沙箱内某个目录下的文件和子目录")
-    public String listDir(
-            @ToolParam(name = "path", required = false, description = "目录路径：相对主工作区根目录，缺省为主工作区根目录") String path) {
-        Path p = resolve(path == null || path.isBlank() ? "." : path);
-        if (p == null) return pathErr(path);
-        if (!Files.isDirectory(p)) return "目录不存在或不是目录：" + path;
+    private String doListDir(String path, String conversationId) {
+        String raw = path == null || path.isBlank() ? "." : path;
+        Path p = resolve(raw, conversationId);
+        if (p == null) return pathErr(raw);
+        if (!Files.isDirectory(p)) return "目录不存在或不是目录：" + raw;
         try (Stream<Path> s = Files.list(p)) {
             List<String> items = s.sorted(Comparator.comparing((Path x) -> !Files.isDirectory(x))
                             .thenComparing(x -> x.getFileName().toString()))
@@ -206,7 +274,7 @@ public class WorkspaceFileTools {
                             : x.getFileName() + "（" + sizeOf(x) + "）")
                     .toList();
             if (items.isEmpty()) return "（空目录）";
-            return "目录「" + path.trim() + "」共 " + items.size() + " 项：\n" + String.join("\n", items);
+            return "目录「" + raw.trim() + "」共 " + items.size() + " 项：\n" + String.join("\n", items);
         } catch (IOException e) {
             return "列目录失败：" + e.getMessage();
         }
@@ -222,7 +290,7 @@ public class WorkspaceFileTools {
     }
 
     /** 校验并解析路径；空白、非法或越界返回 null */
-    private Path resolve(String path) {
+    private Path resolve(String path, String conversationId) {
         if (path == null || path.isBlank()) return null;
         Path p;
         try {
@@ -230,13 +298,14 @@ public class WorkspaceFileTools {
         } catch (Exception e) {
             return null;
         }
-        for (Path root : allowedRoots) {
+        for (Path root : allowedRootsFor(conversationId)) {
             if (p.startsWith(root)) return p;
         }
         return null;
     }
 
     private String pathErr(String path) {
-        return "路径无效或超出沙箱范围：" + path + "。相对路径请相对主工作区根目录，绝对路径必须在主工作区或白名单目录内";
+        return "路径无效或超出沙箱范围：" + path + "。相对路径请相对主工作区根目录，绝对路径必须在主工作区、"
+                + "白名单目录或用户为本会话授权的文件/目录内";
     }
 }

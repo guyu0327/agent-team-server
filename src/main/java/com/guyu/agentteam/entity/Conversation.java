@@ -17,6 +17,8 @@ public class Conversation {
     private String userId;
     private String type;
     private String name;
+    /** 聊天模式：passive（默认）| free，仅群聊有意义 */
+    private String chatMode;
     private boolean pinned;
     private String lastMessage;
     private Long lastMessageAt;
