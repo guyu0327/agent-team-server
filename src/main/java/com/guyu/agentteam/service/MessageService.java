@@ -43,7 +43,8 @@ public class MessageService {
 
         String preview = content;
         if ((preview == null || preview.isBlank()) && grants != null && !grants.isEmpty()) {
-            preview = "[文件] " + grants.get(0).getName() + (grants.size() > 1 ? " 等 " + grants.size() + " 项" : "");
+            String label = ConversationFileGrant.TYPE_IMAGE.equals(grants.get(0).getType()) ? "[图片] " : "[文件] ";
+            preview = label + grants.get(0).getName() + (grants.size() > 1 ? " 等 " + grants.size() + " 项" : "");
         }
         conv.setLastMessage(preview);
         conv.setLastMessageAt(now);

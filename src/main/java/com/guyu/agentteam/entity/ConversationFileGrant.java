@@ -21,6 +21,7 @@ public class ConversationFileGrant {
 
     public static final String TYPE_FILE = "file";
     public static final String TYPE_DIR = "dir";
+    public static final String TYPE_IMAGE = "image";
 
     @Id
     private String conversationId;

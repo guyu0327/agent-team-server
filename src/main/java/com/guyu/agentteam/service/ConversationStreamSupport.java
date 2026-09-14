@@ -1,16 +1,22 @@
 package com.guyu.agentteam.service;
 
 import com.guyu.agentteam.common.Ids;
+import com.guyu.agentteam.common.Images;
 import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.entity.Agent;
 import com.guyu.agentteam.entity.Conversation;
+import com.guyu.agentteam.entity.ConversationFileGrant;
 import com.guyu.agentteam.entity.Message;
 import com.guyu.agentteam.entity.ModelPreset;
 import com.guyu.agentteam.repository.ConversationRepository;
 import com.guyu.agentteam.repository.MessageRepository;
 import com.guyu.agentteam.repository.ModelPresetRepository;
 import io.agentscope.core.message.AssistantMessage;
+import io.agentscope.core.message.Base64Source;
+import io.agentscope.core.message.ContentBlock;
+import io.agentscope.core.message.ImageBlock;
 import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.UserMessage;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
@@ -19,6 +25,11 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -27,6 +38,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /** 普通回复与编排回复共用的 SSE 发送和消息持久化逻辑 */
 @Service
 public class ConversationStreamSupport {
+
+    /** 转成 ImageBlock 的单图上限，防止 base64 撑爆模型请求 */
+    private static final long MAX_IMAGE_BYTES = 8L * 1024 * 1024;
 
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -91,40 +105,78 @@ public class ConversationStreamSupport {
         return presets.findById(a.getPresetId());
     }
 
-    /** 会话文本历史转成 AgentScope 消息（新用户消息已包含在内） */
+    /** 会话文本历史转成 AgentScope 消息（新用户消息已包含在内）；用户消息中的图片附件转成 ImageBlock 供视觉模型查看 */
     public List<Msg> historyMsgs(String conversationId) {
+        return historyMsgs(conversationId, null);
+    }
+
+    /**
+     * 带发送者名称的历史（agentNames 传 null 表示不署名，保持单聊原行为）：
+     * 成员消息携带发言人名称、用户消息携带「用户」，配合 MultiAgentFormatter
+     * 会被合并成带署名的 &lt;history&gt;，群聊成员能分清谁说了什么，
+     * 而不是把其他成员的发言当成自己的历史。
+     */
+    public List<Msg> historyMsgs(String conversationId, Map<String, String> agentNames) {
+        boolean named = agentNames != null;
         return messages.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
                 .filter(m -> "text".equals(m.getType()))
                 .filter(m -> hasContent(m) || ("user".equals(m.getSenderType()) && !Json.readAttachments(m.getAttachments()).isEmpty()))
-                .<Msg>map(m -> "user".equals(m.getSenderType())
-                        ? new UserMessage(effectiveUserText(m))
-                        : new AssistantMessage(m.getContent()))
+                .<Msg>map(m -> {
+                    if ("user".equals(m.getSenderType())) {
+                        return userMsg(m, named ? "用户" : null);
+                    }
+                    return named
+                            ? AssistantMessage.builder()
+                                    .name(agentNames.getOrDefault(m.getSenderId(), "成员"))
+                                    .textContent(m.getContent())
+                                    .build()
+                            : new AssistantMessage(m.getContent());
+                })
                 .toList();
     }
 
-    /** 会话内全部有内容的文本消息（按时间先后），供转写成讨论记录 */
-    public List<Message> recentTextMessages(String conversationId) {
-        return messages.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
-                .filter(m -> "text".equals(m.getType()))
-                .filter(this::hasContent)
-                .toList();
+    /** 单条用户消息转多模态 Msg：文本注记 + 图片块；图片读取失败时自动退化为纯文本 */
+    private UserMessage userMsg(Message m, String name) {
+        List<ContentBlock> blocks = new ArrayList<>();
+        String text = effectiveUserText(m);
+        if (!text.isBlank()) {
+            blocks.add(TextBlock.builder().text(text).build());
+        }
+        for (Json.Attachment a : Json.readAttachments(m.getAttachments())) {
+            if (!ConversationFileGrant.TYPE_IMAGE.equals(a.type())) continue;
+            ImageBlock img = imageBlock(Paths.get(a.path()));
+            if (img != null) blocks.add(img);
+        }
+        return name == null ? new UserMessage(blocks) : UserMessage.builder().name(name).content(blocks).build();
     }
 
-    /** 转写用文本：用户消息保留附件注记，成员消息用原始内容 */
-    public String transcriptText(Message m) {
-        return "user".equals(m.getSenderType()) ? effectiveUserText(m) : m.getContent();
+    private ImageBlock imageBlock(Path p) {
+        try {
+            if (!Files.isRegularFile(p) || Files.size(p) > MAX_IMAGE_BYTES) return null;
+            return ImageBlock.builder()
+                    .source(Base64Source.builder()
+                            .mediaType(Images.mediaType(p.getFileName().toString()))
+                            .data(Base64.getEncoder().encodeToString(Files.readAllBytes(p)))
+                            .build())
+                    .build();
+        } catch (IOException e) {
+            return null;
+        }
     }
 
-    /** 用户消息带上附件说明，模型才知道该条消息在指哪些文件/文件夹 */
+    /** 用户消息带上附件说明，模型才知道该条消息在指哪些文件/文件夹/图片 */
     private String effectiveUserText(Message m) {
         List<Json.Attachment> atts = Json.readAttachments(m.getAttachments());
         String content = m.getContent() == null ? "" : m.getContent();
         if (atts.isEmpty()) return content;
         StringBuilder sb = new StringBuilder(content);
         if (!content.isBlank()) sb.append("\n\n");
-        sb.append("（本条消息附带了以下").append(atts.size() > 1 ? atts.size() + "项" : "").append("文件/文件夹，可用文件工具直接读写：");
+        sb.append("（本条消息附带了以下").append(atts.size() > 1 ? atts.size() + "项" : "").append("附件，文件/文件夹可用文件工具直接读写：");
         for (Json.Attachment a : atts) {
-            sb.append("\n- ").append("dir".equals(a.type()) ? "[文件夹] " : "[文件] ").append(a.path());
+            String label = "dir".equals(a.type()) ? "[文件夹] "
+                    : ConversationFileGrant.TYPE_IMAGE.equals(a.type()) ? "[图片] "
+                    : "[文件] ";
+            sb.append("\n- ").append(label).append(a.path());
         }
         sb.append("）");
         return sb.toString();

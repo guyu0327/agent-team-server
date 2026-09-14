@@ -1,6 +1,7 @@
 package com.guyu.agentteam.service;
 
 import com.guyu.agentteam.common.ApiException;
+import com.guyu.agentteam.common.Images;
 import com.guyu.agentteam.dto.FileGrantDto;
 import com.guyu.agentteam.entity.ConversationFileGrant;
 import com.guyu.agentteam.entity.ConversationFileGrantId;
@@ -73,10 +74,11 @@ public class FileGrantService {
     /** 校验并构造授权记录（不落库） */
     public ConversationFileGrant validate(String conversationId, String raw, long now) {
         Path p = normalize(raw);
+        String name = p.getFileName() == null ? p.toString() : p.getFileName().toString();
         String type = Files.isDirectory(p)
                 ? ConversationFileGrant.TYPE_DIR
+                : Images.isImage(name) ? ConversationFileGrant.TYPE_IMAGE
                 : ConversationFileGrant.TYPE_FILE;
-        String name = p.getFileName() == null ? p.toString() : p.getFileName().toString();
         return new ConversationFileGrant(conversationId, p.toString(), type, name, now);
     }
 

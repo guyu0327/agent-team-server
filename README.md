@@ -8,6 +8,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 ### 回复规则
 - @谁谁回；没人被 @ 时全员依次回复（后一个能看到前一个的发言）
+- 群聊回复（被动与自由讨论）统一接入 AgentScope 的 `OpenAIMultiAgentFormatter`：历史里的成员消息与用户消息都携带发言人名称，请求侧合并为带署名的 `<history>`，成员能分清「谁说了什么」，不会把其他成员的发言当成自己的历史；自由讨论的「轮到你发言」「选下一位发言人」等控制指令通过 `MessageMetadataKeys.BYPASS_MULTIAGENT_HISTORY_MERGE` 标记保持为真实用户轮，不混入历史
 - 编排者例外：被 @ 或在场时，由编排者单独运行协作循环，其他成员由他调度
 - 群聊模式（`chat_mode`）：被动（默认，按上述规则）| 自由讨论。自由讨论仅对无编排者的群生效：首轮回复后由「主持人」模型逐轮选出下一位发言人接龙，直到主持人判定结束、达到轮数上限（8）、总超时（10 分钟）或用户终止；`PUT /api/conversations/{id}/mode` 切换，建群时可通过 `chatMode` 直接指定
 
@@ -32,6 +33,19 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 会话授权：用户在聊天输入框附加文件/文件夹后，该路径自动对本会话开放读写（`conversation_file_grants` 表）；编排者建群时会把发起会话的授权复制一份到项目群（两份副本互相独立），文件工具的作用域全程跟随当前协作目标会话，群内撤销立即生效
 - 通过 `PUT /api/settings/workspace` 运行时修改全局沙箱，立即生效，重启不丢（持久化于 `app_settings` 表）
 - 文件选择弹窗数据源：`GET /api/fs/list?path=` 服务端目录浏览（只读；path 为空返回盘符）
+
+### 图片消息（多模态）
+- 附加文件时按内容自动识别类型：文件夹 / 图片 / 普通文件，授权表随之记录 `type`
+- 用户消息中的图片附件会构建为多模态 `UserMessage`（文本 + ImageBlock）交给智能体：支持视觉的模型（如 mimo-v2.5）可直接理解图片内容；纯文本模型收到图片时由模型侧报错，走 `reply_error` 展示
+- 历史消息中的图片在每轮对话都会重新注入，模型可随时回看
+- 进入模型上下文的单图上限 8MB（超限自动跳过，文本标注不受影响）
+- 前端气泡展示图片用只读端点：`GET /api/fs/content?path=`（仅限图片扩展名，单图 ≤ 20MB）
+
+### 实时语音转写（讯飞流式听写）
+- WebSocket 端点 `/api/asr/stream`：前端发二进制 16k PCM 音频与 `{"type":"stop"}` 控制帧；后端按讯飞节奏（40ms / 1280B 一帧，base64）装帧转发到 `wss://iat-api.xfyun.cn/v2/iat`，识别结果转为 `{type:partial|final|error|end}` JSON 回传
+- 每条前端连接一个 `SessionBridge`：队列缓冲（满丢最旧保延迟）、发送链串行化、60 秒上限自动收尾、stop 后排空残余等 final 再关，所有清理路径收敛到幂等 `shutdown()`
+- 鉴权 URL 每次连接即时生成（HmacSHA256 签名，RFC1123 GMT date，本机时钟偏差需在 5 分钟内）；错误码透传中文提示（10105 鉴权、11200 免费次数用尽等）
+- 配置持久化于 `app_settings`（key=`asr.streamConfig`），经 `GET/PUT /api/settings/asr-stream` 读写；三项全部留空保存则清除配置
 
 ## 功能特性
 
@@ -84,7 +98,7 @@ mysql -uroot -p < db/agent_team.sql
 
 | 事件 | 说明 |
 | --- | --- |
-| `user_message` | 用户消息已持久化（含 `attachments` 附件元数据，无附件为空数组） |
+| `user_message` | 用户消息已持久化（含 `attachments` 附件元数据，`type` 为 `file`/`dir`/`image`，无附件为空数组） |
 | `reply_start` | 智能体开始回复（messageId / agentId / conversationId） |
 | `delta` | 流式增量文本 |
 | `reply_end` | 一段回复完成（含最终全文） |
@@ -104,22 +118,26 @@ mysql -uroot -p < db/agent_team.sql
 | `/api/agents` | 智能体 CRUD |
 | `/api/model-presets` | 模型预设 CRUD |
 | `/api/conversations` | 会话、消息、SSE 流式回复、会话文件授权（`/{id}/files`） |
-| `/api/fs` | 服务端目录浏览（文件选择弹窗数据源，只读） |
-| `/api/settings` | 文件沙箱设置 |
+| `/api/fs` | 服务端目录浏览 + 图片内容读取（文件选择弹窗与气泡缩略图数据源，只读） |
+| `/api/asr/stream` | 实时语音转写 WebSocket（桥接讯飞流式听写） |
+| `/api/settings` | 文件沙箱设置、实时语音识别配置 |
 | `/api/debug` | 调试端点（模型连通性冒烟） |
 
 ## 目录结构
 
 ```
 src/main/java/com/guyu/agentteam/
+├── config/                WebSocket / RestClient 等配置
 ├── controller/            REST 与 SSE 端点
 ├── service/
 │   ├── ChatStreamService        回复规则与流式回复
 │   ├── ConversationStreamSupport  SSE 发送 / 持久化 / 分段流式（普通与编排共用）
+│   ├── AsrStreamService         实时语音识别配置与讯飞鉴权
 │   └── orchestration/
 │       ├── OrchestrationService   编排协作循环与团队工具
 │       ├── AgentModelFactory      模型预设 → AgentScope 模型
 │       └── tool/WorkspaceFileTools 文件工具与动态沙箱
+├── ws/                    实时语音转写 WebSocket（讯飞桥接）
 ├── repository/            Spring Data JPA
 ├── entity / dto / common  实体、传输对象、公共层
 db/                        建库与迁移脚本
