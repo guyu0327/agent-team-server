@@ -28,6 +28,8 @@
     </scm>
     <properties>
         <java.version>21</java.version>
+        <spring-boot.version>4.1.1</spring-boot.version>
+        <agentscope.version>2.0.1</agentscope.version>
     </properties>
     <dependencies>
         <dependency>
@@ -69,13 +71,13 @@
         <!-- AgentScope Java：智能体编排 -->
         <dependency>
             <groupId>io.agentscope</groupId>
-            <artifactId>agentscope-core</artifactId>
-            <version>2.0.1</version>
+            <artifactId>agentscope-harness</artifactId>
+            <version>${agentscope.version}</version>
         </dependency>
         <dependency>
             <groupId>io.agentscope</groupId>
             <artifactId>agentscope-extensions-model-openai</artifactId>
-            <version>2.0.1</version>
+            <version>${agentscope.version}</version>
         </dependency>
     </dependencies>
 

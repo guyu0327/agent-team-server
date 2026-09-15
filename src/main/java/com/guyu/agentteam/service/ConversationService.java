@@ -17,6 +17,7 @@ import com.guyu.agentteam.repository.ConversationFileGrantRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.repository.ConversationRepository;
 import com.guyu.agentteam.repository.MessageRepository;
+import com.guyu.agentteam.repository.OperationGrantRepository;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -34,15 +35,18 @@ public class ConversationService {
     private final MessageRepository messages;
     private final AgentRepository agents;
     private final ConversationFileGrantRepository fileGrants;
+    private final OperationGrantRepository operationGrants;
 
     public ConversationService(ConversationRepository conversations, ConversationMemberRepository members,
                                MessageRepository messages, AgentRepository agents,
-                               ConversationFileGrantRepository fileGrants) {
+                               ConversationFileGrantRepository fileGrants,
+                               OperationGrantRepository operationGrants) {
         this.conversations = conversations;
         this.members = members;
         this.messages = messages;
         this.agents = agents;
         this.fileGrants = fileGrants;
+        this.operationGrants = operationGrants;
     }
 
     @Transactional(readOnly = true)
@@ -183,6 +187,7 @@ public class ConversationService {
         Conversation c = getEntity(id);
         messages.deleteByConversationId(id);
         fileGrants.deleteByConversationId(id);
+        operationGrants.deleteByConversationId(id);
         long now = System.currentTimeMillis();
         c.setLastMessage("");
         c.setLastMessageAt(null);
@@ -236,6 +241,7 @@ public class ConversationService {
         messages.deleteByConversationId(c.getId());
         members.deleteByConversationId(c.getId());
         fileGrants.deleteByConversationId(c.getId());
+        operationGrants.deleteByConversationId(c.getId());
         conversations.delete(c);
     }
 }

@@ -11,7 +11,9 @@ import com.guyu.agentteam.entity.ModelPreset;
 import com.guyu.agentteam.repository.ConversationRepository;
 import com.guyu.agentteam.repository.MessageRepository;
 import com.guyu.agentteam.repository.ModelPresetRepository;
+import io.agentscope.core.agent.accumulator.TextAccumulator;
 import io.agentscope.core.message.AssistantMessage;
+import io.agentscope.core.model.ExecutionConfig;
 import io.agentscope.core.message.Base64Source;
 import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.ImageBlock;
@@ -28,11 +30,13 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** 普通回复与编排回复共用的 SSE 发送和消息持久化逻辑 */
@@ -190,16 +194,43 @@ public class ConversationStreamSupport {
         return s == null || s.isBlank();
     }
 
-    /** reactor 的 block* 超时以 IllegalStateException 表达 */
+    /** 单次模型调用的超时上限，须小于各服务的整体运行上限（成员 4 分钟 / 编排 8 分钟） */
+    public static final Duration MODEL_CALL_TIMEOUT = Duration.ofMinutes(3);
+
+    /**
+     * 单次模型调用的超时与重试策略（框架 ExecutionConfig）：
+     * 不设置时框架对模型调用既无超时也无重试；设置后对可重试错误（传输故障、可重试 HTTP 状态、超时、IO）
+     * 自动指数退避重试，单次调用超时以 ModelException 表达。整体运行上限仍由各服务的 blockLast 兜底。
+     */
+    public static ExecutionConfig modelCallExecutionConfig() {
+        return ExecutionConfig.builder()
+                .timeout(MODEL_CALL_TIMEOUT)
+                .maxAttempts(2)
+                .initialBackoff(Duration.ofSeconds(2))
+                .maxBackoff(Duration.ofSeconds(15))
+                .retryOn(ExecutionConfig.RETRYABLE_ERRORS)
+                .build();
+    }
+
+    /** 整体运行上限的 blockLast 超时（reactor 特有，无类型化异常，只能按消息识别） */
     public static boolean isBlockingTimeout(Exception e) {
         return e instanceof IllegalStateException
                 && String.valueOf(e.getMessage()).contains("Timeout on blocking read");
     }
 
+    /** 用户已请求终止（stopRequested），或框架因 interrupt 抛出的中断错误（可能被包装在 cause 链里） */
+    public static boolean isCancelSignal(Throwable e, AtomicBoolean stopRequested) {
+        if (stopRequested.get()) return true;
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof InterruptedException) return true;
+        }
+        return false;
+    }
+
     /** 一次回复中的一段发言：reply_start 到 reply_end 之间的增量文本；工具调用会把一次回复切成多段 */
     public static class SegState {
         public final AtomicReference<Message> msg = new AtomicReference<>();
-        public final StringBuilder text = new StringBuilder();
+        public final TextAccumulator text = new TextAccumulator();
         /** 已开启的段数（含进行中），用于判断整次回复是否完全空白 */
         public int opened;
     }
@@ -217,8 +248,8 @@ public class ConversationStreamSupport {
     public void closeSegment(SseEmitter emitter, Conversation conv, Agent agent, SegState seg) {
         Message m = seg.msg.getAndSet(null);
         if (m == null) return;
-        String content = seg.text.toString();
-        seg.text.setLength(0);
+        String content = seg.text.getAccumulated();
+        seg.text.reset();
         if (content.isBlank()) {
             markError(m, "（模型未返回内容）");
             send(emitter, "reply_error", Map.of(

@@ -5,13 +5,13 @@ import com.guyu.agentteam.common.CurrentUser;
 import com.guyu.agentteam.dto.AddMembersRequest;
 import com.guyu.agentteam.dto.ConversationDto;
 import com.guyu.agentteam.dto.FileGrantDto;
-import com.guyu.agentteam.dto.GrantFilesRequest;
 import com.guyu.agentteam.dto.GroupChatRequest;
 import com.guyu.agentteam.dto.MessagePageDto;
 import com.guyu.agentteam.dto.ModeRequest;
 import com.guyu.agentteam.dto.NameRequest;
 import com.guyu.agentteam.dto.PinRequest;
 import com.guyu.agentteam.dto.SendRequest;
+import com.guyu.agentteam.dto.OpGrantRequest;
 import com.guyu.agentteam.dto.SingleChatRequest;
 import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.entity.ConversationFileGrant;
@@ -20,6 +20,7 @@ import com.guyu.agentteam.service.ChatStreamService;
 import com.guyu.agentteam.service.ConversationService;
 import com.guyu.agentteam.service.FileGrantService;
 import com.guyu.agentteam.service.MessageService;
+import com.guyu.agentteam.service.OpApprovalService;
 import com.guyu.agentteam.service.orchestration.OrchestrationService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -47,15 +48,17 @@ public class ConversationController {
     private final ChatStreamService chatStreamService;
     private final OrchestrationService orchestrationService;
     private final FileGrantService fileGrantService;
+    private final OpApprovalService opApproval;
 
     public ConversationController(ConversationService conversationService, MessageService messageService,
                                   ChatStreamService chatStreamService, OrchestrationService orchestrationService,
-                                  FileGrantService fileGrantService) {
+                                  FileGrantService fileGrantService, OpApprovalService opApproval) {
         this.conversationService = conversationService;
         this.messageService = messageService;
         this.chatStreamService = chatStreamService;
         this.orchestrationService = orchestrationService;
         this.fileGrantService = fileGrantService;
+        this.opApproval = opApproval;
     }
 
     @GetMapping
@@ -159,12 +162,6 @@ public class ConversationController {
         return fileGrantService.list(id);
     }
 
-    /** 登记文件/目录授权（文件选择弹窗中撤销前的单独授权） */
-    @PostMapping("/{id}/files")
-    public List<FileGrantDto> grantFiles(@PathVariable String id, @RequestBody GrantFilesRequest req) {
-        return fileGrantService.grant(id, req.paths());
-    }
-
     @DeleteMapping("/{id}/files")
     public Map<String, Object> revokeFile(@PathVariable String id, @RequestParam String path) {
         return Map.of("deleted", fileGrantService.revoke(id, path));
@@ -174,5 +171,12 @@ public class ConversationController {
     @PostMapping("/{id}/stop")
     public Map<String, Object> stop(@PathVariable String id) {
         return Map.of("stopped", orchestrationService.stop(id) | chatStreamService.stop(id));
+    }
+
+    /** 审批卡片决定受控操作（写入/修改/执行命令）：decision = once | conversation | deny */
+    @PostMapping("/{id}/op-grant")
+    public Map<String, Object> opGrant(@PathVariable String id, @RequestBody OpGrantRequest req) {
+        req.validate();
+        return Map.of("applied", opApproval.decide(req.requestId(), req.decision()));
     }
 }

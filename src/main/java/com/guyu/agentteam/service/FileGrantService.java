@@ -30,16 +30,6 @@ public class FileGrantService {
                 .toList();
     }
 
-    /** 校验并登记授权（已存在的会刷新元数据），返回授权后的完整列表 */
-    @Transactional
-    public List<FileGrantDto> grant(String conversationId, List<String> paths) {
-        if (paths == null || paths.isEmpty()) {
-            throw ApiException.badRequest("缺少要授权的路径");
-        }
-        grants.saveAll(validated(conversationId, paths, System.currentTimeMillis()));
-        return list(conversationId);
-    }
-
     /** 批量登记已校验的授权 */
     @Transactional
     public void registerAll(List<ConversationFileGrant> validated) {
@@ -55,12 +45,6 @@ public class FileGrantService {
         grants.saveAll(source.stream()
                 .map(g -> new ConversationFileGrant(targetConversationId, g.getPath(), g.getType(), g.getName(), now))
                 .toList());
-    }
-
-    private List<ConversationFileGrant> validated(String conversationId, List<String> paths, long now) {
-        return paths.stream()
-                .map(raw -> validate(conversationId, raw, now))
-                .toList();
     }
 
     @Transactional

@@ -12,12 +12,16 @@ import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.service.ConversationService;
 import com.guyu.agentteam.service.ConversationStreamSupport;
 import com.guyu.agentteam.service.FileGrantService;
+import com.guyu.agentteam.service.OpApprovalService;
+import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.ReActAgent;
+import io.agentscope.core.agent.accumulator.TextAccumulator;
 import io.agentscope.core.event.AgentEventType;
 import io.agentscope.core.event.AgentResultEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.UserMessage;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.core.tool.ToolParam;
@@ -57,13 +61,14 @@ public class OrchestrationService {
     private final AgentModelFactory modelFactory;
     private final WorkspaceFileTools fileTools;
     private final FileGrantService fileGrants;
+    private final OpApprovalService approval;
     /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
     private final Map<String, RunHandle> runs = new ConcurrentHashMap<>();
 
     public OrchestrationService(AgentRepository agents, ConversationMemberRepository members,
                                 ConversationStreamSupport support, ConversationService conversationService,
                                 AgentModelFactory modelFactory, WorkspaceFileTools fileTools,
-                                FileGrantService fileGrants) {
+                                FileGrantService fileGrants, OpApprovalService approval) {
         this.agents = agents;
         this.members = members;
         this.support = support;
@@ -71,6 +76,7 @@ public class OrchestrationService {
         this.modelFactory = modelFactory;
         this.fileTools = fileTools;
         this.fileGrants = fileGrants;
+        this.approval = approval;
     }
 
     public void run(SseEmitter emitter, Conversation conv, Agent orchestrator, ModelPreset preset) {
@@ -86,27 +92,32 @@ public class OrchestrationService {
 
         Toolkit toolkit = new Toolkit();
         // 文件工具作用域跟随当前协作目标会话：建群前用发起会话授权，建群后切到项目群，群里的撤销立即生效
-        toolkit.registerTool(fileTools.scoped(() -> target.get().getId()));
+        OpRequestSink sink = (opType, opTarget, detail) ->
+                approval.approve(emitter, orchestrator, target.get().getId(), opType, opTarget, detail);
+        toolkit.registerTool(fileTools.toolsFor(() -> target.get().getId(), sink));
+        fileTools.registerShellTool(toolkit, () -> target.get().getId(), sink);
         toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId, handle));
 
         sendCoordination(emitter, "coordination_start", orchestrator, conv.getId());
 
-        try (ReActAgent agent = ReActAgent.builder()
+        ReActAgent agent = ReActAgent.builder()
                 .name(orchestrator.getName())
                 .sysPrompt(buildSysPrompt(orchestrator, team, conv.getId()))
                 .model(modelFactory.create(orchestrator, preset))
                 .toolkit(toolkit)
                 .maxIters(MAX_ITERS)
-                .build()) {
+                .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                .build();
+        handle.running.add(agent);
+        try {
             agent.streamEvents(support.historyMsgs(conv.getId()))
                     .doOnNext(e -> {
-                        if (handle.cancelled.get()) throw new CancelledException();
                         if (e.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
                             if (finished.get()) return;
                             String delta = ((TextBlockDeltaEvent) e).getDelta();
                             if (seg.msg.get() == null && delta.isBlank()) return;
                             if (seg.msg.get() == null) support.openSegment(emitter, target.get(), orchestrator, seg);
-                            seg.text.append(delta);
+                            seg.text.add(TextBlock.builder().text(delta).build());
                             support.send(emitter, "delta", Map.of(
                                     "messageId", seg.msg.get().getId(),
                                     "delta", delta,
@@ -117,29 +128,27 @@ public class OrchestrationService {
                     })
                     .blockLast(OVERALL_TIMEOUT);
             support.closeSegment(emitter, target.get(), orchestrator, seg);
+            if (handle.stopRequested.get()) notifyCancelled(emitter, conv, orchestrator, finished);
         } catch (UncheckedIOException e) {
             // 客户端断开，SSE 已不可用
             handle.keys.forEach(runs::remove);
             throw e;
-        } catch (CancelledException e) {
-            support.closeSegment(emitter, target.get(), orchestrator, seg);
-            // finish 已提交过总结就不补终止提示，避免画蛇添足
-            if (!finished.get()) {
-                support.persistError(conv, orchestrator, "协作已被用户手动终止");
-                support.send(emitter, "reply_error", Map.of(
-                        "agentId", orchestrator.getId(),
-                        "error", "协作已被用户手动终止",
-                        "conversationId", conv.getId()));
-            }
         } catch (Exception e) {
             support.closeSegment(emitter, target.get(), orchestrator, seg);
-            String err = ConversationStreamSupport.isBlockingTimeout(e) ? "编排超时，已中止"
-                    : (e.getMessage() == null ? e.toString() : e.getMessage());
-            support.persistError(conv, orchestrator, "「" + orchestrator.getName() + "」编排失败：" + err);
-            support.send(emitter, "reply_error", Map.of(
-                    "agentId", orchestrator.getId(),
-                    "error", "编排失败：" + err,
-                    "conversationId", conv.getId()));
+            if (ConversationStreamSupport.isCancelSignal(e, handle.stopRequested)) {
+                notifyCancelled(emitter, conv, orchestrator, finished);
+            } else {
+                String err = ConversationStreamSupport.isBlockingTimeout(e) ? "编排超时，已中止"
+                        : (e.getMessage() == null ? e.toString() : e.getMessage());
+                support.persistError(conv, orchestrator, "「" + orchestrator.getName() + "」编排失败：" + err);
+                support.send(emitter, "reply_error", Map.of(
+                        "agentId", orchestrator.getId(),
+                        "error", "编排失败：" + err,
+                        "conversationId", conv.getId()));
+            }
+        } finally {
+            handle.running.remove(agent);
+            agent.close();
         }
         sendCoordination(emitter, "coordination_end", orchestrator, conv.getId());
         String groupId = createdGroupId.get();
@@ -153,19 +162,28 @@ public class OrchestrationService {
     public boolean stop(String conversationId) {
         RunHandle handle = runs.get(conversationId);
         if (handle == null) return false;
-        handle.cancelled.set(true);
+        handle.stopRequested.set(true);
+        handle.running.forEach(ReActAgent::interrupt);
         return true;
     }
 
-    /** 一次编排运行的取消句柄：cancelled 置位后，流式回调在下一个事件处中止 */
+    /** 一次编排运行的取消句柄：登记运行中的 ReActAgent，终止时用框架 interrupt 中断其流式循环 */
     private static final class RunHandle {
-        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        final AtomicBoolean stopRequested = new AtomicBoolean(false);
+        /** 运行中的 ReActAgent（编排者本人 + 正在执行 delegate 的成员） */
+        final Set<ReActAgent> running = ConcurrentHashMap.newKeySet();
         /** 该运行注册过的所有会话ID（发起请求的单聊 + 协作中创建的项目群） */
         final Set<String> keys = ConcurrentHashMap.newKeySet();
     }
 
-    /** 用户终止协作时向流中抛出的控制流异常 */
-    private static final class CancelledException extends RuntimeException {
+    /** 终止提示：finish 已提交过总结就不补，避免画蛇添足 */
+    private void notifyCancelled(SseEmitter emitter, Conversation conv, Agent orchestrator, AtomicBoolean finished) {
+        if (finished.get()) return;
+        support.persistError(conv, orchestrator, "协作已被用户手动终止");
+        support.send(emitter, "reply_error", Map.of(
+                "agentId", orchestrator.getId(),
+                "error", "协作已被用户手动终止",
+                "conversationId", conv.getId()));
     }
 
     /** 协调状态事件：客户端断开后静默忽略 */
@@ -359,28 +377,34 @@ public class OrchestrationService {
                     "agentId", targetAgent.getId(),
                     "conversationId", conv.getId()));
 
-            StringBuilder acc = new StringBuilder();
+            TextAccumulator acc = new TextAccumulator();
             AtomicReference<Msg> result = new AtomicReference<>();
             // 成员的文件工具跟随当前协作会话：建群后用群内授权副本，群里撤销对成员立即生效
+            OpRequestSink memberSink = (opType, opTarget, detail) ->
+                    approval.approve(emitter, targetAgent, conv.getId(), opType, opTarget, detail);
             Toolkit memberToolkit = new Toolkit();
-            memberToolkit.registerTool(fileTools.scoped(conv.getId()));
+            memberToolkit.registerTool(fileTools.toolsFor(conv.getId(), memberSink));
+            fileTools.registerShellTool(memberToolkit, conv::getId, memberSink);
             String memberNote = fileTools.promptNote(conv.getId());
             String memberSysPrompt = support.isBlank(targetAgent.getSystemPrompt())
                     ? memberNote
                     : targetAgent.getSystemPrompt().trim() + "\n\n" + memberNote;
-            try (ReActAgent memberAgent = ReActAgent.builder()
+            boolean cancelled = false;
+            ReActAgent memberAgent = ReActAgent.builder()
                     .name(targetAgent.getName())
                     .sysPrompt(memberSysPrompt)
                     .model(modelFactory.create(targetAgent, p.get()))
                     .toolkit(memberToolkit)
                     .maxIters(MAX_ITERS)
-                    .build()) {
+                    .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                    .build();
+            handle.running.add(memberAgent);
+            try {
                 memberAgent.streamEvents(new UserMessage(task))
                         .doOnNext(ev -> {
-                            if (handle.cancelled.get()) throw new CancelledException();
                             if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
                                 String d = ((TextBlockDeltaEvent) ev).getDelta();
-                                acc.append(d);
+                                acc.add(TextBlock.builder().text(d).build());
                                 support.send(emitter, "delta", Map.of(
                                         "messageId", placeholder.getId(),
                                         "delta", d,
@@ -392,9 +416,27 @@ public class OrchestrationService {
                         .blockLast(MEMBER_TIMEOUT);
             } catch (UncheckedIOException e) {
                 throw e;
-            } catch (CancelledException e) {
-                // 用户终止：保留成员已流出的部分内容，无内容则标记为错误
-                if (acc.isEmpty()) {
+            } catch (Exception e) {
+                if (!ConversationStreamSupport.isCancelSignal(e, handle.stopRequested)) {
+                    String err = ConversationStreamSupport.isBlockingTimeout(e) ? "执行超时"
+                            : (e.getMessage() == null ? e.toString() : e.getMessage());
+                    support.markError(placeholder, "执行失败：" + err);
+                    support.send(emitter, "reply_error", Map.of(
+                            "messageId", placeholder.getId(),
+                            "agentId", targetAgent.getId(),
+                            "error", "执行失败：" + err,
+                            "conversationId", conv.getId()));
+                    return "成员「" + targetAgent.getName() + "」执行失败（" + err + "），请决定下一步。";
+                }
+                cancelled = true;
+            } finally {
+                handle.running.remove(memberAgent);
+                memberAgent.close();
+            }
+            // 用户终止（ interrupt 报错或流被框架正常收尾两种形态都归到这里）：
+            // 保留成员已流出的部分内容，无内容则标记为错误
+            if (cancelled || handle.stopRequested.get()) {
+                if (!acc.hasContent()) {
                     support.markError(placeholder, "（协作已被用户终止）");
                     support.send(emitter, "reply_error", Map.of(
                             "messageId", placeholder.getId(),
@@ -402,31 +444,21 @@ public class OrchestrationService {
                             "error", "协作已被用户终止",
                             "conversationId", conv.getId()));
                 } else {
-                    placeholder.setContent(acc.toString());
+                    placeholder.setContent(acc.getAccumulated());
                     support.persist(placeholder);
-                    support.touchConversation(conv, targetAgent, acc.toString());
+                    support.touchConversation(conv, targetAgent, acc.getAccumulated());
                     support.send(emitter, "reply_end", Map.of(
                             "messageId", placeholder.getId(),
                             "agentId", targetAgent.getId(),
-                            "content", acc.toString(),
+                            "content", acc.getAccumulated(),
                             "conversationId", conv.getId()));
                 }
                 return "协作已被用户终止。";
-            } catch (Exception e) {
-                String err = ConversationStreamSupport.isBlockingTimeout(e) ? "执行超时"
-                        : (e.getMessage() == null ? e.toString() : e.getMessage());
-                support.markError(placeholder, "执行失败：" + err);
-                support.send(emitter, "reply_error", Map.of(
-                        "messageId", placeholder.getId(),
-                        "agentId", targetAgent.getId(),
-                        "error", "执行失败：" + err,
-                        "conversationId", conv.getId()));
-                return "成员「" + targetAgent.getName() + "」执行失败（" + err + "），请决定下一步。";
             }
 
             String full = result.get() != null && !support.isBlank(result.get().getTextContent())
                     ? result.get().getTextContent()
-                    : acc.toString();
+                    : acc.getAccumulated();
             if (support.isBlank(full)) {
                 support.markError(placeholder, "（模型未返回内容）");
                 support.send(emitter, "reply_error", Map.of(

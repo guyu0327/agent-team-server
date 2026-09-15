@@ -10,12 +10,14 @@ import com.guyu.agentteam.repository.AgentRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.service.orchestration.AgentModelFactory;
 import com.guyu.agentteam.service.orchestration.OrchestrationService;
+import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.ReActAgent;
 import io.agentscope.core.event.AgentEventType;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.message.MessageMetadataKeys;
 import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.UserMessage;
 import io.agentscope.core.tool.Toolkit;
 import jakarta.annotation.PreDestroy;
@@ -28,6 +30,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -62,17 +65,19 @@ public class ChatStreamService {
     private final WorkspaceFileTools fileTools;
     private final ConversationStreamSupport support;
     private final OrchestrationService orchestration;
+    private final OpApprovalService approval;
 
     public ChatStreamService(ConversationMemberRepository members,
                              AgentRepository agents, AgentModelFactory modelFactory,
                              WorkspaceFileTools fileTools, ConversationStreamSupport support,
-                             OrchestrationService orchestration) {
+                             OrchestrationService orchestration, OpApprovalService approval) {
         this.members = members;
         this.agents = agents;
         this.modelFactory = modelFactory;
         this.fileTools = fileTools;
         this.support = support;
         this.orchestration = orchestration;
+        this.approval = approval;
     }
 
     public void stream(SseEmitter emitter, Conversation conv, Message userMsg) {
@@ -89,6 +94,7 @@ public class ChatStreamService {
                 try {
                     boolean group = "group".equals(conv.getType());
                     for (Agent agent : responders(conv, userMsg.getContent(), freeChain)) {
+                        if (handle != null && handle.stopRequested.get()) break;
                         replyOne(emitter, conv, agent, handle,
                                 freeChain ? discussionInput(conv, agent)
                                         : group ? support.historyMsgs(conv.getId(), memberNames(conv))
@@ -106,9 +112,6 @@ public class ChatStreamService {
                 }
                 support.send(emitter, "done", Map.of());
                 emitter.complete();
-            } catch (CancelledException e) {
-                support.send(emitter, "done", Map.of());
-                emitter.complete();
             } catch (Exception e) {
                 emitter.completeWithError(e);
             }
@@ -119,7 +122,8 @@ public class ChatStreamService {
     public boolean stop(String conversationId) {
         RunHandle handle = runs.get(conversationId);
         if (handle == null) return false;
-        handle.cancelled.set(true);
+        handle.stopRequested.set(true);
+        handle.running.forEach(ReActAgent::interrupt);
         return true;
     }
 
@@ -146,21 +150,23 @@ public class ChatStreamService {
         }
 
         ConversationStreamSupport.SegState seg = new ConversationStreamSupport.SegState();
-        try (ReActAgent react = ReActAgent.builder()
+        ReActAgent react = ReActAgent.builder()
                 .name(agent.getName())
                 .sysPrompt(sysPromptOf(agent, conv.getId()))
                 .model(modelFactory.create(agent, preset, multiAgent))
-                .toolkit(toolkitOf(conv.getId()))
+                .toolkit(toolkitOf(conv, emitter, agent))
                 .maxIters(MAX_ITERS)
-                .build()) {
+                .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                .build();
+        if (handle != null) handle.running.add(react);
+        try {
             react.streamEvents(input)
                     .doOnNext(ev -> {
-                        if (handle != null && handle.cancelled.get()) throw new CancelledException();
                         if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
                             String delta = ((TextBlockDeltaEvent) ev).getDelta();
                             if (seg.msg.get() == null && delta.isBlank()) return;
                             if (seg.msg.get() == null) support.openSegment(emitter, conv, agent, seg);
-                            seg.text.append(delta);
+                            seg.text.add(TextBlock.builder().text(delta).build());
                             support.send(emitter, "delta", Map.of(
                                     "messageId", seg.msg.get().getId(),
                                     "delta", delta,
@@ -171,22 +177,26 @@ public class ChatStreamService {
                     })
                     .blockLast(REPLY_TIMEOUT);
             support.closeSegment(emitter, conv, agent, seg);
-            if (seg.opened == 0) {
+            if (seg.opened == 0 && (handle == null || !handle.stopRequested.get())) {
                 support.persistError(conv, agent, "「" + agent.getName() + "」（模型未返回内容）");
                 support.send(emitter, "reply_error", Map.of("agentId", agent.getId(), "error", "（模型未返回内容）"));
             }
-        } catch (CancelledException e) {
-            support.closeSegment(emitter, conv, agent, seg);
-            throw e;
         } catch (UncheckedIOException e) {
             // 客户端断开，SSE 已不可用
             throw e;
         } catch (Exception e) {
+            support.closeSegment(emitter, conv, agent, seg);
+            if (handle != null && ConversationStreamSupport.isCancelSignal(e, handle.stopRequested)) {
+                // 终止：已保留部分内容，由外层循环按 stopRequested 收尾
+                return;
+            }
             String err = ConversationStreamSupport.isBlockingTimeout(e) ? "回复超时，已中止"
                     : (e.getMessage() == null ? e.toString() : e.getMessage());
-            support.closeSegment(emitter, conv, agent, seg);
             support.persistError(conv, agent, "「" + agent.getName() + "」回复失败：" + err);
             support.send(emitter, "reply_error", Map.of("agentId", agent.getId(), "error", err));
+        } finally {
+            if (handle != null) handle.running.remove(react);
+            react.close();
         }
     }
 
@@ -196,9 +206,12 @@ public class ChatStreamService {
         return support.isBlank(base) ? note : base + "\n\n" + note;
     }
 
-    private Toolkit toolkitOf(String conversationId) {
+    private Toolkit toolkitOf(Conversation conv, SseEmitter emitter, Agent agent) {
+        OpRequestSink sink = (opType, target, detail) ->
+                approval.approve(emitter, agent, conv.getId(), opType, target, detail);
         Toolkit toolkit = new Toolkit();
-        toolkit.registerTool(fileTools.scoped(conversationId));
+        toolkit.registerTool(fileTools.toolsFor(conv.getId(), sink));
+        fileTools.registerShellTool(toolkit, conv::getId, sink);
         return toolkit;
     }
 
@@ -248,8 +261,8 @@ public class ChatStreamService {
         long deadline = System.currentTimeMillis() + CHAIN_OVERALL.toMillis();
         Agent lastSpeaker = null;
         for (int turn = 0; turn < MAX_CHAIN_TURNS; turn++) {
-            if (handle.cancelled.get()) {
-                throw new CancelledException();
+            if (handle.stopRequested.get()) {
+                return;
             }
             if (System.currentTimeMillis() >= deadline) {
                 break;
@@ -305,33 +318,61 @@ public class ChatStreamService {
         if (presetOpt.isEmpty()) {
             return null;
         }
-        StringBuilder out = new StringBuilder();
         try (ReActAgent judge = ReActAgent.builder()
                 .name("moderator")
                 .sysPrompt(moderatorPrompt(pool))
                 .model(modelFactory.create(modelOwner, presetOpt.get(), true))
-                .toolkit(new Toolkit())
-                .maxIters(1)
                 .build()) {
-            // 带署名历史经 MultiAgentFormatter 合并为 <history>，thinking 模型下不会因裸 assistant 轮 400
-            judge.streamEvents(moderatorInput(conv, pool))
-                    .doOnNext(ev -> {
-                        if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
-                            out.append(((TextBlockDeltaEvent) ev).getDelta());
-                        }
-                    })
-                    .blockLast(SELECT_TIMEOUT);
+            // 带署名历史经 MultiAgentFormatter 合并为 <history>，thinking 模型下不会因裸 assistant 轮 400；
+            // 结构化输出由框架适配端点能力：原生 response_format 失败自动降级为工具式输出
+            Msg decision = judge.call(moderatorInput(conv, pool), ModeratorDecision.class)
+                    .block(SELECT_TIMEOUT);
+            String name = decision == null || !decision.hasStructuredData()
+                    ? ""
+                    : String.valueOf(decision.getStructuredData(ModeratorDecision.class).getSpeaker()).trim();
+            if (name.isEmpty() || name.toUpperCase().contains("END") || name.contains("结束")) {
+                return null;
+            }
+            return matchSpeaker(name, pool);
         } catch (Exception e) {
             return null;
         }
-        return parseSpeaker(out.toString(), pool);
+    }
+
+    /** 主持人的结构化决策输出：speaker 填下一位发言人名字，END/空 表示讨论结束 */
+    public static class ModeratorDecision {
+        private String speaker;
+
+        public String getSpeaker() {
+            return speaker;
+        }
+
+        public void setSpeaker(String speaker) {
+            this.speaker = speaker;
+        }
+    }
+
+    /** 按名字匹配成员：先精确匹配，再退回最长包含匹配（应对名字互为前缀的情况） */
+    private Agent matchSpeaker(String name, List<Agent> pool) {
+        for (Agent a : pool) {
+            if (a.getName().equals(name)) {
+                return a;
+            }
+        }
+        Agent found = null;
+        for (Agent a : pool) {
+            if (name.contains(a.getName()) && (found == null || a.getName().length() > found.getName().length())) {
+                found = a;
+            }
+        }
+        return found;
     }
 
     /** 主持人的输入：带署名的群聊历史 + 绕过合并的选人指令 */
     private List<Msg> moderatorInput(Conversation conv, List<Agent> pool) {
         List<Msg> msgs = new ArrayList<>(support.historyMsgs(conv.getId(), memberNames(conv)));
         String members = pool.stream().map(Agent::getName).collect(Collectors.joining("、"));
-        msgs.add(instruction("请根据以上记录决定下一位发言人：只输出一个成员名字，或只输出 END 表示讨论应结束。可选成员：" + members));
+        msgs.add(instruction("请根据以上记录决定下一位发言人：在 speaker 字段填一个成员名字，讨论应结束则填 END。可选成员：" + members));
         return msgs;
     }
 
@@ -344,47 +385,20 @@ public class ChatStreamService {
     private String moderatorPrompt(List<Agent> pool) {
         String names = pool.stream().map(Agent::getName).collect(Collectors.joining("、"));
         return "你是群聊主持人，负责决定下一个发言的成员。根据群聊记录判断："
-                + "如果还有成员没有回应过讨论中的关键问题、或有明确的实质性内容需要补充，输出他的名字（只输出名字本身）；"
-                + "如果讨论已经收敛、观点已充分表达、或开始出现客套与重复，只输出 END。"
+                + "如果还有成员没有回应过讨论中的关键问题、或有明确的实质性内容需要补充，在 speaker 字段填他的名字；"
+                + "如果讨论已经收敛、观点已充分表达、或开始出现客套与重复，在 speaker 字段填 END。"
                 + "尽量不要连续选同一位成员，除非讨论明确需要他跟进。"
-                + "规则：只输出一个成员名字或 END，不要输出任何其他文字。可选成员：" + names;
-    }
-
-
-
-    private Agent parseSpeaker(String text, List<Agent> pool) {
-        String t = text == null ? "" : text.trim();
-        if (t.isEmpty()) {
-            return null;
-        }
-        if (t.toUpperCase().contains("END") || t.contains("结束")) {
-            return null;
-        }
-        for (Agent a : pool) {
-            if (t.equals(a.getName())) {
-                return a;
-            }
-        }
-        Agent found = null;
-        for (Agent a : pool) {
-            if (t.contains(a.getName()) && (found == null || a.getName().length() > found.getName().length())) {
-                found = a;
-            }
-        }
-        return found;
+                + "可选成员：" + names;
     }
 
     private boolean isOrchestrator(Agent a) {
         return Boolean.TRUE.equals(a.getIsOrchestrator());
     }
 
-    /** 一次自由讨论的取消句柄：cancelled 置位后，流式回调在下一个事件处中止 */
+    /** 一次自由讨论的取消句柄：登记运行中的 ReActAgent，终止时用框架 interrupt 中断其流式循环 */
     private static final class RunHandle {
-        final AtomicBoolean cancelled = new AtomicBoolean(false);
-    }
-
-    /** 用户终止讨论时向流中抛出的控制流异常 */
-    private static final class CancelledException extends RuntimeException {
+        final AtomicBoolean stopRequested = new AtomicBoolean(false);
+        final Set<ReActAgent> running = ConcurrentHashMap.newKeySet();
     }
 
     private boolean isBlank(String s) {

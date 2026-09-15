@@ -3,43 +3,42 @@ package com.guyu.agentteam.service.tool;
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.entity.AppSetting;
 import com.guyu.agentteam.entity.ConversationFileGrant;
+import com.guyu.agentteam.entity.OperationGrant;
 import com.guyu.agentteam.repository.AppSettingRepository;
 import com.guyu.agentteam.repository.ConversationFileGrantRepository;
-import io.agentscope.core.tool.Tool;
-import io.agentscope.core.tool.ToolParam;
+import io.agentscope.core.tool.Toolkit;
+import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
+import io.agentscope.harness.agent.filesystem.local.LocalFilesystemWithShell;
+import io.agentscope.harness.agent.filesystem.model.EditResult;
+import io.agentscope.harness.agent.filesystem.model.WriteResult;
+import io.agentscope.harness.agent.filesystem.spec.LocalFilesystemSpec;
+import io.agentscope.harness.agent.tool.FilesystemTool;
+import io.agentscope.harness.agent.tool.ShellExecuteTool;
 import jakarta.annotation.PostConstruct;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.Supplier;
-import java.util.stream.Stream;
 
 /**
  * 智能体文件工具：路径沙箱 = 主工作区目录 + 白名单目录 + 当前会话的文件授权，
  * 前两者通过设置 API 运行时可改，会话授权来自聊天中附加的文件/文件夹。
  * 规则：相对路径解析到主工作区；绝对路径必须落在允许范围内。
- * 越界/非法路径返回错误说明而非抛异常，让模型能自行纠正。
- * 注册给 Toolkit 时使用 {@link #scoped(String)} 返回的会话作用域对象，工具实现按会话合并授权目录。
+ * 读写实现采用 harness 框架的 FilesystemTool（read_file/write_file/edit_file/
+ * grep_files/glob_files/list_files），其中 write/edit 与 shell 命令（execute）是
+ * 受控操作：调用时经 {@link OpRequestSink} 弹审批卡片等用户决定，拒绝则不执行。
  */
 @Service
 public class WorkspaceFileTools {
-
-    /** read_file 单次返回的最大字符数，避免撑爆模型上下文 */
-    private static final int MAX_READ_CHARS = 100_000;
-
-    private static final Logger log = LoggerFactory.getLogger(WorkspaceFileTools.class);
 
     public static final String KEY_ROOT = "workspace.root";
     public static final String KEY_EXTRA_DIRS = "workspace.extraDirs";
@@ -162,7 +161,8 @@ public class WorkspaceFileTools {
 
     /** 拼进智能体 system prompt 的文件工具使用说明（含本会话授权的文件/目录） */
     public String promptNote(String conversationId) {
-        StringBuilder sb = new StringBuilder("文件工具说明：你可以使用 write_file / read_file / list_dir 操作文本文件。")
+        StringBuilder sb = new StringBuilder("文件工具说明：沙箱内可使用 read_file（读取文本，支持 offset/limit 分页）、")
+                .append("grep_files（按内容搜索文件）、glob_files（按通配符查找文件）、list_files（列出目录内容）。")
                 .append("相对路径相对于主工作区根目录 ").append(primaryRoot())
                 .append("；绝对路径允许当且仅当位于主工作区或白名单目录");
         List<String> extras = extraRoots();
@@ -179,133 +179,142 @@ public class WorkspaceFileTools {
                         .append(g.getPath()).append("\n");
             }
         }
-        sb.append("如果任务要求把成果写到文件，必须实际调用 write_file 完成写入，不要只在回复里贴出内容。")
+        sb.append("write_file（写入/覆盖文本文件）、edit_file（精确替换内容）与 execute（执行 shell 命令，")
+                .append("Windows 下为 cmd，working_directory 相对主工作区根目录）是受控操作：")
+                .append("调用时会向用户展示操作详情并等待批准（允许一次 / 本会话此类操作允许 / 拒绝），")
+                .append("被拒绝或超时未响应的操作不会执行，请勿反复重试同一次调用。")
+                .append("普通文件读写请优先使用文件工具。")
+                .append("如果任务要求把成果写到文件，必须实际调用 write_file 完成写入，不要只在回复里贴出内容；")
                 .append("文件操作没有记忆或缓存：即使之前写过同一文件，每一次都必须当轮重新调用工具，")
                 .append("并在收到工具返回的「已写入」回执后才能告知用户成功；未调用工具就宣称已写入是严重错误。");
         return sb.toString();
     }
 
-    /** 注册给 Toolkit 的会话作用域工具对象 */
-    public ScopedTools scoped(String conversationId) {
-        return new ScopedTools(() -> conversationId);
+    /** 会话作用域的框架文件工具：沙箱 = 主工作区 + 白名单 + 本会话授权，write/edit 需审批 */
+    public FilesystemTool toolsFor(String conversationId, OpRequestSink sink) {
+        return routingTools(() -> allowedRootsFor(conversationId), sink);
     }
 
-    /** 作用域动态解析：每次工具调用时取当前协作目标会话（编排建群后切到项目群，群内撤销立即生效） */
-    public ScopedTools scoped(Supplier<String> conversationId) {
-        return new ScopedTools(conversationId);
+    /** 动态作用域（编排者）：每次工具调用解析当前协作目标会话，建群后切目标、群内撤销立即生效 */
+    public FilesystemTool toolsFor(Supplier<String> conversationId, OpRequestSink sink) {
+        return routingTools(() -> allowedRootsFor(conversationId.get()), sink);
     }
 
-    /** 会话作用域的文件工具：所有读写都合并该会话用户授权的路径 */
-    public class ScopedTools {
-
-        private final Supplier<String> conversationId;
-
-        public ScopedTools(Supplier<String> conversationId) {
-            this.conversationId = conversationId;
-        }
-
-        @Tool(name = "write_file", description = "把文本内容写入沙箱内的文件（整文件覆盖），父目录不存在时自动创建")
-        public String writeFile(
-                @ToolParam(name = "path", required = true, description = "文件路径：相对主工作区根目录（如 demo/hello.py），或允许范围内的绝对路径") String path,
-                @ToolParam(name = "content", required = true, description = "要写入的完整文本内容") String content) {
-            return doWriteFile(path, content, conversationId.get());
-        }
-
-        @Tool(name = "read_file", description = "读取沙箱内文本文件的内容")
-        public String readFile(
-                @ToolParam(name = "path", required = true, description = "文件路径：相对主工作区根目录，或允许范围内的绝对路径") String path) {
-            return doReadFile(path, conversationId.get());
-        }
-
-        @Tool(name = "list_dir", description = "列出沙箱内某个目录下的文件和子目录")
-        public String listDir(
-                @ToolParam(name = "path", required = false, description = "目录路径：相对主工作区根目录，缺省为主工作区根目录") String path) {
-            return doListDir(path, conversationId.get());
-        }
+    /** 注册 shell 命令工具（execute）：working_directory 相对主工作区解析，默认 30 秒超时，需审批 */
+    public void registerShellTool(Toolkit toolkit, Supplier<String> conversationId, OpRequestSink sink) {
+        toolkit.registerTool(new GatedShellTool(
+                new ShellExecuteTool(new LocalFilesystemWithShell(allowedRoots.get(0))),
+                conversationId, sink));
     }
 
-    private String doWriteFile(String path, String content, String conversationId) {
-        Path p = resolve(path, conversationId);
-        if (p == null) {
-            log.info("write_file REJECTED path={}", path);
-            return pathErr(path);
-        }
-        try {
-            if (p.getParent() != null) Files.createDirectories(p.getParent());
-            Files.writeString(p, content == null ? "" : content, StandardCharsets.UTF_8);
-            log.info("write_file OK path={} chars={}", p, content == null ? 0 : content.length());
-            return "已写入 " + p + "（" + (content == null ? 0 : content.length()) + " 字符）";
-        } catch (IOException e) {
-            log.info("write_file FAIL path={} err={}", p, e.getMessage());
-            return "写入失败：" + e.getMessage();
-        }
+    private FilesystemTool routingTools(Supplier<List<Path>> rootsSupplier, OpRequestSink sink) {
+        AbstractFilesystem routing = (AbstractFilesystem) Proxy.newProxyInstance(
+                WorkspaceFileTools.class.getClassLoader(), new Class<?>[]{AbstractFilesystem.class},
+                (proxy, method, args) -> {
+                    if (method.getDeclaringClass() == Object.class) {
+                        return method.invoke(proxy, args);
+                    }
+                    Object denied = gateIfControlled(method.getName(), args, sink);
+                    if (denied != null) {
+                        return denied;
+                    }
+                    List<Path> roots = rootsSupplier.get();
+                    Path target = targetPathOf(args);
+                    return method.invoke(filesystemFor(roots, target), args);
+                });
+        return new FilesystemTool(routing);
     }
 
-    private String doReadFile(String path, String conversationId) {
-        Path p = resolve(path, conversationId);
-        if (p == null) {
-            log.info("read_file REJECTED path={}", path);
-            return pathErr(path);
-        }
-        if (!Files.isRegularFile(p)) return "文件不存在或不是普通文件：" + path;
-        try {
-            String text = Files.readString(p, StandardCharsets.UTF_8);
-            if (text.isEmpty()) return "（文件为空）";
-            if (text.length() > MAX_READ_CHARS) {
-                return text.substring(0, MAX_READ_CHARS)
-                        + "\n\n（内容过长已截断，完整共 " + text.length() + " 字符）";
-            }
-            return text;
-        } catch (IOException e) {
-            return "读取失败：" + e.getMessage();
-        }
-    }
-
-    private String doListDir(String path, String conversationId) {
-        String raw = path == null || path.isBlank() ? "." : path;
-        Path p = resolve(raw, conversationId);
-        if (p == null) return pathErr(raw);
-        if (!Files.isDirectory(p)) return "目录不存在或不是目录：" + raw;
-        try (Stream<Path> s = Files.list(p)) {
-            List<String> items = s.sorted(Comparator.comparing((Path x) -> !Files.isDirectory(x))
-                            .thenComparing(x -> x.getFileName().toString()))
-                    .map(x -> Files.isDirectory(x)
-                            ? "[目录] " + x.getFileName()
-                            : x.getFileName() + "（" + sizeOf(x) + "）")
-                    .toList();
-            if (items.isEmpty()) return "（空目录）";
-            return "目录「" + raw.trim() + "」共 " + items.size() + " 项：\n" + String.join("\n", items);
-        } catch (IOException e) {
-            return "列目录失败：" + e.getMessage();
-        }
-    }
-
-    private String sizeOf(Path p) {
-        try {
-            long n = Files.size(p);
-            return n < 1024 ? n + " B" : String.format("%.1f KB", n / 1024.0);
-        } catch (IOException e) {
-            return "?";
-        }
-    }
-
-    /** 校验并解析路径；空白、非法或越界返回 null */
-    private Path resolve(String path, String conversationId) {
-        if (path == null || path.isBlank()) return null;
-        Path p;
-        try {
-            p = allowedRoots.get(0).resolve(path.trim()).normalize();
-        } catch (Exception e) {
+    /**
+     * write/edit 为受控操作：先经审批（弹卡片阻塞等用户决定），未批准直接返回 fail 结果不落盘。
+     * 返回 null 表示非受控操作或已获批准，继续正常调用。
+     */
+    private Object gateIfControlled(String method, Object[] args, OpRequestSink sink) {
+        if (sink == null) {
             return null;
         }
-        for (Path root : allowedRootsFor(conversationId)) {
-            if (p.startsWith(root)) return p;
+        String opType;
+        String target;
+        String detail;
+        switch (method) {
+            case "write" -> {
+                opType = OperationGrant.OP_WRITE;
+                target = strArg(args, 1);
+                detail = strArg(args, 2);
+            }
+            case "edit" -> {
+                opType = OperationGrant.OP_EDIT;
+                target = strArg(args, 1);
+                detail = "原文：\n" + strArg(args, 2) + "\n改为：\n" + strArg(args, 3);
+            }
+            default -> {
+                return null;
+            }
+        }
+        if (sink.request(opType, target, detail)) {
+            return null;
+        }
+        return OperationGrant.OP_EDIT.equals(opType)
+                ? EditResult.fail("用户未批准本次修改，文件未被更改。请尊重用户的决定，不要重复提交同样的修改。")
+                : WriteResult.fail("用户未批准本次写入，文件未被写入。请尊重用户的决定，不要重复提交同样的写入。");
+    }
+
+    private String strArg(Object[] args, int index) {
+        return args != null && args.length > index && args[index] instanceof String s ? s : null;
+    }
+
+    /**
+     * 按盘符选择文件系统实例：框架的 LocalFilesystem 在 Windows 上跨盘符访问
+     * additionalRoots 会因 cwd.relativize 抛「other has different root」（SANDBOXED 模式
+     * 则把外部目录当沙箱内相对路径解析而不可达），因此为每个涉及到的盘符各建一个
+     * cwd 落在该盘的实例。target 为绝对路径时按其盘符路由；相对路径始终落主工作区。
+     */
+    private AbstractFilesystem filesystemFor(List<Path> roots, Path target) {
+        Path primary = roots.get(0);
+        if (target != null && !driveOf(target).equals(driveOf(primary))) {
+            List<Path> driveRoots = roots.stream().filter(r -> driveOf(r).equals(driveOf(target))).toList();
+            if (!driveRoots.isEmpty()) {
+                return buildFilesystem(driveRoots);
+            }
+        }
+        List<Path> sameDrive = roots.stream().skip(1).filter(r -> driveOf(r).equals(driveOf(primary))).toList();
+        return buildFilesystem(primary, sameDrive);
+    }
+
+    /** buildFilesystem 的单列表入口：第一个元素是 project（cwd），其余是 additionalRoots */
+    private AbstractFilesystem buildFilesystem(Path project, List<Path> additional) {
+        return new LocalFilesystemSpec()
+                .project(project)
+                .projectWritable(true)
+                .additionalRoots(additional)
+                .toFilesystem(project, null);
+    }
+
+    private AbstractFilesystem buildFilesystem(List<Path> roots) {
+        return buildFilesystem(roots.get(0), roots.subList(1, roots.size()));
+    }
+
+    /** 从工具调用参数里找绝对路径（支持模型回传的 /C:/... 前缀形态），找不到返回 null */
+    private Path targetPathOf(Object[] args) {
+        if (args == null) return null;
+        for (Object a : args) {
+            if (!(a instanceof String s)) continue;
+            String t = s.trim();
+            if (t.startsWith("/")) t = t.substring(1);
+            if (t.length() >= 2 && t.charAt(1) == ':') {
+                try {
+                    return Paths.get(t);
+                } catch (Exception ignored) {
+                    // 非法路径参数交给框架按原样处理并报错
+                }
+            }
         }
         return null;
     }
 
-    private String pathErr(String path) {
-        return "路径无效或超出沙箱范围：" + path + "。相对路径请相对主工作区根目录，绝对路径必须在主工作区、"
-                + "白名单目录或用户为本会话授权的文件/目录内";
+    /** 路径的盘符标识（Windows 大小写不敏感；非盘符路径归到空串） */
+    private String driveOf(Path p) {
+        Path root = p.toAbsolutePath().getRoot();
+        return root == null ? "" : root.toString().toUpperCase();
     }
 }
