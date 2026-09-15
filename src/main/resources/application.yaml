@@ -1,18 +1,30 @@
 server:
   port: 8080
+  # 单机桌面应用：仅监听本机回环
+  address: 127.0.0.1
 
 spring:
   datasource:
-    url: jdbc:mysql://localhost:3306/agent_team?characterEncoding=UTF-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
-    username: root
-    password: "123456"
-    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:sqlite:./data/agent_team.db
+    driver-class-name: org.sqlite.JDBC
+    hikari:
+      # SQLite 同一时间只允许一个写入连接，连接池限制为 1
+      maximum-pool-size: 1
+      data-source-properties:
+        journal_mode: WAL
+        busy_timeout: 3000
   jpa:
     open-in-view: false
     hibernate:
       ddl-auto: none
+    properties:
+      hibernate:
+        dialect: org.hibernate.community.dialect.SQLiteDialect
 
 # 智能体文件工具的工作区根目录（沙箱）：所有文件操作只能发生在这个目录内
 app:
   workspace:
     root: ./workspace
+  # 本地访问令牌：桌面壳启动时传入随机值；为空则不校验（裸跑开发模式）
+  security:
+    token:

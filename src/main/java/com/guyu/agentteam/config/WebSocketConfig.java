@@ -19,6 +19,8 @@ public class WebSocketConfig implements WebSocketConfigurer {
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
-        registry.addHandler(asrStreamHandler, "/api/asr/stream").setAllowedOrigins("*");
+        // 与 WebConfig 一致：桌面壳（file:// 页面，WebSocket 握手 Origin 为 "file://"，fetch 则为 "null"）+ 本地开发服务器
+        registry.addHandler(asrStreamHandler, "/api/asr/stream")
+                .setAllowedOrigins("null", "file://", "http://localhost:5173");
     }
 }

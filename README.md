@@ -32,7 +32,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 沙箱 = 主工作区目录 + 白名单目录 + 会话授权目录：相对路径解析到主工作区；绝对路径必须落在允许范围内，越界请求会返回错误说明供模型自行纠正；Windows 多盘符按路径自动路由到对应文件系统
 - 会话授权：用户在聊天输入框附加文件/文件夹后，该路径自动对本会话开放读写（`conversation_file_grants` 表）；编排者建群时会把发起会话的授权复制一份到项目群（两份副本互相独立），文件工具的作用域全程跟随当前协作目标会话，群内撤销立即生效
 - 通过 `PUT /api/settings/workspace` 运行时修改全局沙箱，立即生效，重启不丢（持久化于 `app_settings` 表）
-- 文件选择弹窗数据源：`GET /api/fs/list?path=` 服务端目录浏览（只读；path 为空返回盘符）
+- 文件/目录选择：桌面壳调用系统资源管理器原生对话框，前端拿到真实路径后交给后端
 
 ### 受控操作审批（人审卡片）
 - 写入（`write_file`）、修改（`edit_file`）与终端命令（`execute`）是受控操作：智能体发起时回复暂停，前端弹出审批卡片，展示发起智能体、操作类型、目标文件与完整内容/命令
@@ -69,34 +69,36 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | 框架 | Spring Boot 4.1.1（Java 21） |
 | 编排 | AgentScope Java 2.0.1（ReActAgent + Toolkit + harness 文件/shell 工具） |
 | 模型接入 | agentscope-extensions-model-openai（OpenAI 兼容接口） |
-| 数据 | Spring Data JPA + MySQL 8 |
+| 数据 | Spring Data JPA + SQLite（单文件，WAL 模式） |
 | 其他 | Lombok、SseEmitter（SSE 流式推送） |
 
 ## 快速开始
 
-环境要求：JDK 21、MySQL 8.0+。
-
-1. 初始化数据库（按顺序执行 `db/` 下的脚本）：
-
-```bash
-mysql -uroot -p < db/agent_team.sql
-```
-
-2. 按需修改 `src/main/resources/application.yaml` 中的数据源配置（默认 `root/123456`，库 `agent_team`）。
-
-3. 启动：
+环境要求：JDK 21。数据库使用 SQLite 单文件，无需安装，首次启动自动建库建表并创建默认用户。
 
 ```bash
 ./mvnw spring-boot:run        # Windows: mvnw.cmd spring-boot:run
 ```
 
-服务监听 `8080`。前端开发服务器会将 `/api` 代理到该端口。
+服务监听 `127.0.0.1:8080`。前端开发服务器会将 `/api` 代理到该端口。
+
+### 数据库与升级
+
+- 数据文件默认为 `./data/agent_team.db`（目录不存在会自动创建，`-wal`/`-shm` 为 WAL 模式运行时文件），可通过 `spring.datasource.url` 覆盖路径
+- 表结构由版本化迁移管理：`src/main/resources/db/migration/V{n}__xxx.sql`，启动时自动执行未应用的脚本并记录于 `_migration` 表，升级版本无需手动执行 SQL
+- SQLite 同一时间只允许一个写入连接，连接池已固定为 1
+- 数据库快照：`GET /api/settings/backup/database` 基于 `VACUUM INTO` 导出一致性热备份（含未落盘的 WAL 数据），返回 SQLite 数据库文件；桌面壳的「导出备份」即调用此接口
+
+### 本地访问令牌
+
+配置 `app.security.token` 后，所有 `/api/**` 请求必须携带 `X-AT-Token` 请求头（或 `token` 查询参数），防止本机其他进程或浏览器网页访问 API；留空则不校验（裸跑开发）。桌面壳（agent-team-desktop）启动时会自动生成并传入随机令牌。
 
 ### 配置项
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `spring.datasource.*` | `localhost:3306/agent_team` | 数据库连接 |
+| `spring.datasource.*` | `./data/agent_team.db` | SQLite 数据文件路径 |
+| `app.security.token` | 空（不校验） | 本地访问令牌，桌面壳自动注入 |
 | `app.workspace.root` | `./workspace` | 未在设置页自定义时的默认工作区目录 |
 
 ## SSE 事件协议
@@ -126,15 +128,15 @@ mysql -uroot -p < db/agent_team.sql
 | `/api/agents` | 智能体 CRUD |
 | `/api/model-presets` | 模型预设 CRUD |
 | `/api/conversations` | 会话、消息、SSE 流式回复、会话文件授权（`/{id}/files`）、受控操作审批（`/{id}/op-grant`） |
-| `/api/fs` | 服务端目录浏览 + 图片内容读取（文件选择弹窗与气泡缩略图数据源，只读） |
+| `/api/fs` | 图片内容读取（气泡缩略图数据源，只读） |
 | `/api/asr/stream` | 实时语音转写 WebSocket（桥接讯飞流式听写） |
-| `/api/settings` | 文件沙箱设置、实时语音识别配置 |
+| `/api/settings` | 文件沙箱设置、实时语音识别配置、数据库快照导出 |
 
 ## 目录结构
 
 ```
 src/main/java/com/guyu/agentteam/
-├── config/                WebSocket 等配置
+├── config/                数据源/版本化迁移、本地令牌过滤、WebSocket 等配置
 ├── controller/            REST 与 SSE 端点
 ├── service/
 │   ├── ChatStreamService        回复规则与流式回复
@@ -150,10 +152,11 @@ src/main/java/com/guyu/agentteam/
 │       └── OpRequestSink        审批请求回调接口
 ├── ws/                    实时语音转写 WebSocket（讯飞桥接）
 ├── repository/            Spring Data JPA
-├── entity / dto / common  实体、传输对象、公共层
-db/                        建库与迁移脚本
+└── entity / dto / common  实体、传输对象、公共层
+src/main/resources/db/migration/  版本化迁移脚本（启动时自动执行）
 ```
 
 ## 相关仓库
 
 - 前端界面 [agent-team-web]：Vue 3 + TypeScript + Pinia，类微信深色界面
+- 桌面壳 [agent-team-desktop]：Electron 打包分发，自动拉起本服务并管理数据目录与备份

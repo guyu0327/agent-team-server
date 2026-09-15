@@ -56,3 +56,6 @@ replay_pid*
 
 ### AgentScope runtime ###
 .agentscope/
+
+### SQLite 本地数据（私有化部署默认路径） ###
+/data/

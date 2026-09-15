@@ -1,6 +1,7 @@
 package com.guyu.agentteam.service;
 
 import com.guyu.agentteam.common.ApiException;
+import com.guyu.agentteam.common.Ids;
 import com.guyu.agentteam.dto.UserDto;
 import com.guyu.agentteam.dto.UserUpdateRequest;
 import com.guyu.agentteam.entity.User;
@@ -20,7 +21,15 @@ public class UserService {
     public User getCurrent() {
         User u = users.findFirstByOrderByCreatedAtAsc();
         if (u == null) {
-            throw ApiException.notFound("用户不存在");
+            // 私有化部署（SQLite）首启空库时自动创建默认账号，可在设置中改名
+            u = new User();
+            u.setId(Ids.next());
+            u.setName("老板");
+            u.setAvatar("");
+            u.setSignature("");
+            u.setCreatedAt(System.currentTimeMillis());
+            u.setUpdatedAt(System.currentTimeMillis());
+            u = users.save(u);
         }
         return u;
     }
