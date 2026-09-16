@@ -10,4 +10,6 @@ public interface AgentRepository extends JpaRepository<Agent, String> {
     List<Agent> findByOrderByCreatedAtAsc();
 
     long countByPresetId(String presetId);
+
+    long countByImagePresetId(String imagePresetId);
 }

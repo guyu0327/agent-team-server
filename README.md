@@ -2,7 +2,10 @@
 
 AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实现真正的智能体编排：@项目经理提一个需求，他会自动拆解任务、把工作委派给程序员和测试、按需创建项目群，完成后把总结发回你的单聊。
 
-配套前端：`agent-team-web`（Vue 3 类微信界面，见相关仓库）
+## 相关仓库
+
+- 前端界面 [agent-team-web](https://github.com/guyu0327/agent-team-web)：Vue 3 + TypeScript + Pinia，类微信深色界面
+- 桌面壳 [agent-team-desktop](https://github.com/guyu0327/agent-team-desktop)：Electron 打包分发，自动拉起本服务并管理数据目录与备份
 
 ## 核心机制
 
@@ -48,6 +51,12 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 进入模型上下文的单图上限 8MB（超限自动跳过，文本标注不受影响）
 - 前端气泡展示图片用只读端点：`GET /api/fs/content?path=`（仅限图片扩展名，单图 ≤ 20MB）
 
+### 文生图工具（generate_image）
+- 模型预设分四类协议：`openai-chat`（对话，默认）/ `dashscope-image` / `openai-image` / `siliconflow-image`（文生图）；图像类预设的「名称」即模型名（如 `z-image-turbo`、`dall-e-3`、`Kwai-Kolors/Kolors`），API 地址填官方文档的完整图像接口地址（如 `https://api.siliconflow.cn/v1/images/generations`），后端原样请求、不做任何路径拼接，密钥同样加密存储、不回显
+- 智能体可绑定一个图像预设（可空）：绑定的智能体（单聊、群成员、编排者均生效）在 ReAct 循环中获得 `generate_image(prompt, size)` 工具，调用文生图服务后把图片保存到主工作区 `generated/` 目录（文件名时间戳+随机、只增不覆盖），并在回复中以 Markdown 引用路径展示
+- 支持的模型：DashScope 同步端点（z-image-turbo、qwen-image）、OpenAI Images 兼容接口（dall-e-3、gpt-image-1 及同形聚合服务）与硅基流动（Kwai-Kolors/Kolors、Qwen/Qwen-Image，返回的图片 URL 一小时有效、适配器即时下载落盘）；wanx 等异步任务型暂不支持
+- 生图写入位置固定且不覆盖已有文件，属用户主动要求的创作行为，豁免审批卡片；未绑定图像预设的智能体看不到该工具
+
 ### 实时语音转写（讯飞流式听写）
 - WebSocket 端点 `/api/asr/stream`：前端发二进制 16k PCM 音频与 `{"type":"stop"}` 控制帧；后端按讯飞节奏（40ms / 1280B 一帧，base64）装帧转发到 `wss://iat-api.xfyun.cn/v2/iat`，识别结果转为 `{type:partial|final|error|end}` JSON 回传
 - 每条前端连接一个 `SessionBridge`：队列缓冲（满丢最旧保延迟）、发送链串行化、60 秒上限自动收尾、stop 后排空残余等 final 再关，所有清理路径收敛到幂等 `shutdown()`
@@ -59,6 +68,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 用户 / 智能体 / 模型预设 / 会话 / 消息完整 REST API
 - 单聊、群聊、群成员管理、解散、置顶、重命名、已读未读
 - OpenAI 兼容模型接入：每个智能体可关联不同预设、独立温度与角色设定
+- 文生图：预设按协议分类（对话 / DashScope 文生图 / OpenAI Images 文生图），智能体绑定图像预设即获得 `generate_image` 工具，图片落工作区并在气泡中展示
 - 编排者开关（`is_orchestrator`）：任意智能体可设为团队编排者
 - 受控操作审批：AI 写入、修改文件与执行终端命令前弹卡片询问用户，支持允许一次 / 本会话允许 / 拒绝
 
@@ -93,6 +103,12 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 配置 `app.security.token` 后，所有 `/api/**` 请求必须携带 `X-AT-Token` 请求头（或 `token` 查询参数），防止本机其他进程或浏览器网页访问 API；留空则不校验（裸跑开发）。桌面壳（agent-team-desktop）启动时会自动生成并传入随机令牌。
 
+### 密钥加密存储
+
+- 模型预设的 API Key 与讯飞语音识别的 APIKey/APISecret 在数据库中经 Windows DPAPI 加密存储（`dpapi:` 前缀标识，JNA 调用，启动时自动迁移存量明文），数据库文件或备份被拷走后密钥不可解
+- 加密绑定当前 Windows 账户：直接把 `agent_team.db` 拷到其他账户/机器会因解密失败而显示为未配置，需重新填写；非 Windows 环境降级为明文存储
+- 密钥永不回传前端：`GET /api/model-presets` 与 `GET/PUT /api/settings/asr-stream` 只返回 `hasKey` 等状态；更新时密钥留空表示保持不变（讯飞三项全部留空表示清除配置）
+
 ### 配置项
 
 | 配置 | 默认值 | 说明 |
@@ -113,6 +129,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | `reply_end` | 一段回复完成（含最终全文） |
 | `reply_error` | 回复失败或为空 |
 | `op_request` | 受控操作审批请求（`requestId` / `opType`: write\|edit\|shell / `agentName` / `target` / `detail`），等待 `POST /{id}/op-grant` 决定，期间该操作阻塞（最长 120 秒） |
+| `image_start` / `image_end` | 文生图工具开始 / 结束（`generate_image` 执行窗口，前端据此显示生成动画；start 含 `agentName`，均携带 `conversationId`） |
 | `conversation_created` | 编排者创建了项目群（含完整会话对象） |
 | `coordination_start` / `coordination_end` | 编排协调状态开始 / 结束（按会话） |
 | `discussion_start` / `discussion_end` | 自由讨论开始 / 结束（按会话） |
@@ -130,7 +147,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | `/api/conversations` | 会话、消息、SSE 流式回复、会话文件授权（`/{id}/files`）、受控操作审批（`/{id}/op-grant`） |
 | `/api/fs` | 图片内容读取（气泡缩略图数据源，只读） |
 | `/api/asr/stream` | 实时语音转写 WebSocket（桥接讯飞流式听写） |
-| `/api/settings` | 文件沙箱设置、实时语音识别配置、数据库快照导出 |
+| `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、数据库快照导出 |
 
 ## 目录结构
 
@@ -149,14 +166,11 @@ src/main/java/com/guyu/agentteam/
 │   └── tool/
 │       ├── WorkspaceFileTools   文件工具与动态沙箱（多盘符路由 + 写入/修改门控）
 │       ├── GatedShellTool       审批门控的终端命令工具
+│       ├── ImageGenerationTools 文生图工具（按智能体图像预设注册）
+│       ├── DashscopeImageAdapter / OpenAiImageAdapter / SiliconflowImageAdapter  文生图协议适配器
 │       └── OpRequestSink        审批请求回调接口
 ├── ws/                    实时语音转写 WebSocket（讯飞桥接）
 ├── repository/            Spring Data JPA
 └── entity / dto / common  实体、传输对象、公共层
 src/main/resources/db/migration/  版本化迁移脚本（启动时自动执行）
 ```
-
-## 相关仓库
-
-- 前端界面 [agent-team-web]：Vue 3 + TypeScript + Pinia，类微信深色界面
-- 桌面壳 [agent-team-desktop]：Electron 打包分发，自动拉起本服务并管理数据目录与备份

@@ -1,6 +1,7 @@
 package com.guyu.agentteam.controller;
 
 import com.guyu.agentteam.common.ApiException;
+import com.guyu.agentteam.dto.AsrStreamStatusDto;
 import com.guyu.agentteam.dto.WorkspaceSettingsDto;
 import com.guyu.agentteam.dto.WorkspaceSettingsRequest;
 import com.guyu.agentteam.dto.XfyunAsrConfigDto;
@@ -55,12 +56,12 @@ public class SettingsController {
     }
 
     @GetMapping("/asr-stream")
-    public XfyunAsrConfigDto asrStream() {
-        return asrStream.getConfig();
+    public AsrStreamStatusDto asrStream() {
+        return asrStream.status();
     }
 
     @PutMapping("/asr-stream")
-    public XfyunAsrConfigDto updateAsrStream(@RequestBody XfyunAsrConfigDto req) {
+    public AsrStreamStatusDto updateAsrStream(@RequestBody XfyunAsrConfigDto req) {
         return asrStream.saveConfig(req);
     }
 

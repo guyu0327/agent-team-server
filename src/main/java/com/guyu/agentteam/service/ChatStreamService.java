@@ -10,6 +10,7 @@ import com.guyu.agentteam.repository.AgentRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.service.orchestration.AgentModelFactory;
 import com.guyu.agentteam.service.orchestration.OrchestrationService;
+import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.ReActAgent;
@@ -63,18 +64,21 @@ public class ChatStreamService {
     private final AgentRepository agents;
     private final AgentModelFactory modelFactory;
     private final WorkspaceFileTools fileTools;
+    private final ImageGenerationTools imageTools;
     private final ConversationStreamSupport support;
     private final OrchestrationService orchestration;
     private final OpApprovalService approval;
 
     public ChatStreamService(ConversationMemberRepository members,
                              AgentRepository agents, AgentModelFactory modelFactory,
-                             WorkspaceFileTools fileTools, ConversationStreamSupport support,
+                             WorkspaceFileTools fileTools, ImageGenerationTools imageTools,
+                             ConversationStreamSupport support,
                              OrchestrationService orchestration, OpApprovalService approval) {
         this.members = members;
         this.agents = agents;
         this.modelFactory = modelFactory;
         this.fileTools = fileTools;
+        this.imageTools = imageTools;
         this.support = support;
         this.orchestration = orchestration;
         this.approval = approval;
@@ -212,6 +216,7 @@ public class ChatStreamService {
         Toolkit toolkit = new Toolkit();
         toolkit.registerTool(fileTools.toolsFor(conv.getId(), sink));
         fileTools.registerShellTool(toolkit, conv::getId, sink);
+        imageTools.register(toolkit, agent, support.imageListener(emitter, conv::getId, agent));
         return toolkit;
     }
 

@@ -11,6 +11,7 @@ import com.guyu.agentteam.entity.ModelPreset;
 import com.guyu.agentteam.repository.ConversationRepository;
 import com.guyu.agentteam.repository.MessageRepository;
 import com.guyu.agentteam.repository.ModelPresetRepository;
+import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import io.agentscope.core.agent.accumulator.TextAccumulator;
 import io.agentscope.core.message.AssistantMessage;
 import io.agentscope.core.model.ExecutionConfig;
@@ -36,6 +37,7 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Supplier;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -66,6 +68,25 @@ public class ConversationStreamSupport {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /** 生图进度 → SSE（image_start / image_end），普通回复与编排协作共用；会话 ID 由调用方给定（协作中可能切到项目群） */
+    public ImageGenerationTools.ProgressListener imageListener(SseEmitter emitter, Supplier<String> conversationId,
+                                                               Agent agent) {
+        return new ImageGenerationTools.ProgressListener() {
+            @Override
+            public void onStart() {
+                send(emitter, "image_start", Map.of(
+                        "agentId", agent.getId(),
+                        "agentName", agent.getName(),
+                        "conversationId", conversationId.get()));
+            }
+
+            @Override
+            public void onEnd() {
+                send(emitter, "image_end", Map.of("conversationId", conversationId.get()));
+            }
+        };
     }
 
     public Message saveMessage(Conversation conv, Agent agent, String content, String type) {

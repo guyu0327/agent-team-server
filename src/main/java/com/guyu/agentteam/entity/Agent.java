@@ -21,6 +21,8 @@ public class Agent {
     private String description;
     /** 关联的模型预设，模型的名称/地址/Key 都取自预设 */
     private String presetId;
+    /** 可选关联的图像预设（文生图类），绑定的智能体才注册 generate_image 工具 */
+    private String imagePresetId;
     /** 为 true 时在聊天中作为团队编排者运行 AgentScope ReAct 循环 */
     private Boolean isOrchestrator;
     private String systemPrompt;

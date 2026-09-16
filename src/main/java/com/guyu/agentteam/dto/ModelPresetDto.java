@@ -2,13 +2,11 @@ package com.guyu.agentteam.dto;
 
 import com.guyu.agentteam.entity.ModelPreset;
 
-/**
- * 预设的 apiKey 会返回给前端：新建智能体时需要用它自动填充表单。
- * （智能体本身的 apiKey 仍然永不返回，区别对待是有意为之。）
- */
-public record ModelPresetDto(String id, String name, String baseUrl, String apiKey, String remark) {
+/** 预设的 apiKey 永不返回前端，仅回传 hasKey 状态；更新时密钥留空表示保持不变 */
+public record ModelPresetDto(String id, String name, String protocol, String baseUrl, boolean hasKey, String remark) {
 
     public static ModelPresetDto from(ModelPreset p) {
-        return new ModelPresetDto(p.getId(), p.getName(), p.getBaseUrl(), p.getApiKey(), p.getRemark());
+        boolean hasKey = p.getApiKey() != null && !p.getApiKey().isBlank();
+        return new ModelPresetDto(p.getId(), p.getName(), p.getProtocol(), p.getBaseUrl(), hasKey, p.getRemark());
     }
 }

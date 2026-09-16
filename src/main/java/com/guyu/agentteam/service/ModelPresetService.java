@@ -15,6 +15,15 @@ import java.util.List;
 @Service
 public class ModelPresetService {
 
+    /** 协议类型常量：对话（OpenAI 兼容）/ DashScope / OpenAI Images / 硅基流动 文生图 */
+    public static final String PROTOCOL_CHAT = "openai-chat";
+    public static final String PROTOCOL_DASHSCOPE_IMAGE = "dashscope-image";
+    public static final String PROTOCOL_OPENAI_IMAGE = "openai-image";
+    public static final String PROTOCOL_SILICONFLOW_IMAGE = "siliconflow-image";
+
+    public static final List<String> SUPPORTED_PROTOCOLS =
+            List.of(PROTOCOL_CHAT, PROTOCOL_DASHSCOPE_IMAGE, PROTOCOL_OPENAI_IMAGE, PROTOCOL_SILICONFLOW_IMAGE);
+
     private final ModelPresetRepository presets;
     private final AgentRepository agents;
 
@@ -54,8 +63,9 @@ public class ModelPresetService {
     @Transactional
     public void delete(String id) {
         long used = agents.countByPresetId(id);
-        if (used > 0) {
-            throw ApiException.badRequest("该预设正被 " + used + " 个智能体使用，无法删除");
+        long usedAsImage = agents.countByImagePresetId(id);
+        if (used > 0 || usedAsImage > 0) {
+            throw ApiException.badRequest("该预设正被 " + (used + usedAsImage) + " 个智能体使用，无法删除");
         }
         presets.delete(find(id));
     }
@@ -71,10 +81,18 @@ public class ModelPresetService {
         if (req.baseUrl() == null || req.baseUrl().isBlank()) {
             throw ApiException.badRequest("API 地址不能为空");
         }
+        if (!isBlank(req.protocol()) && !SUPPORTED_PROTOCOLS.contains(req.protocol().trim())) {
+            throw ApiException.badRequest("不支持的预设类型：" + req.protocol());
+        }
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
     }
 
     private void apply(ModelPreset p, ModelPresetUpsertRequest req, boolean isCreate) {
         p.setName(req.name().trim());
+        p.setProtocol(isBlank(req.protocol()) ? PROTOCOL_CHAT : req.protocol().trim());
         p.setBaseUrl(req.baseUrl().trim());
         p.setRemark(req.remark() == null ? "" : req.remark().trim());
         if (req.apiKey() != null && !req.apiKey().isBlank()) {

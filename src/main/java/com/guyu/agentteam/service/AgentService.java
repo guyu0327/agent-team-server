@@ -8,6 +8,7 @@ import com.guyu.agentteam.dto.AgentUpsertRequest;
 import com.guyu.agentteam.entity.Agent;
 import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.entity.ConversationMember;
+import com.guyu.agentteam.entity.ModelPreset;
 import com.guyu.agentteam.repository.AgentRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.repository.ConversationRepository;
@@ -103,6 +104,13 @@ public class AgentService {
         if (!presets.existsById(req.presetId())) {
             throw ApiException.badRequest("模型预设不存在");
         }
+        if (req.imagePresetId() != null && !req.imagePresetId().isBlank()) {
+            ModelPreset image = presets.findById(req.imagePresetId())
+                    .orElseThrow(() -> ApiException.badRequest("图像预设不存在"));
+            if (ModelPresetService.PROTOCOL_CHAT.equals(image.getProtocol())) {
+                throw ApiException.badRequest("图像预设必须是文生图类型，不能选择对话预设");
+            }
+        }
     }
 
     private void apply(Agent a, AgentUpsertRequest req, boolean isCreate) {
@@ -111,6 +119,7 @@ public class AgentService {
         a.setGroupName(req.groupName() == null ? "" : req.groupName().trim());
         a.setDescription(req.description() == null ? "" : req.description());
         a.setPresetId(req.presetId());
+        a.setImagePresetId(req.imagePresetId() == null || req.imagePresetId().isBlank() ? null : req.imagePresetId());
         a.setIsOrchestrator(Boolean.TRUE.equals(req.isOrchestrator()));
         a.setSystemPrompt(req.systemPrompt() == null ? "" : req.systemPrompt());
         a.setTemperature(req.temperature() == null ? 0.7 : req.temperature());

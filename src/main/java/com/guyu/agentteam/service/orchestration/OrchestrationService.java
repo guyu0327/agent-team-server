@@ -13,6 +13,7 @@ import com.guyu.agentteam.service.ConversationService;
 import com.guyu.agentteam.service.ConversationStreamSupport;
 import com.guyu.agentteam.service.FileGrantService;
 import com.guyu.agentteam.service.OpApprovalService;
+import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.ReActAgent;
@@ -60,6 +61,7 @@ public class OrchestrationService {
     private final ConversationService conversationService;
     private final AgentModelFactory modelFactory;
     private final WorkspaceFileTools fileTools;
+    private final ImageGenerationTools imageTools;
     private final FileGrantService fileGrants;
     private final OpApprovalService approval;
     /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
@@ -68,6 +70,7 @@ public class OrchestrationService {
     public OrchestrationService(AgentRepository agents, ConversationMemberRepository members,
                                 ConversationStreamSupport support, ConversationService conversationService,
                                 AgentModelFactory modelFactory, WorkspaceFileTools fileTools,
+                                ImageGenerationTools imageTools,
                                 FileGrantService fileGrants, OpApprovalService approval) {
         this.agents = agents;
         this.members = members;
@@ -75,6 +78,7 @@ public class OrchestrationService {
         this.conversationService = conversationService;
         this.modelFactory = modelFactory;
         this.fileTools = fileTools;
+        this.imageTools = imageTools;
         this.fileGrants = fileGrants;
         this.approval = approval;
     }
@@ -96,6 +100,7 @@ public class OrchestrationService {
                 approval.approve(emitter, orchestrator, target.get().getId(), opType, opTarget, detail);
         toolkit.registerTool(fileTools.toolsFor(() -> target.get().getId(), sink));
         fileTools.registerShellTool(toolkit, () -> target.get().getId(), sink);
+        imageTools.register(toolkit, orchestrator, support.imageListener(emitter, () -> target.get().getId(), orchestrator));
         toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId, handle));
 
         sendCoordination(emitter, "coordination_start", orchestrator, conv.getId());
@@ -385,6 +390,7 @@ public class OrchestrationService {
             Toolkit memberToolkit = new Toolkit();
             memberToolkit.registerTool(fileTools.toolsFor(conv.getId(), memberSink));
             fileTools.registerShellTool(memberToolkit, conv::getId, memberSink);
+            imageTools.register(memberToolkit, targetAgent, support.imageListener(emitter, conv::getId, targetAgent));
             String memberNote = fileTools.promptNote(conv.getId());
             String memberSysPrompt = support.isBlank(targetAgent.getSystemPrompt())
                     ? memberNote
