@@ -4,6 +4,7 @@ import com.guyu.agentteam.common.Ids;
 import com.guyu.agentteam.common.Images;
 import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.entity.Agent;
+import com.guyu.agentteam.entity.AppLog;
 import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.entity.ConversationFileGrant;
 import com.guyu.agentteam.entity.Message;
@@ -53,12 +54,23 @@ public class ConversationStreamSupport {
     private final ConversationRepository conversations;
     private final MessageRepository messages;
     private final ModelPresetRepository presets;
+    private final AppLogService appLogs;
+
+    /** 漏斗里需要落库的运行事件 → 日志类型（op_request 由 OpApprovalService 单独记录，content 类事件不记） */
+    private static final Map<String, String> LOGGED_EVENTS = Map.of(
+            "coordination_start", AppLog.TYPE_COORDINATION,
+            "coordination_end", AppLog.TYPE_COORDINATION,
+            "discussion_start", AppLog.TYPE_DISCUSSION,
+            "discussion_end", AppLog.TYPE_DISCUSSION,
+            "image_start", AppLog.TYPE_IMAGE,
+            "image_end", AppLog.TYPE_IMAGE);
 
     public ConversationStreamSupport(ConversationRepository conversations, MessageRepository messages,
-                                     ModelPresetRepository presets) {
+                                     ModelPresetRepository presets, AppLogService appLogs) {
         this.conversations = conversations;
         this.messages = messages;
         this.presets = presets;
+        this.appLogs = appLogs;
     }
 
     public void send(SseEmitter emitter, String event, Object data) {
@@ -68,6 +80,20 @@ public class ConversationStreamSupport {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+        logEvent(event, data);
+    }
+
+    private void logEvent(String event, Object data) {
+        String type = LOGGED_EVENTS.get(event);
+        if (type == null || !(data instanceof Map<?, ?> payload)) {
+            return;
+        }
+        appLogs.record(type, str(payload.get("conversationId")), str(payload.get("agentId")),
+                event + (payload.get("agentName") == null ? "" : "「" + payload.get("agentName") + "」"));
+    }
+
+    private static String str(Object o) {
+        return o == null ? null : String.valueOf(o);
     }
 
     /** 生图进度 → SSE（image_start / image_end），普通回复与编排协作共用；会话 ID 由调用方给定（协作中可能切到项目群） */
@@ -107,12 +133,14 @@ public class ConversationStreamSupport {
 
     public void persistError(Conversation conv, Agent agent, String error) {
         saveMessage(conv, agent, error, "error");
+        appLogs.record(AppLog.TYPE_ERROR, conv.getId(), agent.getId(), error);
     }
 
     public void markError(Message placeholder, String error) {
         placeholder.setType("error");
         placeholder.setContent(error);
         messages.save(placeholder);
+        appLogs.record(AppLog.TYPE_ERROR, placeholder.getConversationId(), placeholder.getSenderId(), error);
     }
 
     public void touchConversation(Conversation conv, Agent agent, String content) {

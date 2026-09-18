@@ -3,12 +3,15 @@ package com.guyu.agentteam.service.orchestration;
 import com.guyu.agentteam.dto.ConversationDto;
 import com.guyu.agentteam.dto.GroupChatRequest;
 import com.guyu.agentteam.entity.Agent;
+import com.guyu.agentteam.entity.AppLog;
 import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.entity.ConversationMember;
 import com.guyu.agentteam.entity.Message;
 import com.guyu.agentteam.entity.ModelPreset;
 import com.guyu.agentteam.repository.AgentRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
+import com.guyu.agentteam.service.AppLogService;
+import com.guyu.agentteam.service.CoordinationLimitsService;
 import com.guyu.agentteam.service.ConversationService;
 import com.guyu.agentteam.service.ConversationStreamSupport;
 import com.guyu.agentteam.service.FileGrantService;
@@ -29,6 +32,7 @@ import io.agentscope.core.tool.ToolParam;
 import io.agentscope.core.tool.Toolkit;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.publisher.Mono;
 
 import java.io.UncheckedIOException;
 import java.time.Duration;
@@ -51,9 +55,8 @@ import java.util.stream.Collectors;
 @Service
 public class OrchestrationService {
 
-    private static final int MAX_ITERS = 10;
-    private static final Duration OVERALL_TIMEOUT = Duration.ofMinutes(8);
-    private static final Duration MEMBER_TIMEOUT = Duration.ofMinutes(4);
+    /** ReAct 迭代不设上限（int 最大值等效于关闭），总时长由「协作限制」设置兜底 */
+    private static final int MAX_ITERS = Integer.MAX_VALUE;
 
     private final AgentRepository agents;
     private final ConversationMemberRepository members;
@@ -64,6 +67,8 @@ public class OrchestrationService {
     private final ImageGenerationTools imageTools;
     private final FileGrantService fileGrants;
     private final OpApprovalService approval;
+    private final AppLogService appLogs;
+    private final CoordinationLimitsService limitsService;
     /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
     private final Map<String, RunHandle> runs = new ConcurrentHashMap<>();
 
@@ -71,7 +76,8 @@ public class OrchestrationService {
                                 ConversationStreamSupport support, ConversationService conversationService,
                                 AgentModelFactory modelFactory, WorkspaceFileTools fileTools,
                                 ImageGenerationTools imageTools,
-                                FileGrantService fileGrants, OpApprovalService approval) {
+                                FileGrantService fileGrants, OpApprovalService approval,
+                                AppLogService appLogs, CoordinationLimitsService limitsService) {
         this.agents = agents;
         this.members = members;
         this.support = support;
@@ -81,6 +87,8 @@ public class OrchestrationService {
         this.imageTools = imageTools;
         this.fileGrants = fileGrants;
         this.approval = approval;
+        this.appLogs = appLogs;
+        this.limitsService = limitsService;
     }
 
     public void run(SseEmitter emitter, Conversation conv, Agent orchestrator, ModelPreset preset) {
@@ -116,6 +124,7 @@ public class OrchestrationService {
         handle.running.add(agent);
         try {
             agent.streamEvents(support.historyMsgs(conv.getId()))
+                    .takeUntilOther(handle.cancelSignal())
                     .doOnNext(e -> {
                         if (e.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
                             if (finished.get()) return;
@@ -131,7 +140,7 @@ public class OrchestrationService {
                             support.closeSegment(emitter, target.get(), orchestrator, seg);
                         }
                     })
-                    .blockLast(OVERALL_TIMEOUT);
+                    .blockLast(Duration.ofMinutes(limitsService.load().overallMinutes()));
             support.closeSegment(emitter, target.get(), orchestrator, seg);
             if (handle.stopRequested.get()) notifyCancelled(emitter, conv, orchestrator, finished);
         } catch (UncheckedIOException e) {
@@ -167,8 +176,12 @@ public class OrchestrationService {
     public boolean stop(String conversationId) {
         RunHandle handle = runs.get(conversationId);
         if (handle == null) return false;
-        handle.stopRequested.set(true);
+        // 直接掐断在途的模型请求/审批等待：框架 interrupt 只在迭代间生效，长调用会拖住终止
+        handle.requestCancel();
         handle.running.forEach(ReActAgent::interrupt);
+        // 卡在审批等待的请求按拒绝唤醒，前端同步关闭卡片
+        handle.keys.forEach(key -> approval.cancelAllForConversation(key));
+        appLogs.record(AppLog.TYPE_COORDINATION, conversationId, null, "用户手动终止协作");
         return true;
     }
 
@@ -179,6 +192,26 @@ public class OrchestrationService {
         final Set<ReActAgent> running = ConcurrentHashMap.newKeySet();
         /** 该运行注册过的所有会话ID（发起请求的单聊 + 协作中创建的项目群） */
         final Set<String> keys = ConcurrentHashMap.newKeySet();
+        /** 终止通知回调：每个流式调用独立注册；不能用共享 Future——订阅被取消会连带 cancel 连坐他人 */
+        private final Set<Runnable> cancelListeners = ConcurrentHashMap.newKeySet();
+
+        void requestCancel() {
+            stopRequested.set(true);
+            cancelListeners.forEach(Runnable::run);
+        }
+
+        /** 取消信号：终止时立即完成；每个订阅独立注册，流的正常结束只注销自己 */
+        Mono<Void> cancelSignal() {
+            return Mono.create(sink -> {
+                Runnable notify = () -> sink.success(null);
+                sink.onDispose(() -> cancelListeners.remove(notify));
+                // 先注册后检查，堵住「注册前已终止」的竞态窗口；重复 success 幂等
+                cancelListeners.add(notify);
+                if (stopRequested.get()) {
+                    notify.run();
+                }
+            });
+        }
     }
 
     /** 终止提示：finish 已提交过总结就不补，避免画蛇添足 */
@@ -216,6 +249,15 @@ public class OrchestrationService {
                 .toList();
     }
 
+    /** 日志用的任务描述摘要 */
+    private static String excerpt(String text) {
+        if (text == null) {
+            return "";
+        }
+        String t = text.replaceAll("\\s+", " ").trim();
+        return t.length() <= 200 ? t : t.substring(0, 200) + "…";
+    }
+
     private String buildSysPrompt(Agent orchestrator, List<Agent> team, String conversationId) {
         StringBuilder sb = new StringBuilder();
         String base = orchestrator.getSystemPrompt();
@@ -225,9 +267,9 @@ public class OrchestrationService {
         sb.append("你是智能体团队的编排者（").append(orchestrator.getName())
                 .append("），职责是理解用户需求，协调团队成员分工完成，并给出最终总结。\n")
                 .append("协作规范：\n")
-                .append("1. 先调用 list_team 了解可委派的成员及其职责。\n")
+                .append("1. 先调用 list_team 了解可委派的成员及其职责和能力。\n")
                 .append("2. 只要本次任务需要 2 个及以上成员配合（例如一人开发、另一人测试或评审），就必须在第一次 delegate 之前先调用 create_team 创建项目群，之后所有安排和委派都在群里进行。只有确定全程只需要 1 个成员独立完成时，才可以不建群。\n")
-                .append("3. 把需求拆解为子任务，用 delegate 依次委派给合适的成员；任务描述要完整明确，包含必要的上下文、要求和期望产出。\n")
+                .append("3. 把需求拆解为子任务，用 delegate 依次委派给最合适的成员（按成员能力匹配，涉及生成/绘制图片的任务只能委派给具备图像生成能力的成员）；任务描述要完整明确，包含必要的上下文、要求和期望产出。\n")
                 .append("4. 成员的输出会直接展示给用户，不要复述成员的完整输出；你只需在每次委派前后简短说明你的安排和判断。\n")
                 .append("5. 单次只委派一个成员，等他的结果返回后再决定下一步（例如先实现再验证）。\n");
         if (team.isEmpty()) {
@@ -236,6 +278,18 @@ public class OrchestrationService {
             sb.append("6. 所有工作完成后必须调用 finish，summary 写给用户的最终总结答复，总结会发回用户发起请求的会话。\n");
         }
         sb.append("7. 如果任务要求把成果写到文件，委派时要把期望的输出路径（相对工作区根目录）写进任务描述，并提醒成员调用 write_file 完成写入。\n");
+        // 成员能力清单：让编排者无需逐个试探就知道谁能绘图，委派才能精准
+        List<Agent> drawers = team.stream().filter(imageTools::hasCapability).toList();
+        if (imageTools.hasCapability(orchestrator)) {
+            sb.append("你本人具备图像生成能力（generate_image 工具），可直接完成简单的生图请求。\n");
+        }
+        if (!drawers.isEmpty()) {
+            sb.append("具备图像生成（绘图）能力的成员：")
+                    .append(drawers.stream().map(Agent::getName).collect(Collectors.joining("、")))
+                    .append("。涉及绘图/生成图片的子任务必须委派给这些成员，其余成员无法生成图片。\n");
+        } else if (!team.isEmpty()) {
+            sb.append("当前所有成员均不具备图像生成能力，涉及绘图的任务请自行完成或向用户说明。\n");
+        }
         sb.append(fileTools.promptNote(conversationId)).append("\n");
         return sb.toString();
     }
@@ -271,7 +325,7 @@ public class OrchestrationService {
             this.handle = handle;
         }
 
-        @Tool(name = "list_team", description = "查看当前可委派的团队成员名单及其职责", readOnly = true)
+        @Tool(name = "list_team", description = "查看当前可委派的团队成员名单及其职责与能力", readOnly = true)
         public String listTeam() {
             if (team.isEmpty()) {
                 return "当前团队没有其他成员，你需要自己完成任务并调用 finish 总结。";
@@ -281,6 +335,9 @@ public class OrchestrationService {
                 sb.append("- ").append(a.getName());
                 if (!support.isBlank(a.getDescription())) {
                     sb.append("：").append(a.getDescription().trim());
+                }
+                if (imageTools.hasCapability(a)) {
+                    sb.append("［具备图像生成/绘图能力，可委派绘图任务］");
                 }
                 sb.append("\n");
             }
@@ -365,6 +422,8 @@ public class OrchestrationService {
             }
             delegatedMembers.add(targetAgent.getId());
             Conversation conv = target.get();
+            appLogs.record(AppLog.TYPE_COORDINATION, conv.getId(), targetAgent.getId(),
+                    "编排者委派任务给「" + targetAgent.getName() + "」：" + excerpt(task));
             Optional<ModelPreset> p = support.presetOf(targetAgent);
             if (p.isEmpty() || support.isBlank(p.get().getApiKey()) || support.isBlank(p.get().getBaseUrl())) {
                 support.persistError(conv, targetAgent, "「" + targetAgent.getName() + "」的模型预设缺失或不完整，无法参与协作");
@@ -407,6 +466,7 @@ public class OrchestrationService {
             handle.running.add(memberAgent);
             try {
                 memberAgent.streamEvents(new UserMessage(task))
+                        .takeUntilOther(handle.cancelSignal())
                         .doOnNext(ev -> {
                             if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
                                 String d = ((TextBlockDeltaEvent) ev).getDelta();
@@ -419,7 +479,7 @@ public class OrchestrationService {
                                 result.set(((AgentResultEvent) ev).getResult());
                             }
                         })
-                        .blockLast(MEMBER_TIMEOUT);
+                        .blockLast(Duration.ofMinutes(limitsService.load().memberMinutes()));
             } catch (UncheckedIOException e) {
                 throw e;
             } catch (Exception e) {

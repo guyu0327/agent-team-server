@@ -2,10 +2,13 @@ package com.guyu.agentteam.controller;
 
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.dto.AsrStreamStatusDto;
+import com.guyu.agentteam.dto.CoordinationLimitsDto;
+import com.guyu.agentteam.dto.CoordinationLimitsRequest;
 import com.guyu.agentteam.dto.WorkspaceSettingsDto;
 import com.guyu.agentteam.dto.WorkspaceSettingsRequest;
 import com.guyu.agentteam.dto.XfyunAsrConfigDto;
 import com.guyu.agentteam.service.AsrStreamService;
+import com.guyu.agentteam.service.CoordinationLimitsService;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpHeaders;
@@ -33,13 +36,16 @@ public class SettingsController {
 
     private final WorkspaceFileTools workspace;
     private final AsrStreamService asrStream;
+    private final CoordinationLimitsService coordinationLimits;
     private final DataSource dataSource;
     private final Environment env;
 
     public SettingsController(WorkspaceFileTools workspace, AsrStreamService asrStream,
+                              CoordinationLimitsService coordinationLimits,
                               DataSource dataSource, Environment env) {
         this.workspace = workspace;
         this.asrStream = asrStream;
+        this.coordinationLimits = coordinationLimits;
         this.dataSource = dataSource;
         this.env = env;
     }
@@ -63,6 +69,17 @@ public class SettingsController {
     @PutMapping("/asr-stream")
     public AsrStreamStatusDto updateAsrStream(@RequestBody XfyunAsrConfigDto req) {
         return asrStream.saveConfig(req);
+    }
+
+    @GetMapping("/coordination")
+    public CoordinationLimitsDto coordination() {
+        var l = coordinationLimits.load();
+        return new CoordinationLimitsDto(l.overallMinutes(), l.memberMinutes());
+    }
+
+    @PutMapping("/coordination")
+    public CoordinationLimitsDto updateCoordination(@RequestBody CoordinationLimitsRequest req) {
+        return coordinationLimits.save(req.overallMinutes(), req.memberMinutes());
     }
 
     /**

@@ -67,6 +67,17 @@ public class ImageGenerationTools {
         toolkit.registerTool(new GenerateImageTool(adapters.get(preset.getProtocol()), preset, fileTools, listener));
     }
 
+    /** 该智能体是否具备生图能力（绑定了配置完整的图像生成预设）：编排者据此感知谁能绘图 */
+    public boolean hasCapability(Agent agent) {
+        String presetId = agent.getImagePresetId();
+        if (presetId == null || presetId.isBlank()) {
+            return false;
+        }
+        ModelPreset preset = presets.findById(presetId).orElse(null);
+        return preset != null && adapters.containsKey(preset.getProtocol())
+                && !isBlank(preset.getApiKey()) && !isBlank(preset.getBaseUrl());
+    }
+
     public static class GenerateImageTool {
 
         private final ImageGenAdapter adapter;

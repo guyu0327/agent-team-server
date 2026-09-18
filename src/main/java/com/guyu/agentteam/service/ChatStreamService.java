@@ -2,6 +2,7 @@ package com.guyu.agentteam.service;
 
 import com.guyu.agentteam.dto.MessageDto;
 import com.guyu.agentteam.entity.Agent;
+import com.guyu.agentteam.entity.AppLog;
 import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.entity.ConversationMember;
 import com.guyu.agentteam.entity.Message;
@@ -24,6 +25,7 @@ import io.agentscope.core.tool.Toolkit;
 import jakarta.annotation.PreDestroy;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.publisher.Mono;
 
 import java.io.UncheckedIOException;
 import java.time.Duration;
@@ -42,17 +44,14 @@ import java.util.stream.Collectors;
  * 回复规则：@了谁只有被@的人回复，没@则群里全员依次回复（后一个人能看到前一个人的发言）。
  * 编排者例外：被点名或群里存在编排者时，由编排者单独运行 AgentScope 协作循环，按需调用其他成员。
  * 自由模式（群聊 chat_mode=free 且无编排者）：首轮回复结束后由「主持人」模型逐轮选出下一位发言人
- * 接龙讨论，直到主持人判定结束、达到轮数上限、总超时或用户终止。
+ * 接龙讨论，直到主持人判定结束、总超时或用户终止。
  * 所有回复都走 AgentScope ReAct 循环，智能体可调用工作区文件工具（write_file/read_file/list_dir）。
  */
 @Service
 public class ChatStreamService {
 
-    private static final int MAX_ITERS = 10;
-    private static final Duration REPLY_TIMEOUT = Duration.ofMinutes(4);
-    /** 自由讨论接龙轮数上限（不含首轮被@的回复） */
-    private static final int MAX_CHAIN_TURNS = 8;
-    private static final Duration CHAIN_OVERALL = Duration.ofMinutes(10);
+    /** ReAct 迭代不设上限（int 最大值等效于关闭），单条回复时长由「协作限制」设置兜底 */
+    private static final int MAX_ITERS = Integer.MAX_VALUE;
     private static final Duration SELECT_TIMEOUT = Duration.ofMinutes(2);
 
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -68,12 +67,15 @@ public class ChatStreamService {
     private final ConversationStreamSupport support;
     private final OrchestrationService orchestration;
     private final OpApprovalService approval;
+    private final AppLogService appLogs;
+    private final CoordinationLimitsService limitsService;
 
     public ChatStreamService(ConversationMemberRepository members,
                              AgentRepository agents, AgentModelFactory modelFactory,
                              WorkspaceFileTools fileTools, ImageGenerationTools imageTools,
                              ConversationStreamSupport support,
-                             OrchestrationService orchestration, OpApprovalService approval) {
+                             OrchestrationService orchestration, OpApprovalService approval,
+                             AppLogService appLogs, CoordinationLimitsService limitsService) {
         this.members = members;
         this.agents = agents;
         this.modelFactory = modelFactory;
@@ -82,6 +84,8 @@ public class ChatStreamService {
         this.support = support;
         this.orchestration = orchestration;
         this.approval = approval;
+        this.appLogs = appLogs;
+        this.limitsService = limitsService;
     }
 
     public void stream(SseEmitter emitter, Conversation conv, Message userMsg) {
@@ -126,8 +130,12 @@ public class ChatStreamService {
     public boolean stop(String conversationId) {
         RunHandle handle = runs.get(conversationId);
         if (handle == null) return false;
-        handle.stopRequested.set(true);
+        // 直接掐断在途的模型请求/审批等待：框架 interrupt 只在迭代间生效，长调用会拖住终止
+        handle.requestCancel();
         handle.running.forEach(ReActAgent::interrupt);
+        // 卡在审批等待的请求按拒绝唤醒，前端同步关闭卡片
+        approval.cancelAllForConversation(conversationId);
+        appLogs.record(AppLog.TYPE_DISCUSSION, conversationId, null, "用户手动终止自由讨论");
         return true;
     }
 
@@ -165,6 +173,7 @@ public class ChatStreamService {
         if (handle != null) handle.running.add(react);
         try {
             react.streamEvents(input)
+                    .takeUntilOther(handle != null ? handle.cancelSignal() : Mono.never())
                     .doOnNext(ev -> {
                         if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
                             String delta = ((TextBlockDeltaEvent) ev).getDelta();
@@ -179,7 +188,7 @@ public class ChatStreamService {
                             support.closeSegment(emitter, conv, agent, seg);
                         }
                     })
-                    .blockLast(REPLY_TIMEOUT);
+                    .blockLast(Duration.ofMinutes(limitsService.load().memberMinutes()));
             support.closeSegment(emitter, conv, agent, seg);
             if (seg.opened == 0 && (handle == null || !handle.stopRequested.get())) {
                 support.persistError(conv, agent, "「" + agent.getName() + "」（模型未返回内容）");
@@ -257,22 +266,22 @@ public class ChatStreamService {
                 .toList();
     }
 
-    /** 自由讨论接龙：每轮由主持人模型选出下一位发言人，直到判定结束/轮数上限/总超时/用户终止 */
+    /** 自由讨论接龙：每轮由主持人模型选出下一位发言人，直到判定结束/总超时/用户终止 */
     private void runDiscussionChain(SseEmitter emitter, Conversation conv, RunHandle handle) {
         List<Agent> pool = memberAgents(conv);
         if (pool.size() < 2) {
             return;
         }
-        long deadline = System.currentTimeMillis() + CHAIN_OVERALL.toMillis();
+        long deadline = System.currentTimeMillis() + Duration.ofMinutes(limitsService.load().overallMinutes()).toMillis();
         Agent lastSpeaker = null;
-        for (int turn = 0; turn < MAX_CHAIN_TURNS; turn++) {
+        while (true) {
             if (handle.stopRequested.get()) {
                 return;
             }
             if (System.currentTimeMillis() >= deadline) {
                 break;
             }
-            Agent next = selectNextSpeaker(conv, pool, lastSpeaker);
+            Agent next = selectNextSpeaker(conv, pool, lastSpeaker, handle);
             if (next == null) {
                 break;
             }
@@ -312,7 +321,7 @@ public class ChatStreamService {
     }
 
     /** 主持人决策：返回下一位发言人；返回 null 表示讨论结束（含决策失败时的保险结束） */
-    private Agent selectNextSpeaker(Conversation conv, List<Agent> pool, Agent lastSpeaker) {
+    private Agent selectNextSpeaker(Conversation conv, List<Agent> pool, Agent lastSpeaker, RunHandle handle) {
         // 主持人复用上一位发言人（或第一个配置完整的成员）的模型预设
         Agent modelOwner = lastSpeaker != null ? lastSpeaker
                 : pool.stream().filter(this::hasUsablePreset).findFirst().orElse(null);
@@ -328,17 +337,23 @@ public class ChatStreamService {
                 .sysPrompt(moderatorPrompt(pool))
                 .model(modelFactory.create(modelOwner, presetOpt.get(), true))
                 .build()) {
-            // 带署名历史经 MultiAgentFormatter 合并为 <history>，thinking 模型下不会因裸 assistant 轮 400；
-            // 结构化输出由框架适配端点能力：原生 response_format 失败自动降级为工具式输出
-            Msg decision = judge.call(moderatorInput(conv, pool), ModeratorDecision.class)
-                    .block(SELECT_TIMEOUT);
-            String name = decision == null || !decision.hasStructuredData()
-                    ? ""
-                    : String.valueOf(decision.getStructuredData(ModeratorDecision.class).getSpeaker()).trim();
-            if (name.isEmpty() || name.toUpperCase().contains("END") || name.contains("结束")) {
-                return null;
+            if (handle != null) handle.running.add(judge);
+            try {
+                // 带署名历史经 MultiAgentFormatter 合并为 <history>，thinking 模型下不会因裸 assistant 轮 400；
+                // 结构化输出由框架适配端点能力：原生 response_format 失败自动降级为工具式输出
+                Msg decision = judge.call(moderatorInput(conv, pool), ModeratorDecision.class)
+                        .takeUntilOther(handle.cancelSignal())
+                        .block(SELECT_TIMEOUT);
+                String name = decision == null || !decision.hasStructuredData()
+                        ? ""
+                        : String.valueOf(decision.getStructuredData(ModeratorDecision.class).getSpeaker()).trim();
+                if (name.isEmpty() || name.toUpperCase().contains("END") || name.contains("结束")) {
+                    return null;
+                }
+                return matchSpeaker(name, pool);
+            } finally {
+                if (handle != null) handle.running.remove(judge);
             }
-            return matchSpeaker(name, pool);
         } catch (Exception e) {
             return null;
         }
@@ -404,6 +419,26 @@ public class ChatStreamService {
     private static final class RunHandle {
         final AtomicBoolean stopRequested = new AtomicBoolean(false);
         final Set<ReActAgent> running = ConcurrentHashMap.newKeySet();
+        /** 终止通知回调：每个流式调用独立注册；不能用共享 Future——订阅被取消会连带 cancel 连坐他人 */
+        private final Set<Runnable> cancelListeners = ConcurrentHashMap.newKeySet();
+
+        void requestCancel() {
+            stopRequested.set(true);
+            cancelListeners.forEach(Runnable::run);
+        }
+
+        /** 取消信号：终止时立即完成；每个订阅独立注册，流的正常结束只注销自己 */
+        Mono<Void> cancelSignal() {
+            return Mono.create(sink -> {
+                Runnable notify = () -> sink.success(null);
+                sink.onDispose(() -> cancelListeners.remove(notify));
+                // 先注册后检查，堵住「注册前已终止」的竞态窗口；重复 success 幂等
+                cancelListeners.add(notify);
+                if (stopRequested.get()) {
+                    notify.run();
+                }
+            });
+        }
     }
 
     private boolean isBlank(String s) {

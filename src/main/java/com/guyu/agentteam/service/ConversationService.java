@@ -51,7 +51,15 @@ public class ConversationService {
 
     @Transactional(readOnly = true)
     public List<ConversationDto> list(String userId) {
-        return conversations.findByUserIdOrderByPinnedDescLastMessageAtDesc(userId).stream()
+        return conversations.findByUserIdAndArchivedAtIsNullOrderByPinnedDescLastMessageAtDesc(userId).stream()
+                .map(this::toDto).toList();
+    }
+
+    /** 历史会话列表：按归档时间倒序；agentId 非空时只回与其绑定的会话（单聊命中、群聊含该成员也命中） */
+    @Transactional(readOnly = true)
+    public List<ConversationDto> listArchived(String userId, String agentId) {
+        return conversations.findByUserIdAndArchivedAtIsNotNullOrderByArchivedAtDesc(userId).stream()
+                .filter(c -> agentId == null || agentId.isBlank() || memberIds(c.getId()).contains(agentId))
                 .map(this::toDto).toList();
     }
 
@@ -66,7 +74,7 @@ public class ConversationService {
             throw ApiException.badRequest("缺少 agentId");
         }
         agents.findById(agentId).orElseThrow(() -> ApiException.notFound("智能体不存在"));
-        for (Conversation c : conversations.findByUserIdAndType(userId, "single")) {
+        for (Conversation c : conversations.findByUserIdAndTypeAndArchivedAtIsNull(userId, "single")) {
             if (memberIds(c.getId()).contains(agentId)) {
                 return toDto(c);
             }
@@ -182,6 +190,59 @@ public class ConversationService {
         deleteAll(getEntity(id));
     }
 
+    /** 归档到历史会话：空会话直接物理删除，不产生空历史 */
+    @Transactional
+    public void archive(String id) {
+        Conversation c = getEntity(id);
+        if (c.getArchivedAt() != null) {
+            return;
+        }
+        if (!messages.existsByConversationId(id)) {
+            deleteAll(c);
+            return;
+        }
+        archiveInPlace(c);
+    }
+
+    /** 恢复历史会话到消息列表。单聊冲突处理：同智能体已有活跃单聊时，有消息的先归档、空的物理删除（swap） */
+    @Transactional
+    public ConversationDto restore(String id) {
+        Conversation c = getEntity(id);
+        if (c.getArchivedAt() == null) {
+            return toDto(c);
+        }
+        if ("single".equals(c.getType())) {
+            String agentId = memberIds(id).isEmpty() ? null : memberIds(id).get(0);
+            if (agentId != null) {
+                for (Conversation other : conversations.findByUserIdAndTypeAndArchivedAtIsNull(c.getUserId(), "single")) {
+                    if (!memberIds(other.getId()).contains(agentId)) {
+                        continue;
+                    }
+                    if (messages.existsByConversationId(other.getId())) {
+                        archiveInPlace(other);
+                    } else {
+                        deleteAll(other);
+                    }
+                    break;
+                }
+            }
+        }
+        c.setArchivedAt(null);
+        c.setUpdatedAt(System.currentTimeMillis());
+        conversations.save(c);
+        return toDto(c);
+    }
+
+    /** 归档落库：清置顶、归零未读，members/grants 全不动，恢复后直接可用 */
+    private void archiveInPlace(Conversation c) {
+        long now = System.currentTimeMillis();
+        c.setArchivedAt(now);
+        c.setPinned(false);
+        c.setLastReadAt(now);
+        c.setUpdatedAt(now);
+        conversations.save(c);
+    }
+
     @Transactional
     public void reset(String id) {
         Conversation c = getEntity(id);
@@ -215,7 +276,7 @@ public class ConversationService {
         return new ConversationDto(c.getId(), c.getType(), c.getName() == null ? "" : c.getName(), agentId,
                 ids, c.getChatMode() == null ? "passive" : c.getChatMode(), c.isPinned(),
                 c.getLastMessage() == null ? "" : c.getLastMessage(),
-                c.getLastMessageAt(), unread);
+                c.getLastMessageAt(), unread, c.getArchivedAt());
     }
 
     private Conversation baseConversation(String userId, long now) {

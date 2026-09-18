@@ -16,5 +16,7 @@ public interface MessageRepository extends JpaRepository<Message, String> {
 
     long countByConversationIdAndCreatedAtGreaterThanAndSenderTypeNot(String conversationId, Long createdAt, String senderType);
 
+    boolean existsByConversationId(String conversationId);
+
     void deleteByConversationId(String conversationId);
 }

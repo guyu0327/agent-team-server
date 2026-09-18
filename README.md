@@ -13,22 +13,23 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - @谁谁回；没人被 @ 时全员依次回复（后一个能看到前一个的发言）
 - 群聊回复（被动与自由讨论）统一接入 AgentScope 的 `OpenAIMultiAgentFormatter`：历史里的成员消息与用户消息都携带发言人名称，请求侧合并为带署名的 `<history>`，成员能分清「谁说了什么」，不会把其他成员的发言当成自己的历史；自由讨论的「轮到你发言」「选下一位发言人」等控制指令通过 `MessageMetadataKeys.BYPASS_MULTIAGENT_HISTORY_MERGE` 标记保持为真实用户轮，不混入历史
 - 编排者例外：被 @ 或在场时，由编排者单独运行协作循环，其他成员由他调度
-- 群聊模式（`chat_mode`）：被动（默认，按上述规则）| 自由讨论。自由讨论仅对无编排者的群生效：首轮回复后由「主持人」模型逐轮选出下一位发言人接龙，直到主持人判定结束、达到轮数上限（8）、总超时（10 分钟）或用户终止；`PUT /api/conversations/{id}/mode` 切换，建群时可通过 `chatMode` 直接指定
+- 群聊模式（`chat_mode`）：被动（默认，按上述规则）| 自由讨论。自由讨论仅对无编排者的群生效：首轮回复后由「主持人」模型逐轮选出下一位发言人接龙，直到主持人判定结束、达到总超时或用户终止（ReAct 迭代与接龙轮数不再设上限，时长完全由「协作限制」兜底）；`PUT /api/conversations/{id}/mode` 切换，建群时可通过 `chatMode` 直接指定
 
 ### 编排协作（透明协作）
 编排者通过四个工具驱动团队：
 
 | 工具 | 作用 |
 | --- | --- |
-| `list_team` | 查看可委派的成员及职责 |
+| `list_team` | 查看可委派的成员及职责与能力（是否具备图像生成等） |
 | `create_team` | 需要多成员配合时自动创建项目群，协作过程进群 |
 | `delegate` | 委派子任务；成员用自己的人设和模型独立执行，输出作为真实消息流式展示 |
 | `finish` | 提交最终总结，自动发回用户发起请求的单聊 |
 
 - 协作全程透明：编排者的每段发言、成员的完整输出都是真实持久化的聊天消息
 - 编排者发言按工具调用自动切分为多段气泡
-- 协作或自由讨论进行中可随时终止：`POST /api/conversations/{id}/stop`（同时终止编排协作与自由讨论，已产生的输出保留）
-- 限制：maxIters=10，整体超时 8 分钟，单个成员 4 分钟
+- 编排者提前感知成员能力：`list_team` 返回成员职责与能力（是否具备图像生成），系统提示也注入成员能力清单，绘图任务只会委派给具备图像生成的成员
+- 协作或自由讨论进行中可随时终止：`POST /api/conversations/{id}/stop`（同时终止编排协作与自由讨论，直接掐断在途模型请求并按拒绝唤醒待审批请求，已产生的输出保留）
+- 限制：ReAct 迭代不设上限；整体与单成员时长可在设置页配置（默认 60 / 5 分钟，持久化于 `app_settings` 的 `coordination.limits`），到时自动终止
 
 ### 文件工具（沙箱）
 - 所有智能体（含普通单聊直答）都运行在 ReAct 循环上，文件能力来自 AgentScope harness 的 `FilesystemTool`：`read_file` / `write_file` / `edit_file` / `grep_files` / `glob_files` / `list_files`，另有 `execute` 终端命令工具（Windows 下为 cmd）
@@ -39,10 +40,22 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 ### 受控操作审批（人审卡片）
 - 写入（`write_file`）、修改（`edit_file`）与终端命令（`execute`）是受控操作：智能体发起时回复暂停，前端弹出审批卡片，展示发起智能体、操作类型、目标文件与完整内容/命令
-- 三个决定：**允许一次** / **本会话允许**（持久化于 `operation_grants` 表，按会话+操作类型生效，同类操作后续不再询问）/ **拒绝**；卡片 120 秒未响应按拒绝处理
-- 被拒或超时的操作不会执行，模型收到拒绝说明并被告知不要反复重试；会话删除或消息重置时自动清除本会话授权
+- 三个决定：**允许一次** / **本会话允许**（持久化于 `operation_grants` 表，按会话+操作类型生效，同类操作后续不再询问，并立即放行该会话同类型的其他待审批请求）/ **拒绝**；卡片 120 秒未响应按拒绝处理
+- 被拒或超时的操作不会执行，模型收到拒绝说明并被告知不要反复重试；会话删除或消息重置时自动清除本会话授权；终止协作/讨论或归档会话时按拒绝唤醒全部待审批请求
 - 框架 `FilesystemTool` 没有删除工具，删除文件只能经 `execute` 命令完成，同样需要审批
 - 决定接口：`POST /api/conversations/{id}/op-grant`（`requestId` + `decision: once|conversation|deny`）
+
+### 会话归档（历史会话）
+- `conversations.archived_at` 非空即视为已归档（历史会话），活跃列表与单聊复用查询一律排除，避免「恢复后又被旧会话顶掉」
+- 归档入口：`POST /api/conversations/{id}/archive`（先中断进行中的回复/协作，再落归档标记；空会话直接物理删除，不产生空历史），适用于删除/解散/开始新会话等所有「聊天消失」操作
+- 恢复：`POST /api/conversations/{id}/restore` 把会话拉回活跃列表；单聊冲突时，同智能体已有活跃单聊会先入历史（有消息）或被物理删除（空会话），保证同一智能体始终只有一个活跃单聊
+- 归档只清置顶与未读，成员、文件授权、消息全部保留，恢复后可直接继续聊；彻底删除仍走 `DELETE /api/conversations/{id}`
+- 历史列表：`GET /api/conversations?archived=true`，可选 `agentId` 过滤与其相关的会话（单聊命中或群聊含该成员）
+
+### 运行日志（app_logs）
+- 关键事件落库，便于排查问题：`error` / `op_request` / `op_decision` / `coordination` / `discussion` / `image` / `api_error`
+- 写入经内存队列异步批量落库（业务线程只入队），避免 SQLite 单连接被日志阻塞；队列满丢弃新日志并限流告警
+- 保留 30 天，批量写入后低频触发过期清理；查询走 `GET /api/logs`，支持 `type` / `from` / `to` / 分页，前端「设置-数据管理-查看日志」即基于此
 
 ### 图片消息（多模态）
 - 附加文件时按内容自动识别类型：文件夹 / 图片 / 普通文件，授权表随之记录 `type`
@@ -66,11 +79,12 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 ## 功能特性
 
 - 用户 / 智能体 / 模型预设 / 会话 / 消息完整 REST API
-- 单聊、群聊、群成员管理、解散、置顶、重命名、已读未读
+- 单聊、群聊、群成员管理、解散、置顶、重命名、已读未读；删除/解散/重置统一下沉为会话归档（历史会话），可恢复或彻底删除
 - OpenAI 兼容模型接入：每个智能体可关联不同预设、独立温度与角色设定
 - 文生图：预设按协议分类（对话 / DashScope 文生图 / OpenAI Images 文生图），智能体绑定图像预设即获得 `generate_image` 工具，图片落工作区并在气泡中展示
-- 编排者开关（`is_orchestrator`）：任意智能体可设为团队编排者
-- 受控操作审批：AI 写入、修改文件与执行终端命令前弹卡片询问用户，支持允许一次 / 本会话允许 / 拒绝
+- 编排者开关（`is_orchestrator`）：任意智能体可设为团队编排者，且能感知成员的绘图能力
+- 受控操作审批：AI 写入、修改文件与执行终端命令前弹卡片询问用户，支持允许一次 / 本会话允许（批量放行同类待审批）/ 拒绝
+- 运行日志：协作/讨论/审批/生图/错误等关键事件异步落库，可按类型与时间范围查询
 
 ## 技术栈
 
@@ -144,10 +158,11 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | `/api/user` | 当前用户（老板）信息 |
 | `/api/agents` | 智能体 CRUD |
 | `/api/model-presets` | 模型预设 CRUD |
-| `/api/conversations` | 会话、消息、SSE 流式回复、会话文件授权（`/{id}/files`）、受控操作审批（`/{id}/op-grant`） |
+| `/api/conversations` | 会话、消息、SSE 流式回复、会话文件授权（`/{id}/files`）、受控操作审批（`/{id}/op-grant`）、历史会话归档/恢复（`/{id}/archive`、`/{id}/restore`） |
 | `/api/fs` | 图片内容读取（气泡缩略图数据源，只读） |
 | `/api/asr/stream` | 实时语音转写 WebSocket（桥接讯飞流式听写） |
-| `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、数据库快照导出 |
+| `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、协作时长限制、数据库快照导出 |
+| `/api/logs` | 运行日志查询（按类型与时间范围分页） |
 
 ## 目录结构
 
@@ -158,7 +173,9 @@ src/main/java/com/guyu/agentteam/
 ├── service/
 │   ├── ChatStreamService        回复规则与流式回复
 │   ├── ConversationStreamSupport  SSE 发送 / 持久化 / 分段流式（普通与编排共用）
-│   ├── OpApprovalService        受控操作审批（卡片请求、阻塞等待与决定）
+│   ├── OpApprovalService        受控操作审批（卡片请求、阻塞等待、批量放行与取消）
+│   ├── AppLogService            运行日志异步落库与过期清理
+│   ├── CoordinationLimitsService 协作/讨论时长限制（app_settings 持久化）
 │   ├── AsrStreamService         实时语音识别配置与讯飞鉴权
 │   ├── orchestration/
 │   │   ├── OrchestrationService   编排协作循环与团队工具

@@ -7,7 +7,9 @@ import java.util.List;
 
 public interface ConversationRepository extends JpaRepository<Conversation, String> {
 
-    List<Conversation> findByUserIdOrderByPinnedDescLastMessageAtDesc(String userId);
+    List<Conversation> findByUserIdAndArchivedAtIsNullOrderByPinnedDescLastMessageAtDesc(String userId);
 
-    List<Conversation> findByUserIdAndType(String userId, String type);
+    List<Conversation> findByUserIdAndTypeAndArchivedAtIsNull(String userId, String type);
+
+    List<Conversation> findByUserIdAndArchivedAtIsNotNullOrderByArchivedAtDesc(String userId);
 }

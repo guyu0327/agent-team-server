@@ -62,7 +62,11 @@ public class ConversationController {
     }
 
     @GetMapping
-    public List<ConversationDto> list() {
+    public List<ConversationDto> list(@RequestParam(required = false) Boolean archived,
+                                      @RequestParam(required = false) String agentId) {
+        if (Boolean.TRUE.equals(archived)) {
+            return conversationService.listArchived(CurrentUser.ID, agentId);
+        }
         return conversationService.list(CurrentUser.ID);
     }
 
@@ -114,6 +118,21 @@ public class ConversationController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@PathVariable String id) {
         conversationService.delete(id);
+    }
+
+    /** 归档到历史会话：先中断进行中的回复/协作，再落归档标记 */
+    @PostMapping("/{id}/archive")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void archive(@PathVariable String id) {
+        orchestrationService.stop(id);
+        chatStreamService.stop(id);
+        conversationService.archive(id);
+    }
+
+    /** 从历史会话恢复到消息列表（单聊冲突时原活跃会话自动入历史） */
+    @PostMapping("/{id}/restore")
+    public ConversationDto restore(@PathVariable String id) {
+        return conversationService.restore(id);
     }
 
     @DeleteMapping("/{id}/messages")

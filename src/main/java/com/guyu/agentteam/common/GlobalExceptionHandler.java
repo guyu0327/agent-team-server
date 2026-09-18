@@ -1,5 +1,8 @@
 package com.guyu.agentteam.common;
 
+import com.guyu.agentteam.entity.AppLog;
+import com.guyu.agentteam.service.AppLogService;
+import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
@@ -16,18 +19,28 @@ public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    private final AppLogService appLogs;
+
+    public GlobalExceptionHandler(AppLogService appLogs) {
+        this.appLogs = appLogs;
+    }
+
     @ExceptionHandler(ApiException.class)
-    public ResponseEntity<Map<String, Object>> api(ApiException e) {
+    public ResponseEntity<Map<String, Object>> api(ApiException e, HttpServletRequest req) {
+        appLogs.record(AppLog.TYPE_API_ERROR, null, null, req.getMethod() + " " + req.getRequestURI()
+                + " → " + e.getStatus() + " " + e.getMessage());
         return build(e.getStatus(), e.getMessage());
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
-    public ResponseEntity<Map<String, Object>> unreadable(HttpMessageNotReadableException e) {
+    public ResponseEntity<Map<String, Object>> unreadable(HttpMessageNotReadableException e, HttpServletRequest req) {
+        appLogs.record(AppLog.TYPE_API_ERROR, null, null, req.getMethod() + " " + req.getRequestURI() + " → 400 请求体格式错误");
         return build(400, "请求体格式错误");
     }
 
     @ExceptionHandler(MethodArgumentTypeMismatchException.class)
-    public ResponseEntity<Map<String, Object>> typeMismatch(MethodArgumentTypeMismatchException e) {
+    public ResponseEntity<Map<String, Object>> typeMismatch(MethodArgumentTypeMismatchException e, HttpServletRequest req) {
+        appLogs.record(AppLog.TYPE_API_ERROR, null, null, req.getMethod() + " " + req.getRequestURI() + " → 400 参数类型错误");
         return build(400, "参数类型错误");
     }
 
@@ -37,8 +50,10 @@ public class GlobalExceptionHandler {
     }
 
     @ExceptionHandler(Exception.class)
-    public ResponseEntity<Map<String, Object>> other(Exception e) {
+    public ResponseEntity<Map<String, Object>> other(Exception e, HttpServletRequest req) {
         log.error("未处理异常", e);
+        String detail = String.valueOf(e.getMessage() == null ? e : e.getMessage());
+        appLogs.record(AppLog.TYPE_API_ERROR, null, null, req.getMethod() + " " + req.getRequestURI() + " → 500 " + detail);
         return build(500, "服务器内部错误");
     }
 

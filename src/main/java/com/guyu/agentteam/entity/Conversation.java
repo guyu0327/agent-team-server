@@ -25,4 +25,6 @@ public class Conversation {
     private Long lastReadAt;
     private Long createdAt;
     private Long updatedAt;
+    /** 历史会话归档时间：非空表示已归档（重置/解散/删除后进入历史），活跃查询一律排除 */
+    private Long archivedAt;
 }
