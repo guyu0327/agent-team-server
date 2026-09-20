@@ -162,7 +162,8 @@ public class WorkspaceFileTools {
     /** 拼进智能体 system prompt 的文件工具使用说明（含本会话授权的文件/目录） */
     public String promptNote(String conversationId) {
         StringBuilder sb = new StringBuilder("文件工具说明：沙箱内可使用 read_file（读取文本，支持 offset/limit 分页）、")
-                .append("grep_files（按内容搜索文件）、glob_files（按通配符查找文件）、list_files（列出目录内容）。")
+                .append("grep_files（按内容搜索文件）、glob_files（按通配符查找文件）、list_files（列出目录内容）、")
+                .append("view_image（查看图片：把 png/jpg 等图片文件重新注入为可看的图像，适用于重看已阅的历史图片）。")
                 .append("相对路径相对于主工作区根目录 ").append(primaryRoot())
                 .append("；绝对路径允许当且仅当位于主工作区或白名单目录");
         List<String> extras = extraRoots();

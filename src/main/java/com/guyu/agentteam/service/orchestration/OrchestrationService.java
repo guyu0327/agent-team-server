@@ -2,6 +2,7 @@ package com.guyu.agentteam.service.orchestration;
 
 import com.guyu.agentteam.dto.ConversationDto;
 import com.guyu.agentteam.dto.GroupChatRequest;
+import com.guyu.agentteam.dto.MessageDto;
 import com.guyu.agentteam.entity.Agent;
 import com.guyu.agentteam.entity.AppLog;
 import com.guyu.agentteam.entity.Conversation;
@@ -10,20 +11,26 @@ import com.guyu.agentteam.entity.Message;
 import com.guyu.agentteam.entity.ModelPreset;
 import com.guyu.agentteam.repository.AgentRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
+import com.guyu.agentteam.repository.MessageRepository;
+import com.guyu.agentteam.service.AgentMemoryService;
 import com.guyu.agentteam.service.AppLogService;
 import com.guyu.agentteam.service.CoordinationLimitsService;
+import com.guyu.agentteam.service.ContextCompressionService;
 import com.guyu.agentteam.service.ConversationService;
 import com.guyu.agentteam.service.ConversationStreamSupport;
 import com.guyu.agentteam.service.FileGrantService;
+import com.guyu.agentteam.service.MessageService;
 import com.guyu.agentteam.service.OpApprovalService;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
+import com.guyu.agentteam.service.tool.ViewImageTools;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.ReActAgent;
 import io.agentscope.core.agent.accumulator.TextAccumulator;
 import io.agentscope.core.event.AgentEventType;
 import io.agentscope.core.event.AgentResultEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
+import io.agentscope.core.memory.LongTermMemoryMode;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.UserMessage;
@@ -65,19 +72,29 @@ public class OrchestrationService {
     private final AgentModelFactory modelFactory;
     private final WorkspaceFileTools fileTools;
     private final ImageGenerationTools imageTools;
+    private final ViewImageTools viewTools;
     private final FileGrantService fileGrants;
     private final OpApprovalService approval;
     private final AppLogService appLogs;
     private final CoordinationLimitsService limitsService;
+    private final ContextCompressionService compression;
+    private final AgentMemoryService memoryService;
+    private final com.guyu.agentteam.service.tool.ScheduledTaskTools taskTools;
+    private final MessageService messageService;
+    private final MessageRepository messages;
     /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
     private final Map<String, RunHandle> runs = new ConcurrentHashMap<>();
 
     public OrchestrationService(AgentRepository agents, ConversationMemberRepository members,
                                 ConversationStreamSupport support, ConversationService conversationService,
                                 AgentModelFactory modelFactory, WorkspaceFileTools fileTools,
-                                ImageGenerationTools imageTools,
+                                ImageGenerationTools imageTools, ViewImageTools viewTools,
                                 FileGrantService fileGrants, OpApprovalService approval,
-                                AppLogService appLogs, CoordinationLimitsService limitsService) {
+                                AppLogService appLogs, CoordinationLimitsService limitsService,
+                                ContextCompressionService compression,
+                                AgentMemoryService memoryService,
+                                com.guyu.agentteam.service.tool.ScheduledTaskTools taskTools,
+                                MessageService messageService, MessageRepository messages) {
         this.agents = agents;
         this.members = members;
         this.support = support;
@@ -85,33 +102,88 @@ public class OrchestrationService {
         this.modelFactory = modelFactory;
         this.fileTools = fileTools;
         this.imageTools = imageTools;
+        this.viewTools = viewTools;
         this.fileGrants = fileGrants;
         this.approval = approval;
         this.appLogs = appLogs;
         this.limitsService = limitsService;
+        this.compression = compression;
+        this.memoryService = memoryService;
+        this.taskTools = taskTools;
+        this.messageService = messageService;
+        this.messages = messages;
     }
 
-    public void run(SseEmitter emitter, Conversation conv, Agent orchestrator, ModelPreset preset) {
+    public void run(SseEmitter emitter, Conversation conv, Agent orchestrator, ModelPreset preset,
+                    ConversationStreamSupport.TaskTag taskTag) {
         List<Agent> team = teamPool(conv, orchestrator);
-        ConversationStreamSupport.SegState seg = new ConversationStreamSupport.SegState();
-        AtomicBoolean finished = new AtomicBoolean(false);
         RunHandle handle = new RunHandle();
+        handle.taskTag = taskTag;
         handle.keys.add(conv.getId());
         runs.put(conv.getId(), handle);
         // 协作目标会话：默认是当前会话，create_team 后切到项目群
         AtomicReference<Conversation> target = new AtomicReference<>(conv);
         AtomicReference<String> createdGroupId = new AtomicReference<>();
 
+        sendCoordination(emitter, "coordination_start", orchestrator, conv.getId());
+        // 最多两轮：任务触发轮若整轮零工具调用（只输出任务卡/计划文本，未实际执行），追加纠正指令自动重试一次
+        for (int attempt = 0; attempt < 2; attempt++) {
+            boolean settled = runAgentRound(emitter, conv, target, orchestrator, preset, team, handle, createdGroupId);
+            if (settled || taskTag == null || attempt > 0 || handle.stopRequested.get()) break;
+            String correction = "刚才一轮你只输出了纯文本（任务卡 / 计划 / 总结），没有调用任何工具，任务并没有实际开始执行。\n"
+                    + "请立即实际执行任务内容：需要成员参与就实际调用 delegate 工具把任务派给成员（当前会话通常已是任务项目群，无需再建群），"
+                    + "需要写改文件就实际调用文件工具；不要再用文字总结代替真实执行。";
+            Message m = messageService.createUserMessage(conv, correction, List.of());
+            m.setTaskId(taskTag.taskId());
+            m.setTaskName(taskTag.taskName());
+            messages.save(m);
+            support.send(emitter, "user_message", MessageDto.from(m));
+            appLogs.record(AppLog.TYPE_TASK, conv.getId(), orchestrator.getId(),
+                    "定时任务「" + taskTag.taskName() + "」触发轮只输出文本未实际执行，已追加纠正指令自动重试一次");
+            compression.compactIfNeeded(conv, orchestrator);
+        }
+        // 协作完整走完才把发起会话的图片标记为已阅（被终止过的不标）
+        if (!handle.stopRequested.get()) {
+            compression.markImagesConsumed(conv.getId());
+        }
+        sendCoordination(emitter, "coordination_end", orchestrator, conv.getId());
+        String groupId = createdGroupId.get();
+        if (groupId != null) {
+            sendCoordination(emitter, "coordination_end", orchestrator, groupId);
+        }
+        handle.keys.forEach(runs::remove);
+    }
+
+    /**
+     * 跑一轮编排者的 ReAct 循环。
+     * 返回 true 表示本轮已「尘埃落定」无需重试：实际调用了工具、或被用户终止、或中途出错；
+     * 返回 false 表示完整走完但零工具调用（纯文本回复）。
+     */
+    private boolean runAgentRound(SseEmitter emitter, Conversation conv, AtomicReference<Conversation> target,
+                                  Agent orchestrator, ModelPreset preset, List<Agent> team, RunHandle handle,
+                                  AtomicReference<String> createdGroupId) {
+        ConversationStreamSupport.TaskTag taskTag = handle.taskTag;
+        ConversationStreamSupport.SegState seg = new ConversationStreamSupport.SegState();
+        AtomicBoolean finished = new AtomicBoolean(false);
+        AtomicBoolean toolCalled = new AtomicBoolean(false);
+
         Toolkit toolkit = new Toolkit();
-        // 文件工具作用域跟随当前协作目标会话：建群前用发起会话授权，建群后切到项目群，群里的撤销立即生效
+        // 文件工具作用域跟随当前协作目标会话：建群前用发起会话授权，建群后切到项目群，群里的撤销立即生效。
+        // 任务触发回合（taskTag 非空）是后台自动执行：按任务配置自动放行写改/命令，而非等待无人响应的审批卡片
+        boolean background = taskTag != null;
         OpRequestSink sink = (opType, opTarget, detail) ->
-                approval.approve(emitter, orchestrator, target.get().getId(), opType, opTarget, detail);
+                approval.approve(emitter, orchestrator, target.get().getId(), opType, opTarget, detail,
+                        background, taskTag != null && taskTag.autoWrite(), taskTag != null && taskTag.autoShell());
         toolkit.registerTool(fileTools.toolsFor(() -> target.get().getId(), sink));
         fileTools.registerShellTool(toolkit, () -> target.get().getId(), sink);
         imageTools.register(toolkit, orchestrator, support.imageListener(emitter, () -> target.get().getId(), orchestrator));
+        viewTools.register(toolkit, () -> target.get().getId());
         toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId, handle));
+        // 定时任务工具：会话跟随协作目标（建群后任务绑定项目群），创建的任务归编排者名下
+        taskTools.register(toolkit, () -> target.get().getId(), orchestrator::getId,
+                () -> taskTag != null ? taskTag.taskName() : null);
 
-        sendCoordination(emitter, "coordination_start", orchestrator, conv.getId());
+        compression.compactIfNeeded(conv, orchestrator);
 
         ReActAgent agent = ReActAgent.builder()
                 .name(orchestrator.getName())
@@ -120,8 +192,11 @@ public class OrchestrationService {
                 .toolkit(toolkit)
                 .maxIters(MAX_ITERS)
                 .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                .longTermMemory(memoryService.store(orchestrator.getId()))
+                .longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
                 .build();
         handle.running.add(agent);
+        boolean ok = true;
         try {
             agent.streamEvents(support.historyMsgs(conv.getId()))
                     .takeUntilOther(handle.cancelSignal())
@@ -130,13 +205,14 @@ public class OrchestrationService {
                             if (finished.get()) return;
                             String delta = ((TextBlockDeltaEvent) e).getDelta();
                             if (seg.msg.get() == null && delta.isBlank()) return;
-                            if (seg.msg.get() == null) support.openSegment(emitter, target.get(), orchestrator, seg);
+                            if (seg.msg.get() == null) support.openSegment(emitter, target.get(), orchestrator, seg, handle.taskTag);
                             seg.text.add(TextBlock.builder().text(delta).build());
                             support.send(emitter, "delta", Map.of(
                                     "messageId", seg.msg.get().getId(),
                                     "delta", delta,
                                     "conversationId", target.get().getId()));
                         } else if (e.getType() == AgentEventType.TOOL_CALL_START) {
+                            toolCalled.set(true);
                             support.closeSegment(emitter, target.get(), orchestrator, seg);
                         }
                     })
@@ -148,6 +224,7 @@ public class OrchestrationService {
             handle.keys.forEach(runs::remove);
             throw e;
         } catch (Exception e) {
+            ok = false;
             support.closeSegment(emitter, target.get(), orchestrator, seg);
             if (ConversationStreamSupport.isCancelSignal(e, handle.stopRequested)) {
                 notifyCancelled(emitter, conv, orchestrator, finished);
@@ -164,12 +241,7 @@ public class OrchestrationService {
             handle.running.remove(agent);
             agent.close();
         }
-        sendCoordination(emitter, "coordination_end", orchestrator, conv.getId());
-        String groupId = createdGroupId.get();
-        if (groupId != null) {
-            sendCoordination(emitter, "coordination_end", orchestrator, groupId);
-        }
-        handle.keys.forEach(runs::remove);
+        return !ok || handle.stopRequested.get() || toolCalled.get();
     }
 
     /** 终止指定会话进行中的编排协作，返回是否找到了运行中的协作 */
@@ -188,6 +260,8 @@ public class OrchestrationService {
     /** 一次编排运行的取消句柄：登记运行中的 ReActAgent，终止时用框架 interrupt 中断其流式循环 */
     private static final class RunHandle {
         final AtomicBoolean stopRequested = new AtomicBoolean(false);
+        /** 定时任务回合标注：任务触发的协作把本轮消息全部打上来源任务 */
+        ConversationStreamSupport.TaskTag taskTag;
         /** 运行中的 ReActAgent（编排者本人 + 正在执行 delegate 的成员） */
         final Set<ReActAgent> running = ConcurrentHashMap.newKeySet();
         /** 该运行注册过的所有会话ID（发起请求的单聊 + 协作中创建的项目群） */
@@ -268,7 +342,7 @@ public class OrchestrationService {
                 .append("），职责是理解用户需求，协调团队成员分工完成，并给出最终总结。\n")
                 .append("协作规范：\n")
                 .append("1. 先调用 list_team 了解可委派的成员及其职责和能力。\n")
-                .append("2. 只要本次任务需要 2 个及以上成员配合（例如一人开发、另一人测试或评审），就必须在第一次 delegate 之前先调用 create_team 创建项目群，之后所有安排和委派都在群里进行。只有确定全程只需要 1 个成员独立完成时，才可以不建群。\n")
+                .append("2. 只要本次任务需要委派任何成员参与（哪怕只有 1 个），就必须在第一次 delegate 之前先调用 create_team 创建项目群，之后所有安排和委派都在群里进行——你、参与的成员和用户共同构成协作多方。只有完全不需要任何成员、你独立完成时，才可以不建群。若当前会话已经是群聊（如任务项目群），直接 delegate 即可，无需 create_team。\n")
                 .append("3. 把需求拆解为子任务，用 delegate 依次委派给最合适的成员（按成员能力匹配，涉及生成/绘制图片的任务只能委派给具备图像生成能力的成员）；任务描述要完整明确，包含必要的上下文、要求和期望产出。\n")
                 .append("4. 成员的输出会直接展示给用户，不要复述成员的完整输出；你只需在每次委派前后简短说明你的安排和判断。\n")
                 .append("5. 单次只委派一个成员，等他的结果返回后再决定下一步（例如先实现再验证）。\n");
@@ -278,6 +352,8 @@ public class OrchestrationService {
             sb.append("6. 所有工作完成后必须调用 finish，summary 写给用户的最终总结答复，总结会发回用户发起请求的会话。\n");
         }
         sb.append("7. 如果任务要求把成果写到文件，委派时要把期望的输出路径（相对工作区根目录）写进任务描述，并提醒成员调用 write_file 完成写入。\n");
+        sb.append("8. 当用户要求定时、定期、每天/每周固定时间、每隔一段时间或到点执行/提醒某事时，这是要创建定时任务：必须调用 schedule_task 创建并向用户确认时间；只要该工作需要成员参与（由谁做、让谁做、谁来完成等），就必须把相关成员传给 member_ids（支持成员 id 或成员名字，可先 list_team 查成员）——到点触发时会自动创建任务项目群并组织协作。漏传 member_ids 会导致只有你一人执行，成员不会参与。此场景下禁止调用 create_team 建普通项目群、也不要立即 delegate 委派成员：普通群聊本身不会让工作定时发生。create_team 仅用于「现在就执行」的即时协作请求。已创建的任务可用 list_scheduled_tasks 查询、update_scheduled_task 修改、cancel_scheduled_task 取消，任务的执行结果会出现在「定时任务」页对应的任务会话中。\n");
+        sb.append("9. 收到以「【定时任务触发·」开头的消息时，说明是某个已存在任务到点的自动触发：按规则 1-5 真实执行其中的任务内容——需要成员参与就实际调用 delegate（触发消息所在的会话通常已是任务项目群，此时直接 delegate，不要再 create_team），需要写改文件就实际调用文件工具；此场景禁止的只有调用 schedule_task 再创建新任务，其余协作工具照常使用。任务内容若说「以任务卡形式委派」，指把任务卡内容作为 delegate 的参数传给成员，绝不是把任务卡作为聊天文本输出。不要只在回复里输出任务卡、计划或总结来代替真实执行，也不要因为历史记录里出现过类似执行结果就跳过本轮。\n");
         // 成员能力清单：让编排者无需逐个试探就知道谁能绘图，委派才能精准
         List<Agent> drawers = team.stream().filter(imageTools::hasCapability).toList();
         if (imageTools.hasCapability(orchestrator)) {
@@ -291,6 +367,15 @@ public class OrchestrationService {
             sb.append("当前所有成员均不具备图像生成能力，涉及绘图的任务请自行完成或向用户说明。\n");
         }
         sb.append(fileTools.promptNote(conversationId)).append("\n");
+        String digest = compression.digestOf(conversationId);
+        if (!support.isBlank(digest)) {
+            sb.append("\n【会话早期历史摘要】\n更早的完整对话已压缩为以下要点，请以此作为早期上下文：\n")
+                    .append(digest.trim()).append("\n");
+        }
+        String memory = memoryService.promptBlock(orchestrator.getId());
+        if (!support.isBlank(memory)) {
+            sb.append('\n').append(memory).append('\n');
+        }
         return sb.toString();
     }
 
@@ -345,8 +430,8 @@ public class OrchestrationService {
         }
 
         @Tool(name = "create_team", description =
-                "创建一个项目群，把完成该任务所需的成员拉进群里协作。需要 2 个及以上成员配合的任务必须先创建项目群再开始委派"
-                        + "（例如开发完成后需要另一个人测试或评审）。创建后你的安排和委派的成员输出都会展示在群里，"
+                "创建一个项目群，把完成该任务所需的成员拉进群里协作。只要需要委派成员参与（哪怕只有 1 个），"
+                        + "必须先创建项目群再开始委派。创建后你的安排和委派的成员输出都会展示在群里，"
                         + "最终总结仍会发回用户发起请求的会话")
         public String createTeam(
                 @ToolParam(name = "name", required = true, description = "群名称，简洁明了，如：排序功能开发群") String name,
@@ -435,7 +520,7 @@ public class OrchestrationService {
             }
 
             closeSegment();
-            Message placeholder = support.saveMessage(conv, targetAgent, "", "text");
+            Message placeholder = support.saveMessage(conv, targetAgent, "", "text", handle.taskTag);
             support.send(emitter, "reply_start", Map.of(
                     "messageId", placeholder.getId(),
                     "agentId", targetAgent.getId(),
@@ -443,9 +528,13 @@ public class OrchestrationService {
 
             TextAccumulator acc = new TextAccumulator();
             AtomicReference<Msg> result = new AtomicReference<>();
-            // 成员的文件工具跟随当前协作会话：建群后用群内授权副本，群里撤销对成员立即生效
+            // 成员的文件工具跟随当前协作会话：建群后用群内授权副本，群里撤销对成员立即生效。
+            // 任务触发回合里成员与编排者同策略：按任务配置自动放行/拒绝，不走无人响应的人工审批
+            ConversationStreamSupport.TaskTag tag = handle.taskTag;
+            boolean memberBackground = tag != null;
             OpRequestSink memberSink = (opType, opTarget, detail) ->
-                    approval.approve(emitter, targetAgent, conv.getId(), opType, opTarget, detail);
+                    approval.approve(emitter, targetAgent, conv.getId(), opType, opTarget, detail,
+                            memberBackground, tag != null && tag.autoWrite(), tag != null && tag.autoShell());
             Toolkit memberToolkit = new Toolkit();
             memberToolkit.registerTool(fileTools.toolsFor(conv.getId(), memberSink));
             fileTools.registerShellTool(memberToolkit, conv::getId, memberSink);
@@ -454,6 +543,10 @@ public class OrchestrationService {
             String memberSysPrompt = support.isBlank(targetAgent.getSystemPrompt())
                     ? memberNote
                     : targetAgent.getSystemPrompt().trim() + "\n\n" + memberNote;
+            String memberMemory = memoryService.promptBlock(targetAgent.getId());
+            if (!support.isBlank(memberMemory)) {
+                memberSysPrompt += "\n\n" + memberMemory;
+            }
             boolean cancelled = false;
             ReActAgent memberAgent = ReActAgent.builder()
                     .name(targetAgent.getName())
@@ -462,6 +555,8 @@ public class OrchestrationService {
                     .toolkit(memberToolkit)
                     .maxIters(MAX_ITERS)
                     .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                    .longTermMemory(memoryService.store(targetAgent.getId()))
+                    .longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
                     .build();
             handle.running.add(memberAgent);
             try {
@@ -553,7 +648,7 @@ public class OrchestrationService {
                 return "任务已结束";
             }
             closeSegment();
-            Message m = support.saveMessage(originConv, orchestrator, "", "text");
+            Message m = support.saveMessage(originConv, orchestrator, "", "text", handle.taskTag);
             support.send(emitter, "reply_start", Map.of(
                     "messageId", m.getId(),
                     "agentId", orchestrator.getId(),

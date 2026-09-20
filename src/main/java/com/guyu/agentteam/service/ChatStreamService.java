@@ -7,15 +7,20 @@ import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.entity.ConversationMember;
 import com.guyu.agentteam.entity.Message;
 import com.guyu.agentteam.entity.ModelPreset;
+import com.guyu.agentteam.entity.ScheduledTask;
 import com.guyu.agentteam.repository.AgentRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
+import com.guyu.agentteam.repository.ScheduledTaskRepository;
 import com.guyu.agentteam.service.orchestration.AgentModelFactory;
 import com.guyu.agentteam.service.orchestration.OrchestrationService;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
+import com.guyu.agentteam.service.tool.ScheduledTaskTools;
+import com.guyu.agentteam.service.tool.ViewImageTools;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.ReActAgent;
 import io.agentscope.core.event.AgentEventType;
+import io.agentscope.core.memory.LongTermMemoryMode;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.message.MessageMetadataKeys;
 import io.agentscope.core.message.Msg;
@@ -64,28 +69,41 @@ public class ChatStreamService {
     private final AgentModelFactory modelFactory;
     private final WorkspaceFileTools fileTools;
     private final ImageGenerationTools imageTools;
+    private final ViewImageTools viewTools;
     private final ConversationStreamSupport support;
     private final OrchestrationService orchestration;
     private final OpApprovalService approval;
     private final AppLogService appLogs;
     private final CoordinationLimitsService limitsService;
+    private final ContextCompressionService compression;
+    private final AgentMemoryService memoryService;
+    private final ScheduledTaskTools taskTools;
+    private final ScheduledTaskRepository tasks;
 
     public ChatStreamService(ConversationMemberRepository members,
                              AgentRepository agents, AgentModelFactory modelFactory,
                              WorkspaceFileTools fileTools, ImageGenerationTools imageTools,
+                             ViewImageTools viewTools,
                              ConversationStreamSupport support,
                              OrchestrationService orchestration, OpApprovalService approval,
-                             AppLogService appLogs, CoordinationLimitsService limitsService) {
+                             AppLogService appLogs, CoordinationLimitsService limitsService,
+                             ContextCompressionService compression, AgentMemoryService memoryService,
+                             ScheduledTaskTools taskTools, ScheduledTaskRepository tasks) {
         this.members = members;
         this.agents = agents;
         this.modelFactory = modelFactory;
         this.fileTools = fileTools;
         this.imageTools = imageTools;
+        this.viewTools = viewTools;
         this.support = support;
         this.orchestration = orchestration;
         this.approval = approval;
         this.appLogs = appLogs;
         this.limitsService = limitsService;
+        this.compression = compression;
+        this.memoryService = memoryService;
+        this.taskTools = taskTools;
+        this.tasks = tasks;
     }
 
     public void stream(SseEmitter emitter, Conversation conv, Message userMsg) {
@@ -93,16 +111,32 @@ public class ChatStreamService {
         executor.submit(() -> {
             try {
                 boolean freeChain = isFreeDiscussion(conv);
-                RunHandle handle = null;
+                // 每个回合都登记取消句柄：普通回复（单聊/群聊依次回复）与自由讨论一样支持随时终止
+                RunHandle handle = new RunHandle();
+                handle.discussion = freeChain;
+                // 定时任务触发的回合（合成用户消息带 taskId）：本轮全部落库消息继承任务标注，
+                // 并携带任务的审批放行策略（后台无人盯审批，写改/命令按任务配置自动放行或快速拒绝）
+                if (userMsg.getTaskId() != null) {
+                    boolean autoWrite = true;
+                    boolean autoShell = false;
+                    ScheduledTask task = tasks.findById(userMsg.getTaskId()).orElse(null);
+                    if (task != null) {
+                        autoWrite = task.isAutoWrite();
+                        autoShell = task.isAutoShell();
+                    }
+                    handle.taskTag = new ConversationStreamSupport.TaskTag(
+                            userMsg.getTaskId(), userMsg.getTaskName(), autoWrite, autoShell);
+                }
+                runs.put(conv.getId(), handle);
                 if (freeChain) {
-                    handle = new RunHandle();
-                    runs.put(conv.getId(), handle);
                     support.send(emitter, "discussion_start", Map.of("conversationId", conv.getId()));
                 }
                 try {
                     boolean group = "group".equals(conv.getType());
-                    for (Agent agent : responders(conv, userMsg.getContent(), freeChain)) {
-                        if (handle != null && handle.stopRequested.get()) break;
+                    List<Agent> responders = responders(conv, userMsg.getContent(), freeChain);
+                    compression.compactIfNeeded(conv, compressionOwner(conv, responders));
+                    for (Agent agent : responders) {
+                        if (handle.stopRequested.get()) break;
                         replyOne(emitter, conv, agent, handle,
                                 freeChain ? discussionInput(conv, agent)
                                         : group ? support.historyMsgs(conv.getId(), memberNames(conv))
@@ -113,10 +147,14 @@ public class ChatStreamService {
                         runDiscussionChain(emitter, conv, handle);
                     }
                 } finally {
+                    runs.remove(conv.getId());
                     if (freeChain) {
-                        runs.remove(conv.getId());
                         support.send(emitter, "discussion_end", Map.of("conversationId", conv.getId()));
                     }
+                }
+                // 回合完整走完才把图片标记为已阅（被终止过的不标，下一回合重看后再标）
+                if (!handle.stopRequested.get()) {
+                    compression.markImagesConsumed(conv.getId());
                 }
                 support.send(emitter, "done", Map.of());
                 emitter.complete();
@@ -126,7 +164,12 @@ public class ChatStreamService {
         });
     }
 
-    /** 终止指定会话进行中的自由讨论，返回是否找到了运行中的讨论 */
+    /** 该会话是否有进行中的回复回合（定时任务触发时用于重入保护） */
+    public boolean isRunning(String conversationId) {
+        return runs.containsKey(conversationId);
+    }
+
+    /** 终止指定会话进行中的回复/自由讨论，返回是否找到了运行中的回合 */
     public boolean stop(String conversationId) {
         RunHandle handle = runs.get(conversationId);
         if (handle == null) return false;
@@ -135,7 +178,9 @@ public class ChatStreamService {
         handle.running.forEach(ReActAgent::interrupt);
         // 卡在审批等待的请求按拒绝唤醒，前端同步关闭卡片
         approval.cancelAllForConversation(conversationId);
-        appLogs.record(AppLog.TYPE_DISCUSSION, conversationId, null, "用户手动终止自由讨论");
+        if (handle.discussion) {
+            appLogs.record(AppLog.TYPE_DISCUSSION, conversationId, null, "用户手动终止自由讨论");
+        }
         return true;
     }
 
@@ -157,18 +202,26 @@ public class ChatStreamService {
         }
 
         if (isOrchestrator(agent)) {
-            orchestration.run(emitter, conv, agent, preset);
+            orchestration.run(emitter, conv, agent, preset, handle != null ? handle.taskTag : null);
             return;
         }
+
+        // 预告「谁即将发言」：模型思考窗口（含接龙/依次回复的间隔期）没有 reply_start，
+        // 前端独立思考条靠它显示头像与身份；占位气泡出现（reply_start）后由气泡内打字点接管
+        support.send(emitter, "reply_pending", Map.of(
+                "agentId", agent.getId(),
+                "conversationId", conv.getId()));
 
         ConversationStreamSupport.SegState seg = new ConversationStreamSupport.SegState();
         ReActAgent react = ReActAgent.builder()
                 .name(agent.getName())
                 .sysPrompt(sysPromptOf(agent, conv.getId()))
                 .model(modelFactory.create(agent, preset, multiAgent))
-                .toolkit(toolkitOf(conv, emitter, agent))
+                .toolkit(toolkitOf(conv, emitter, agent, handle))
                 .maxIters(MAX_ITERS)
                 .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                .longTermMemory(memoryService.store(agent.getId()))
+                .longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
                 .build();
         if (handle != null) handle.running.add(react);
         try {
@@ -178,7 +231,9 @@ public class ChatStreamService {
                         if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
                             String delta = ((TextBlockDeltaEvent) ev).getDelta();
                             if (seg.msg.get() == null && delta.isBlank()) return;
-                            if (seg.msg.get() == null) support.openSegment(emitter, conv, agent, seg);
+                            if (seg.msg.get() == null) {
+                                support.openSegment(emitter, conv, agent, seg, handle != null ? handle.taskTag : null);
+                            }
                             seg.text.add(TextBlock.builder().text(delta).build());
                             support.send(emitter, "delta", Map.of(
                                     "messageId", seg.msg.get().getId(),
@@ -216,17 +271,49 @@ public class ChatStreamService {
     private String sysPromptOf(Agent agent, String conversationId) {
         String base = support.isBlank(agent.getSystemPrompt()) ? "" : agent.getSystemPrompt().trim();
         String note = fileTools.promptNote(conversationId);
-        return support.isBlank(base) ? note : base + "\n\n" + note;
+        String sys = support.isBlank(base) ? note : base + "\n\n" + note;
+        sys += "\n\n当用户要求定时、定期、每天/每周固定时间、每隔一段时间或到点执行/提醒某事时，必须调用 schedule_task 创建定时任务并向用户确认时间，"
+                + "不要只在对话里口头答应；若该工作需要其他成员一起完成，把成员 id 传给 member_ids，到点触发会自动创建任务项目群并组织协作，"
+                + "不要用建普通群聊代替定时任务（群聊本身不会让工作定时发生）。任务的执行结果会出现在「定时任务」页对应的任务会话中。"
+                + "收到以「【定时任务触发·」开头的消息时，说明是某个已存在任务到点的自动触发：直接执行其中的任务内容，"
+                + "禁止调用 schedule_task 再创建新任务。";
+        String digest = compression.digestOf(conversationId);
+        if (!support.isBlank(digest)) {
+            sys += "\n\n【会话早期历史摘要】\n更早的完整对话已压缩为以下要点，请以此作为早期上下文"
+                    + "（更早已阅的图片不再重复附上，需要重看可调用 view_image 工具）：\n" + digest.trim();
+        }
+        String memory = memoryService.promptBlock(agent.getId());
+        if (!support.isBlank(memory)) {
+            sys += "\n\n" + memory;
+        }
+        return sys;
     }
 
-    private Toolkit toolkitOf(Conversation conv, SseEmitter emitter, Agent agent) {
+    private Toolkit toolkitOf(Conversation conv, SseEmitter emitter, Agent agent, RunHandle handle) {
+        ConversationStreamSupport.TaskTag tag = handle != null ? handle.taskTag : null;
+        // 任务触发回合为后台执行（无人响应审批卡片）：按任务配置自动放行或立即拒绝，
+        // 不走 120 秒等待；普通聊天回合维持人工审批
+        boolean background = tag != null;
         OpRequestSink sink = (opType, target, detail) ->
-                approval.approve(emitter, agent, conv.getId(), opType, target, detail);
+                approval.approve(emitter, agent, conv.getId(), opType, target, detail,
+                        background, tag != null && tag.autoWrite(), tag != null && tag.autoShell());
         Toolkit toolkit = new Toolkit();
         toolkit.registerTool(fileTools.toolsFor(conv.getId(), sink));
         fileTools.registerShellTool(toolkit, conv::getId, sink);
         imageTools.register(toolkit, agent, support.imageListener(emitter, conv::getId, agent));
+        viewTools.register(toolkit, conv::getId);
+        taskTools.register(toolkit, conv::getId, agent::getId,
+                () -> tag != null ? tag.taskName() : null);
         return toolkit;
+    }
+
+    /** 压缩用的模型归属：优先本次要回复的智能体，否则取第一个预设可用的成员 */
+    private Agent compressionOwner(Conversation conv, List<Agent> responders) {
+        return responders.stream().filter(this::hasUsablePreset).findFirst()
+                .orElseGet(() -> memberAgents(conv).stream()
+                        .filter(this::hasUsablePreset)
+                        .findFirst()
+                        .orElse(null));
     }
 
     private List<Agent> responders(Conversation conv, String content, boolean freeChain) {
@@ -415,9 +502,13 @@ public class ChatStreamService {
         return Boolean.TRUE.equals(a.getIsOrchestrator());
     }
 
-    /** 一次自由讨论的取消句柄：登记运行中的 ReActAgent，终止时用框架 interrupt 中断其流式循环 */
+    /** 一次回复回合的取消句柄：登记运行中的 ReActAgent，终止时用框架 interrupt 中断其流式循环 */
     private static final class RunHandle {
         final AtomicBoolean stopRequested = new AtomicBoolean(false);
+        /** 本回合是否为自由讨论（终止时据此记运行日志） */
+        boolean discussion;
+        /** 定时任务回合标注：本轮所有落库消息继承任务来源 */
+        ConversationStreamSupport.TaskTag taskTag;
         final Set<ReActAgent> running = ConcurrentHashMap.newKeySet();
         /** 终止通知回调：每个流式调用独立注册；不能用共享 Future——订阅被取消会连带 cancel 连坐他人 */
         private final Set<Runnable> cancelListeners = ConcurrentHashMap.newKeySet();

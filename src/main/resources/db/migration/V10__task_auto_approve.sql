@@ -1,0 +1,2 @@
+ALTER TABLE scheduled_tasks ADD COLUMN auto_write INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE scheduled_tasks ADD COLUMN auto_shell INTEGER NOT NULL DEFAULT 0;

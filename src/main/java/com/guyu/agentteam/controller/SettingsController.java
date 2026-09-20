@@ -2,12 +2,15 @@ package com.guyu.agentteam.controller;
 
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.dto.AsrStreamStatusDto;
+import com.guyu.agentteam.dto.ContextCompressionDto;
+import com.guyu.agentteam.dto.ContextCompressionRequest;
 import com.guyu.agentteam.dto.CoordinationLimitsDto;
 import com.guyu.agentteam.dto.CoordinationLimitsRequest;
 import com.guyu.agentteam.dto.WorkspaceSettingsDto;
 import com.guyu.agentteam.dto.WorkspaceSettingsRequest;
 import com.guyu.agentteam.dto.XfyunAsrConfigDto;
 import com.guyu.agentteam.service.AsrStreamService;
+import com.guyu.agentteam.service.ContextCompressionService;
 import com.guyu.agentteam.service.CoordinationLimitsService;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import org.springframework.core.env.Environment;
@@ -37,15 +40,18 @@ public class SettingsController {
     private final WorkspaceFileTools workspace;
     private final AsrStreamService asrStream;
     private final CoordinationLimitsService coordinationLimits;
+    private final ContextCompressionService compression;
     private final DataSource dataSource;
     private final Environment env;
 
     public SettingsController(WorkspaceFileTools workspace, AsrStreamService asrStream,
                               CoordinationLimitsService coordinationLimits,
+                              ContextCompressionService compression,
                               DataSource dataSource, Environment env) {
         this.workspace = workspace;
         this.asrStream = asrStream;
         this.coordinationLimits = coordinationLimits;
+        this.compression = compression;
         this.dataSource = dataSource;
         this.env = env;
     }
@@ -80,6 +86,16 @@ public class SettingsController {
     @PutMapping("/coordination")
     public CoordinationLimitsDto updateCoordination(@RequestBody CoordinationLimitsRequest req) {
         return coordinationLimits.save(req.overallMinutes(), req.memberMinutes());
+    }
+
+    @GetMapping("/context-compression")
+    public ContextCompressionDto contextCompression() {
+        return compression.get();
+    }
+
+    @PutMapping("/context-compression")
+    public ContextCompressionDto updateContextCompression(@RequestBody ContextCompressionRequest req) {
+        return compression.save(req.enabled(), req.budgetChars());
     }
 
     /**

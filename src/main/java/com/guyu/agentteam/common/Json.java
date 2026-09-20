@@ -8,7 +8,12 @@ import java.util.List;
 /** 消息附件 JSON 与对象互转 */
 public final class Json {
 
-    public record Attachment(String path, String type, String name) {
+    public record Attachment(String path, String type, String name, boolean consumed) {
+
+        /** 新建附件默认未阅（consumed=false）：图片在被模型看过一轮后由上下文压缩服务标记为已阅 */
+        public Attachment(String path, String type, String name) {
+            this(path, type, name, false);
+        }
     }
 
     private static final TypeReference<List<Attachment>> ATTACHMENT_LIST = new TypeReference<>() {

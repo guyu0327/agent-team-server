@@ -21,14 +21,14 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | 工具 | 作用 |
 | --- | --- |
 | `list_team` | 查看可委派的成员及职责与能力（是否具备图像生成等） |
-| `create_team` | 需要多成员配合时自动创建项目群，协作过程进群 |
+| `create_team` | 需要成员参与时（哪怕 1 个）先创建项目群，协作过程进群；编排者 + 成员 + 用户构成协作多方 |
 | `delegate` | 委派子任务；成员用自己的人设和模型独立执行，输出作为真实消息流式展示 |
 | `finish` | 提交最终总结，自动发回用户发起请求的单聊 |
 
 - 协作全程透明：编排者的每段发言、成员的完整输出都是真实持久化的聊天消息
 - 编排者发言按工具调用自动切分为多段气泡
 - 编排者提前感知成员能力：`list_team` 返回成员职责与能力（是否具备图像生成），系统提示也注入成员能力清单，绘图任务只会委派给具备图像生成的成员
-- 协作或自由讨论进行中可随时终止：`POST /api/conversations/{id}/stop`（同时终止编排协作与自由讨论，直接掐断在途模型请求并按拒绝唤醒待审批请求，已产生的输出保留）
+- 回复进行中可随时终止：`POST /api/conversations/{id}/stop`（覆盖普通回复、编排协作与自由讨论，直接掐断在途模型请求并按拒绝唤醒待审批请求，已产生的输出保留）
 - 限制：ReAct 迭代不设上限；整体与单成员时长可在设置页配置（默认 60 / 5 分钟，持久化于 `app_settings` 的 `coordination.limits`），到时自动终止
 
 ### 文件工具（沙箱）
@@ -42,6 +42,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 写入（`write_file`）、修改（`edit_file`）与终端命令（`execute`）是受控操作：智能体发起时回复暂停，前端弹出审批卡片，展示发起智能体、操作类型、目标文件与完整内容/命令
 - 三个决定：**允许一次** / **本会话允许**（持久化于 `operation_grants` 表，按会话+操作类型生效，同类操作后续不再询问，并立即放行该会话同类型的其他待审批请求）/ **拒绝**；卡片 120 秒未响应按拒绝处理
 - 被拒或超时的操作不会执行，模型收到拒绝说明并被告知不要反复重试；会话删除或消息重置时自动清除本会话授权；终止协作/讨论或归档会话时按拒绝唤醒全部待审批请求
+- 任务触发回合的自动放行：定时任务后台触发时没有人在审批卡片前，按任务级「后台自动放行」配置直接决定——终端命令按 `auto_shell`（默认不放行）、写入/修改按 `auto_write`（默认放行），未放行的操作立即按拒绝返回（不再空等 120 秒）；放行与拒绝均记入运行日志（「后台自动放行」/「后台未授权拒绝」）；编排者本人与被 `delegate` 成员的审批均跟随任务策略，对话里手动执行不受影响、仍走人审卡片（V10 迁移 `scheduled_tasks.auto_write` / `auto_shell`，任务表单可开关）
 - 框架 `FilesystemTool` 没有删除工具，删除文件只能经 `execute` 命令完成，同样需要审批
 - 决定接口：`POST /api/conversations/{id}/op-grant`（`requestId` + `decision: once|conversation|deny`）
 
@@ -52,8 +53,22 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 归档只清置顶与未读，成员、文件授权、消息全部保留，恢复后可直接继续聊；彻底删除仍走 `DELETE /api/conversations/{id}`
 - 历史列表：`GET /api/conversations?archived=true`，可选 `agentId` 过滤与其相关的会话（单聊命中或群聊含该成员）
 
+### 上下文压缩（滚动摘要）
+- 注入模型的历史有字符预算（默认 6 万，`app_settings` 的 `context.compression` 持久化，`GET/PUT /api/settings/context-compression` 读写）：回合开始时超预算则把水位线之后较旧的一段消息连同旧摘要一起，用回复智能体自己的模型压缩成一份完整新摘要，水位线推进；摘要拼进智能体 system prompt（「会话早期历史摘要」），近期消息保留原文
+- 摘要与水位线持久化于 `conversations.context_digest` / `digest_watermark`（V5 迁移），重启不丢；单聊、群聊、编排协作、自由讨论共用同一条注入路径，自动生效
+- 压缩失败（模型调用异常）自动降级为按预算纯截断（从最新往回取），只记日志不阻塞回复；最新一条消息（本轮用户消息）无论多大都保留
+- 图片已阅：用户消息中的图片只在首次回复时注入视觉块，回合完整走完（未被终止）后自动标记 consumed（附件 JSON），后续轮次降级为文字注记「[图片·已阅]」，大幅降低视觉 token 消耗；图片文件与前端气泡展示不受影响
+- `view_image` 工具：全部智能体可用，按路径把沙箱内（主工作区 + 白名单 + 会话授权）的图片重新注入为视觉块，用于重看已阅历史图片或查看工作区图片（png/jpg/jpeg/gif/webp/bmp，≤8MB）；压缩事件记入运行日志新类型 `compact`
+
+### 智能体长期记忆（agent_memories）
+- 基于 AgentScope 的 `LongTermMemory` 接口以 **AGENT_CONTROL** 模式接入：框架自动给智能体注册 `recordToMemory` / `retrieveFromMemory` 两个工具，记什么、何时取回完全由智能体在 ReAct 循环中自行决定（用户分享偏好、背景、重要事实或明确要求记住时写入）
+- 存储为 SQLite `agent_memories` 表（V6 迁移），按智能体隔离、跨会话共享；单聊、群成员、编排协作（含受委派成员）全部生效
+- 每轮回复系统提示注入当前记忆清单（时间正序，预算 6000 字符），智能体无需主动检索即可「记得」用户；`retrieveFromMemory` 可按需取全量
+- 上限：单智能体 300 条（超出裁最旧）、单条 2000 字符；删除智能体时级联清空其记忆
+- 查看/清空：`GET /api/agents/{id}/memories`、`DELETE /api/agents/{id}/memories`
+
 ### 运行日志（app_logs）
-- 关键事件落库，便于排查问题：`error` / `op_request` / `op_decision` / `coordination` / `discussion` / `image` / `api_error`
+- 关键事件落库，便于排查问题：`error` / `op_request` / `op_decision` / `coordination` / `discussion` / `image` / `compact` / `api_error`
 - 写入经内存队列异步批量落库（业务线程只入队），避免 SQLite 单连接被日志阻塞；队列满丢弃新日志并限流告警
 - 保留 30 天，批量写入后低频触发过期清理；查询走 `GET /api/logs`，支持 `type` / `from` / `to` / 分页，前端「设置-数据管理-查看日志」即基于此
 
@@ -70,6 +85,17 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 支持的模型：DashScope 同步端点（z-image-turbo、qwen-image）、OpenAI Images 兼容接口（dall-e-3、gpt-image-1 及同形聚合服务）与硅基流动（Kwai-Kolors/Kolors、Qwen/Qwen-Image，返回的图片 URL 一小时有效、适配器即时下载落盘）；wanx 等异步任务型暂不支持
 - 生图写入位置固定且不覆盖已有文件，属用户主动要求的创作行为，豁免审批卡片；未绑定图像预设的智能体看不到该工具
 
+### 定时任务（scheduled_tasks）
+- 任务模型：名称 + 内容 + 触发方式（`once` 单次 runAt / `daily` 每天 timeOfDay / `weekly` 每周 timeOfDay+daysOfWeek（1=周一…7=周日）/ `interval` 每 intervalMinutes 分钟），不引入 cron，字段结构化由后端校验（V7 迁移）；任务类型 `mode`：`normal` 普通（智能体独立执行，绑定其任务线程）/ `collab` 协作（编排者执行并拉非编排者成员建任务项目群，成员必选，V9 迁移）；`catch_up` 开关控制错过的单次任务启动后 24h 内是否补发，默认不补发（补发关闭时错过的任务直接转 done 并记日志）
+- 会话绑定：无协作成员 → 智能体专属任务线程（`category=task` 单聊，同智能体多任务共用一条，消息带 `task_id`/`task_name` 打标供筛选）；有协作成员 → 任务项目群（`category=task` 群聊「任务：名称」，触发时成员一起执行）；任务全部删光的会话不再出现在任务页
+- 触发管线：到点向绑定会话注入合成用户消息（前缀【定时任务触发·名称】，正文明确「这是已有任务的自动触发，直接执行、勿再创建」，并澄清「以任务卡形式委派」等说法指把卡片内容作为 `delegate` 参数传给成员而非聊天文本输出，落库打任务标），走 `ChatStreamService.stream()` 全管线（回复 / 协作 / 落库照旧）；触发回合内 `schedule_task` 工具直接拒绝（防把触发误当新请求循环建任务），同名同内容的重复创建也被后端拦截；上一轮未结束自动顺延 1 分钟；一次性任务触发后转 `done`，周期任务算下一次
+- 触发轮纠错：任务触发的编排协作轮若整轮零工具调用（只输出任务卡 / 计划 / 总结文本，未实际执行），自动追加一条带任务标的纠正指令用户消息重试一轮（「请立即调用 delegate / 文件工具实际执行」），并记运行日志 `task`；每个触发轮最多纠错重试一次，被终止或出错的回合不重试
+- 实时可见：任务触发的回合用 `Broadcast` 扇出发射器，`GET /api/conversations/{id}/events`（SSE，令牌走 `token` 查询参数）常驻订阅后推给正在查看的前端；用户主动发消息仍走 POST 响应流，不重复
+- 错过补发：应用启动时恢复任务（`ApplicationReadyEvent`），开启 `catch_up` 的错过一次性任务 24 小时内补发（消息标注「错过补发」），未开启默认不补发直接转 `done` 并记日志；周期任务只重排未来
+- AI 工具：智能体在对话中可用 `schedule_task` / `update_task` / `list_tasks` / `cancel_task` 为用户安排或调整任务；系统提示与工具描述明确：周期性/定时需求一律走 `schedule_task`（需要成员参与传 `member_ids` 建协作任务群），不得用建普通群聊代替；用户侧走 REST（见 API 概览），日志类型 `task`
+- 删除归档与恢复：删除任务（单个或批量）后其消息整批移入归档会话（`category=task` + `archived_at`，历史页以「定时任务」标签展示），任务配置以 JSON 快照存进 `conversations.task_snapshot`（V8 迁移）；`POST /api/tasks/restore/{conversationId}` 按快照走创建流程重建任务（once 已过期顺延 1 分钟执行），归档消息随之搬回任务线程挂到新任务名下、归档会话删除（历史页不再显示）
+- 立即执行：`POST /api/tasks/{taskId}/run` 手动触发与到点相同的执行流程（会话忙碌直接报错不排队）；周期任务的下一次排期不受影响，暂停中的任务执行后保持暂停（不产生排期）
+
 ### 实时语音转写（讯飞流式听写）
 - WebSocket 端点 `/api/asr/stream`：前端发二进制 16k PCM 音频与 `{"type":"stop"}` 控制帧；后端按讯飞节奏（40ms / 1280B 一帧，base64）装帧转发到 `wss://iat-api.xfyun.cn/v2/iat`，识别结果转为 `{type:partial|final|error|end}` JSON 回传
 - 每条前端连接一个 `SessionBridge`：队列缓冲（满丢最旧保延迟）、发送链串行化、60 秒上限自动收尾、stop 后排空残余等 final 再关，所有清理路径收敛到幂等 `shutdown()`
@@ -84,7 +110,10 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 文生图：预设按协议分类（对话 / DashScope 文生图 / OpenAI Images 文生图），智能体绑定图像预设即获得 `generate_image` 工具，图片落工作区并在气泡中展示
 - 编排者开关（`is_orchestrator`）：任意智能体可设为团队编排者，且能感知成员的绘图能力
 - 受控操作审批：AI 写入、修改文件与执行终端命令前弹卡片询问用户，支持允许一次 / 本会话允许（批量放行同类待审批）/ 拒绝
-- 运行日志：协作/讨论/审批/生图/错误等关键事件异步落库，可按类型与时间范围查询
+- 上下文压缩：历史超预算自动滚动摘要（设置页可调预算与开关），图片首轮看完即降级为文字注记，`view_image` 工具按需重看
+- 运行日志：协作/讨论/审批/生图/压缩/错误等关键事件异步落库，可按类型与时间范围查询
+- 智能体长期记忆：框架 AGENT_CONTROL 模式，智能体自己决定记住什么，SQLite 落库、跨会话生效，可查看与清空
+- 定时任务：单次 / 每天 / 每周 / 固定间隔四种触发，独立任务会话（线程或项目群）不污染普通聊天，用户与智能体均可增删改查，错过的单次任务 24h 内补发；后台触发回合按任务配置自动放行受控操作（写改默认放行、命令默认不放行），触发轮只输出文字未实际执行时自动纠错重试一轮
 
 ## 技术栈
 
@@ -139,6 +168,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | --- | --- |
 | `user_message` | 用户消息已持久化（含 `attachments` 附件元数据，`type` 为 `file`/`dir`/`image`，无附件为空数组） |
 | `reply_start` | 智能体开始回复（messageId / agentId / conversationId） |
+| `reply_pending` | 一位成员即将回复（agentId / conversationId）：模型思考窗口（含接龙/依次回复间隔期）先行预告，首个非空增量才发 `reply_start`，前端据此显示「谁在思考」 |
 | `delta` | 流式增量文本 |
 | `reply_end` | 一段回复完成（含最终全文） |
 | `reply_error` | 回复失败或为空 |
@@ -151,17 +181,20 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 编排协作可能跨会话进行（建群协作、总结回单聊），`reply_start` 起的所有事件都携带 `conversationId`，客户端应按它路由消息。
 
+定时任务触发的回合没有 POST 请求方，事件经 `Broadcast` 扇出到 `GET /api/conversations/{id}/events`（同协议常驻 SSE 订阅，令牌走 `token` 查询参数），同一会话两类流互不重复。
+
 ## API 概览
 
 | 前缀 | 说明 |
 | --- | --- |
 | `/api/user` | 当前用户（老板）信息 |
-| `/api/agents` | 智能体 CRUD |
+| `/api/agents` | 智能体 CRUD、长期记忆查看/清空（`/{id}/memories`） |
 | `/api/model-presets` | 模型预设 CRUD |
 | `/api/conversations` | 会话、消息、SSE 流式回复、会话文件授权（`/{id}/files`）、受控操作审批（`/{id}/op-grant`）、历史会话归档/恢复（`/{id}/archive`、`/{id}/restore`） |
+| `/api/tasks` | 定时任务 CRUD（`GET` 按会话分组、`POST` 创建、`PUT /{taskId}` 更新含暂停恢复、`DELETE /{taskId}`）、`/{taskId}/run` 立即执行一次、`/conversation/{id}` 会话任务列表、`/conversations` 任务会话列表（仅还剩任务的）、`/restore/{conversationId}` 从历史归档恢复任务 |
 | `/api/fs` | 图片内容读取（气泡缩略图数据源，只读） |
 | `/api/asr/stream` | 实时语音转写 WebSocket（桥接讯飞流式听写） |
-| `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、协作时长限制、数据库快照导出 |
+| `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、协作时长限制、上下文压缩（预算/开关）、数据库快照导出 |
 | `/api/logs` | 运行日志查询（按类型与时间范围分页） |
 
 ## 目录结构
@@ -176,6 +209,7 @@ src/main/java/com/guyu/agentteam/
 │   ├── OpApprovalService        受控操作审批（卡片请求、阻塞等待、批量放行与取消）
 │   ├── AppLogService            运行日志异步落库与过期清理
 │   ├── CoordinationLimitsService 协作/讨论时长限制（app_settings 持久化）
+│   ├── ScheduledTaskService      定时任务（CRUD/调度/恢复补发/触发，TaskScheduler + 句柄表）
 │   ├── AsrStreamService         实时语音识别配置与讯飞鉴权
 │   ├── orchestration/
 │   │   ├── OrchestrationService   编排协作循环与团队工具
@@ -184,6 +218,7 @@ src/main/java/com/guyu/agentteam/
 │       ├── WorkspaceFileTools   文件工具与动态沙箱（多盘符路由 + 写入/修改门控）
 │       ├── GatedShellTool       审批门控的终端命令工具
 │       ├── ImageGenerationTools 文生图工具（按智能体图像预设注册）
+│       ├── ScheduledTaskTools   定时任务工具（schedule/update/list/cancel_task）
 │       ├── DashscopeImageAdapter / OpenAiImageAdapter / SiliconflowImageAdapter  文生图协议适配器
 │       └── OpRequestSink        审批请求回调接口
 ├── ws/                    实时语音转写 WebSocket（讯飞桥接）

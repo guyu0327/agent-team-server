@@ -21,5 +21,8 @@ public class Message {
     /** 附件 JSON：[{"path":"D:\\a\\b.py","type":"file","name":"b.py"}]，无附件为 null */
     private String attachments;
     private String type;
+    /** 定时任务回合标注：本条消息由哪个定时任务触发产生（合成用户消息与该轮回复共用） */
+    private String taskId;
+    private String taskName;
     private Long createdAt;
 }

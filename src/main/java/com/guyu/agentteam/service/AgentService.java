@@ -13,6 +13,7 @@ import com.guyu.agentteam.repository.AgentRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.repository.ConversationRepository;
 import com.guyu.agentteam.repository.MessageRepository;
+import com.guyu.agentteam.repository.AgentMemoryRepository;
 import com.guyu.agentteam.repository.ModelPresetRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -27,15 +28,17 @@ public class AgentService {
     private final ConversationMemberRepository members;
     private final MessageRepository messages;
     private final ModelPresetRepository presets;
+    private final AgentMemoryRepository agentMemories;
 
     public AgentService(AgentRepository agents, ConversationRepository conversations,
                         ConversationMemberRepository members, MessageRepository messages,
-                        ModelPresetRepository presets) {
+                        ModelPresetRepository presets, AgentMemoryRepository agentMemories) {
         this.agents = agents;
         this.conversations = conversations;
         this.members = members;
         this.messages = messages;
         this.presets = presets;
+        this.agentMemories = agentMemories;
     }
 
     @Transactional(readOnly = true)
@@ -88,6 +91,7 @@ public class AgentService {
             }
         }
         agents.delete(a);
+        agentMemories.deleteAllByAgent(id);
     }
 
     private Agent find(String id) {

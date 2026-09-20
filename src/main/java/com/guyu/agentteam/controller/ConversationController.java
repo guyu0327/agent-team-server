@@ -18,6 +18,7 @@ import com.guyu.agentteam.entity.ConversationFileGrant;
 import com.guyu.agentteam.entity.Message;
 import com.guyu.agentteam.service.ChatStreamService;
 import com.guyu.agentteam.service.ConversationService;
+import com.guyu.agentteam.service.ConversationStreamSupport;
 import com.guyu.agentteam.service.FileGrantService;
 import com.guyu.agentteam.service.MessageService;
 import com.guyu.agentteam.service.OpApprovalService;
@@ -49,16 +50,19 @@ public class ConversationController {
     private final OrchestrationService orchestrationService;
     private final FileGrantService fileGrantService;
     private final OpApprovalService opApproval;
+    private final ConversationStreamSupport streamSupport;
 
     public ConversationController(ConversationService conversationService, MessageService messageService,
                                   ChatStreamService chatStreamService, OrchestrationService orchestrationService,
-                                  FileGrantService fileGrantService, OpApprovalService opApproval) {
+                                  FileGrantService fileGrantService, OpApprovalService opApproval,
+                                  ConversationStreamSupport streamSupport) {
         this.conversationService = conversationService;
         this.messageService = messageService;
         this.chatStreamService = chatStreamService;
         this.orchestrationService = orchestrationService;
         this.fileGrantService = fileGrantService;
         this.opApproval = opApproval;
+        this.streamSupport = streamSupport;
     }
 
     @GetMapping
@@ -144,8 +148,26 @@ public class ConversationController {
     @GetMapping("/{id}/messages")
     public MessagePageDto messages(@PathVariable String id,
                                    @RequestParam(required = false) Long before,
+                                   @RequestParam(required = false) String taskId,
                                    @RequestParam(defaultValue = "50") int limit) {
-        return conversationService.page(id, before, limit);
+        return conversationService.page(id, before, limit, taskId);
+    }
+
+    /**
+     * 常驻事件订阅（EventSource）：会话有定时任务触发时，扇出该回合全部 SSE 事件，
+     * 正在查看此会话的前端无需刷新即可实时看到输出。
+     */
+    @GetMapping(value = "/{id}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter events(@PathVariable String id) {
+        conversationService.getEntity(id);
+        SseEmitter emitter = new SseEmitter(0L);
+        streamSupport.registerWatcher(id, emitter);
+        try {
+            emitter.send(SseEmitter.event().name("ready").data("{}", org.springframework.http.MediaType.APPLICATION_JSON));
+        } catch (Exception ignored) {
+            // 客户端已断开：onCompletion 会清理注册
+        }
+        return emitter;
     }
 
     /**

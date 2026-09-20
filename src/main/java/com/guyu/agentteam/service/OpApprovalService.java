@@ -61,15 +61,34 @@ public class OpApprovalService {
     /** 智能体一次受控工具调用的审批流程：发卡片 → 阻塞等决定 → 是否放行 */
     public boolean approve(SseEmitter emitter, Agent agent, String conversationId,
                            String opType, String target, String detail) {
+        return approve(emitter, agent, conversationId, opType, target, detail, false, false, false);
+    }
+
+    /**
+     * 带回合策略的审批：定时任务触发回合是后台自动执行，没人响应审批卡片（等满 120 秒只会白等后拒绝）。
+     * backgroundRound=true 时按任务的放行策略直接裁决：已授权（会话授权或任务允许）→ 放行并记
+     * 「后台自动放行」日志；任务不允许 → 立即拒绝（不阻塞 120 秒）并记「后台未授权拒绝」日志。
+     * 普通聊天回合（backgroundRound=false）行为与旧签名完全一致。
+     */
+    public boolean approve(SseEmitter emitter, Agent agent, String conversationId,
+                           String opType, String target, String detail,
+                           boolean backgroundRound, boolean autoWriteAllowed, boolean autoShellAllowed) {
         if (conversationId == null || conversationId.isBlank()) {
             return false;
         }
         if (grants.existsById(new OperationGrantId(conversationId, opType))) {
             return true;
         }
-        String requestId = Ids.next();
         String summary = "「" + agent.getName() + "」请求 " + opType
                 + (target == null || target.isBlank() ? "" : " → " + target);
+        if (backgroundRound) {
+            boolean allowed = OperationGrant.OP_SHELL.equals(opType) ? autoShellAllowed : autoWriteAllowed;
+            appLogs.record(AppLog.TYPE_OP_DECISION, conversationId, agent.getId(),
+                    allowed ? "「后台自动放行」" + summary : "「后台未授权拒绝」" + summary
+                            + "（可在任务设置中开启执行命令自动放行）");
+            return allowed;
+        }
+        String requestId = Ids.next();
         PendingRequest pr = new PendingRequest(conversationId, opType, summary);
         pending.put(requestId, pr);
         try {

@@ -2,7 +2,9 @@ package com.guyu.agentteam.controller;
 
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.dto.AgentDto;
+import com.guyu.agentteam.dto.AgentMemoryDto;
 import com.guyu.agentteam.dto.AgentUpsertRequest;
+import com.guyu.agentteam.service.AgentMemoryService;
 import com.guyu.agentteam.service.AgentService;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -22,9 +24,11 @@ import java.util.List;
 public class AgentController {
 
     private final AgentService agentService;
+    private final AgentMemoryService memoryService;
 
-    public AgentController(AgentService agentService) {
+    public AgentController(AgentService agentService, AgentMemoryService memoryService) {
         this.agentService = agentService;
+        this.memoryService = memoryService;
     }
 
     @GetMapping
@@ -47,5 +51,17 @@ public class AgentController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void delete(@PathVariable String id) {
         agentService.delete(id);
+    }
+
+    /** 智能体的长期记忆（由智能体在对话中自行记录），最新在前 */
+    @GetMapping("/{id}/memories")
+    public List<AgentMemoryDto> memories(@PathVariable String id) {
+        return memoryService.list(id);
+    }
+
+    @DeleteMapping("/{id}/memories")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void clearMemories(@PathVariable String id) {
+        memoryService.clear(id);
     }
 }

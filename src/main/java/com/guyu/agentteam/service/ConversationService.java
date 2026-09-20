@@ -30,32 +30,39 @@ import java.util.Map;
 @Service
 public class ConversationService {
 
+    public static final String CATEGORY_CHAT = "chat";
+    public static final String CATEGORY_TASK = "task";
+
     private final ConversationRepository conversations;
     private final ConversationMemberRepository members;
     private final MessageRepository messages;
     private final AgentRepository agents;
     private final ConversationFileGrantRepository fileGrants;
     private final OperationGrantRepository operationGrants;
+    private final ScheduledTaskService scheduledTasks;
 
     public ConversationService(ConversationRepository conversations, ConversationMemberRepository members,
                                MessageRepository messages, AgentRepository agents,
                                ConversationFileGrantRepository fileGrants,
-                               OperationGrantRepository operationGrants) {
+                               OperationGrantRepository operationGrants,
+                               ScheduledTaskService scheduledTasks) {
         this.conversations = conversations;
         this.members = members;
         this.messages = messages;
         this.agents = agents;
         this.fileGrants = fileGrants;
         this.operationGrants = operationGrants;
+        this.scheduledTasks = scheduledTasks;
     }
 
     @Transactional(readOnly = true)
     public List<ConversationDto> list(String userId) {
-        return conversations.findByUserIdAndArchivedAtIsNullOrderByPinnedDescLastMessageAtDesc(userId).stream()
+        return conversations.findByUserIdAndCategoryAndArchivedAtIsNullOrderByPinnedDescLastMessageAtDesc(
+                        userId, CATEGORY_CHAT).stream()
                 .map(this::toDto).toList();
     }
 
-    /** 历史会话列表：按归档时间倒序；agentId 非空时只回与其绑定的会话（单聊命中、群聊含该成员也命中） */
+    /** 历史会话列表：按归档时间倒序；普通会话与定时任务归档（category=task）混排，由前端打标签区分；agentId 非空时只回与其绑定的会话 */
     @Transactional(readOnly = true)
     public List<ConversationDto> listArchived(String userId, String agentId) {
         return conversations.findByUserIdAndArchivedAtIsNotNullOrderByArchivedAtDesc(userId).stream()
@@ -74,7 +81,7 @@ public class ConversationService {
             throw ApiException.badRequest("缺少 agentId");
         }
         agents.findById(agentId).orElseThrow(() -> ApiException.notFound("智能体不存在"));
-        for (Conversation c : conversations.findByUserIdAndTypeAndArchivedAtIsNull(userId, "single")) {
+        for (Conversation c : conversations.findByUserIdAndTypeAndCategoryAndArchivedAtIsNull(userId, "single", CATEGORY_CHAT)) {
             if (memberIds(c.getId()).contains(agentId)) {
                 return toDto(c);
             }
@@ -197,6 +204,7 @@ public class ConversationService {
         if (c.getArchivedAt() != null) {
             return;
         }
+        scheduledTasks.cancelAllForConversation(id);
         if (!messages.existsByConversationId(id)) {
             deleteAll(c);
             return;
@@ -214,7 +222,8 @@ public class ConversationService {
         if ("single".equals(c.getType())) {
             String agentId = memberIds(id).isEmpty() ? null : memberIds(id).get(0);
             if (agentId != null) {
-                for (Conversation other : conversations.findByUserIdAndTypeAndArchivedAtIsNull(c.getUserId(), "single")) {
+                for (Conversation other : conversations.findByUserIdAndTypeAndCategoryAndArchivedAtIsNull(
+                        c.getUserId(), "single", CATEGORY_CHAT)) {
                     if (!memberIds(other.getId()).contains(agentId)) {
                         continue;
                     }
@@ -258,10 +267,15 @@ public class ConversationService {
     }
 
     @Transactional(readOnly = true)
-    public MessagePageDto page(String id, Long before, int limit) {
+    public MessagePageDto page(String id, Long before, int limit, String taskId) {
+        boolean filtered = taskId != null && !taskId.isBlank();
         List<Message> found = before == null
-                ? messages.findByConversationIdOrderByCreatedAtDesc(id, PageRequest.of(0, limit))
-                : messages.findByConversationIdAndCreatedAtLessThanOrderByCreatedAtDesc(id, before, PageRequest.of(0, limit));
+                ? (filtered
+                        ? messages.findByConversationIdAndTaskIdOrderByCreatedAtDesc(id, taskId, PageRequest.of(0, limit))
+                        : messages.findByConversationIdOrderByCreatedAtDesc(id, PageRequest.of(0, limit)))
+                : (filtered
+                        ? messages.findByConversationIdAndTaskIdAndCreatedAtLessThanOrderByCreatedAtDesc(id, taskId, before, PageRequest.of(0, limit))
+                        : messages.findByConversationIdAndCreatedAtLessThanOrderByCreatedAtDesc(id, before, PageRequest.of(0, limit)));
         boolean hasMore = found.size() >= limit;
         List<MessageDto> list = new ArrayList<>(found.stream().map(MessageDto::from).toList());
         Collections.reverse(list);
@@ -273,7 +287,9 @@ public class ConversationService {
         String agentId = "single".equals(c.getType()) && !ids.isEmpty() ? ids.get(0) : null;
         long lastRead = c.getLastReadAt() == null ? 0L : c.getLastReadAt();
         long unread = messages.countByConversationIdAndCreatedAtGreaterThanAndSenderTypeNot(c.getId(), lastRead, "user");
-        return new ConversationDto(c.getId(), c.getType(), c.getName() == null ? "" : c.getName(), agentId,
+        return new ConversationDto(c.getId(), c.getType(),
+                c.getCategory() == null ? CATEGORY_CHAT : c.getCategory(),
+                c.getName() == null ? "" : c.getName(), agentId,
                 ids, c.getChatMode() == null ? "passive" : c.getChatMode(), c.isPinned(),
                 c.getLastMessage() == null ? "" : c.getLastMessage(),
                 c.getLastMessageAt(), unread, c.getArchivedAt());
@@ -284,6 +300,7 @@ public class ConversationService {
         c.setId(Ids.next());
         c.setUserId(userId);
         c.setType("single");
+        c.setCategory(CATEGORY_CHAT);
         c.setName("");
         c.setChatMode("passive");
         c.setPinned(false);
@@ -299,6 +316,7 @@ public class ConversationService {
     }
 
     private void deleteAll(Conversation c) {
+        scheduledTasks.cancelAllForConversation(c.getId());
         messages.deleteByConversationId(c.getId());
         members.deleteByConversationId(c.getId());
         fileGrants.deleteByConversationId(c.getId());

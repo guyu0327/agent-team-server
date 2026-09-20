@@ -38,7 +38,9 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -55,6 +57,7 @@ public class ConversationStreamSupport {
     private final MessageRepository messages;
     private final ModelPresetRepository presets;
     private final AppLogService appLogs;
+    private final ContextCompressionService compression;
 
     /** 漏斗里需要落库的运行事件 → 日志类型（op_request 由 OpApprovalService 单独记录，content 类事件不记） */
     private static final Map<String, String> LOGGED_EVENTS = Map.of(
@@ -66,21 +69,172 @@ public class ConversationStreamSupport {
             "image_end", AppLog.TYPE_IMAGE);
 
     public ConversationStreamSupport(ConversationRepository conversations, MessageRepository messages,
-                                     ModelPresetRepository presets, AppLogService appLogs) {
+                                     ModelPresetRepository presets, AppLogService appLogs,
+                                     ContextCompressionService compression) {
         this.conversations = conversations;
         this.messages = messages;
         this.presets = presets;
         this.appLogs = appLogs;
+        this.compression = compression;
     }
 
     public void send(SseEmitter emitter, String event, Object data) {
+        String json = mapper.writeValueAsString(data);
+        if (emitter instanceof Broadcast broadcast) {
+            trackRound(broadcast.conversationId, event, data);
+        }
+        dispatch(emitter, event, json);
+        logEvent(event, data);
+    }
+
+    /** 定时任务触发的回合用 Broadcast：事件扇出给该会话的观察者（events 常驻 SSE），普通发送仍走各自请求的响应流 */
+    private void dispatch(SseEmitter emitter, String event, String json) {
         try {
+            if (emitter instanceof Broadcast broadcast) {
+                fanOut(broadcast.conversationId, event, json);
+                return;
+            }
             emitter.send(SseEmitter.event().name(event)
-                    .data(mapper.writeValueAsString(data), MediaType.APPLICATION_JSON));
+                    .data(json, MediaType.APPLICATION_JSON));
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
-        logEvent(event, data);
+    }
+
+    private void fanOut(String conversationId, String event, String json) {
+        Set<SseEmitter> set = watchers.get(conversationId);
+        if (set == null || set.isEmpty()) {
+            return;
+        }
+        for (SseEmitter watcher : set) {
+            try {
+                watcher.send(SseEmitter.event().name(event)
+                        .data(json, MediaType.APPLICATION_JSON));
+            } catch (Exception e) {
+                removeWatcher(conversationId, watcher);
+            }
+        }
+    }
+
+    private final Map<String, Set<SseEmitter>> watchers = new ConcurrentHashMap<>();
+
+    /**
+     * 任务触发回合的实时状态（仅 Broadcast 回合跟踪）：前端切页会断开/重连观察者，
+     * 重连时重放这里的快照，协作状态与流式到一半的回复才不会在界面上凭空消失。
+     */
+    private final Map<String, ConvRoundState> roundStates = new ConcurrentHashMap<>();
+
+    private static final class ConvRoundState {
+        volatile String coordinator;
+        volatile boolean discussing;
+        final Map<String, InFlightSegment> segments = new ConcurrentHashMap<>();
+    }
+
+    private static final class InFlightSegment {
+        final String agentId;
+        final StringBuilder text = new StringBuilder();
+
+        InFlightSegment(String agentId) {
+            this.agentId = agentId;
+        }
+    }
+
+    private void trackRound(String conversationId, String event, Object data) {
+        ConvRoundState st;
+        switch (event) {
+            case "reply_start", "coordination_start" ->
+                    st = roundStates.computeIfAbsent(conversationId, k -> new ConvRoundState());
+            case "done" -> {
+                roundStates.remove(conversationId);
+                return;
+            }
+            default -> {
+                st = roundStates.get(conversationId);
+                if (st == null) return;
+            }
+        }
+        Map<?, ?> p = data instanceof Map<?, ?> m ? m : Map.of();
+        switch (event) {
+            case "reply_start" -> st.segments.put(String.valueOf(p.get("messageId")),
+                    new InFlightSegment(String.valueOf(p.get("agentId"))));
+            case "delta" -> {
+                InFlightSegment seg = st.segments.get(String.valueOf(p.get("messageId")));
+                if (seg != null && p.get("delta") != null) {
+                    seg.text.append(String.valueOf(p.get("delta")));
+                }
+            }
+            case "reply_end" -> st.segments.remove(String.valueOf(p.get("messageId")));
+            case "reply_error" -> {
+                // 带 messageId 的是单段失败已落库；不带的是整轮错误，进行中的段一并丢弃
+                if (p.get("messageId") != null) st.segments.remove(String.valueOf(p.get("messageId")));
+                else st.segments.clear();
+            }
+            case "coordination_start" -> st.coordinator = String.valueOf(p.get("agentId"));
+            case "coordination_end" -> st.coordinator = null;
+            case "discussion_start" -> st.discussing = true;
+            case "discussion_end" -> st.discussing = false;
+            default -> { /* user_message / conversation_created / image_* 无需跟踪 */ }
+        }
+        if (st.coordinator == null && !st.discussing && st.segments.isEmpty()) {
+            roundStates.remove(conversationId);
+        }
+    }
+
+    /** 观察者：前端通过 /events 常驻 SSE 订阅某会话，接收该会话定时任务触发回合的全部事件 */
+    public void registerWatcher(String conversationId, SseEmitter emitter) {
+        watchers.computeIfAbsent(conversationId, k -> ConcurrentHashMap.newKeySet()).add(emitter);
+        replayRound(conversationId, emitter);
+        emitter.onCompletion(() -> removeWatcher(conversationId, emitter));
+        emitter.onTimeout(() -> removeWatcher(conversationId, emitter));
+    }
+
+    /** 新观察者补发仍在进行的回合状态（重放的 delta 为全量快照，前端替换而非追加） */
+    private void replayRound(String conversationId, SseEmitter emitter) {
+        ConvRoundState st = roundStates.get(conversationId);
+        if (st == null) return;
+        try {
+            if (st.coordinator != null) {
+                emitter.send(SseEmitter.event().name("coordination_start").data(
+                        Map.of("agentId", st.coordinator, "conversationId", conversationId),
+                        MediaType.APPLICATION_JSON));
+            }
+            if (st.discussing) {
+                emitter.send(SseEmitter.event().name("discussion_start").data(
+                        Map.of("conversationId", conversationId), MediaType.APPLICATION_JSON));
+            }
+            for (Map.Entry<String, InFlightSegment> e : st.segments.entrySet()) {
+                emitter.send(SseEmitter.event().name("reply_start").data(
+                        Map.of("messageId", e.getKey(), "agentId", e.getValue().agentId,
+                                "conversationId", conversationId),
+                        MediaType.APPLICATION_JSON));
+                String text = e.getValue().text.toString();
+                if (!text.isEmpty()) {
+                    emitter.send(SseEmitter.event().name("delta").data(
+                            Map.of("messageId", e.getKey(), "delta", text, "replay", true,
+                                    "conversationId", conversationId),
+                            MediaType.APPLICATION_JSON));
+                }
+            }
+        } catch (Exception ignored) {
+            // 重连者立刻断开：onCompletion 会清理注册
+        }
+    }
+
+    private void removeWatcher(String conversationId, SseEmitter emitter) {
+        Set<SseEmitter> set = watchers.get(conversationId);
+        if (set != null) {
+            set.remove(emitter);
+        }
+    }
+
+    /** 无响应客户端的扇出型 emitter：send 被拦截改道观察者，自身永不真正写流 */
+    public static final class Broadcast extends SseEmitter {
+        final String conversationId;
+
+        public Broadcast(String conversationId) {
+            super(0L);
+            this.conversationId = conversationId;
+        }
     }
 
     private void logEvent(String event, Object data) {
@@ -115,7 +269,15 @@ public class ConversationStreamSupport {
         };
     }
 
+    /** 定时任务回合标注：随消息落库，前端据此显示来源任务徽标并支持按任务筛选；auto* 为该回合的审批放行策略 */
+    public record TaskTag(String taskId, String taskName, boolean autoWrite, boolean autoShell) {
+    }
+
     public Message saveMessage(Conversation conv, Agent agent, String content, String type) {
+        return saveMessage(conv, agent, content, type, null);
+    }
+
+    public Message saveMessage(Conversation conv, Agent agent, String content, String type, TaskTag tag) {
         Message m = new Message();
         m.setId(Ids.next());
         m.setConversationId(conv.getId());
@@ -123,6 +285,10 @@ public class ConversationStreamSupport {
         m.setSenderId(agent.getId());
         m.setContent(content);
         m.setType(type);
+        if (tag != null) {
+            m.setTaskId(tag.taskId());
+            m.setTaskName(tag.taskName());
+        }
         m.setCreatedAt(System.currentTimeMillis());
         return messages.save(m);
     }
@@ -168,12 +334,16 @@ public class ConversationStreamSupport {
      * 成员消息携带发言人名称、用户消息携带「用户」，配合 MultiAgentFormatter
      * 会被合并成带署名的 &lt;history&gt;，群聊成员能分清谁说了什么，
      * 而不是把其他成员的发言当成自己的历史。
+     * 上下文压缩：水位线之前的消息已滚入摘要（digest 由调用方拼进 system prompt），
+     * 注入时跳过；仍超字符预算的旧消息按预算从最新往回截断。
      */
     public List<Msg> historyMsgs(String conversationId, Map<String, String> agentNames) {
         boolean named = agentNames != null;
-        return messages.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
+        List<Message> all = messages.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
                 .filter(m -> "text".equals(m.getType()))
                 .filter(m -> hasContent(m) || ("user".equals(m.getSenderType()) && !Json.readAttachments(m.getAttachments()).isEmpty()))
+                .toList();
+        return scopedByBudget(conversationId, all).stream()
                 .<Msg>map(m -> {
                     if ("user".equals(m.getSenderType())) {
                         return userMsg(m, named ? "用户" : null);
@@ -188,7 +358,53 @@ public class ConversationStreamSupport {
                 .toList();
     }
 
-    /** 单条用户消息转多模态 Msg：文本注记 + 图片块；图片读取失败时自动退化为纯文本 */
+    /** 应用摘要水位线与字符预算：水位线之前的历史已滚入摘要；装不进预算的旧消息本轮截断 */
+    private List<Message> scopedByBudget(String conversationId, List<Message> all) {
+        ContextCompressionService.Settings s = compression.load();
+        if (!s.enabled()) {
+            return all;
+        }
+        int start = 0;
+        String watermark = conversations.findById(conversationId)
+                .map(conversation -> conversation.getDigestWatermark())
+                .filter(w -> w != null && !w.isBlank())
+                .orElse(null);
+        if (watermark != null) {
+            for (int i = 0; i < all.size(); i++) {
+                if (watermark.equals(all.get(i).getId())) {
+                    start = i + 1;
+                    break;
+                }
+            }
+        }
+        List<Message> effective = all.subList(start, all.size());
+        long acc = 0;
+        int from = effective.size();
+        for (int i = effective.size() - 1; i >= 0; i--) {
+            acc += charsOf(effective.get(i));
+            if (acc > s.budgetChars()) {
+                break;
+            }
+            from = i;
+        }
+        // 最新一条（通常是本轮用户消息）无论多大都必须保留
+        if (from >= effective.size() && !effective.isEmpty()) {
+            from = effective.size() - 1;
+        }
+        return from == 0 ? effective : effective.subList(from, effective.size());
+    }
+
+    private long charsOf(Message m) {
+        long n = m.getContent() == null ? 0 : m.getContent().length();
+        // 附件在 effectiveUserText 里展开成注记文本，按每条 100 字符粗略估算
+        return n + 100L * Json.readAttachments(m.getAttachments()).size();
+    }
+
+    /**
+     * 单条用户消息转多模态 Msg：文本注记 + 图片块；图片读取失败时自动退化为纯文本。
+     * 已阅图片（consumed）不再注入视觉块——首轮已被模型看过，其回复即承载了图片信息，
+     * 后续轮只保留 effectiveUserText 里的文字注记，需要重看时模型可调用 view_image 工具。
+     */
     private UserMessage userMsg(Message m, String name) {
         List<ContentBlock> blocks = new ArrayList<>();
         String text = effectiveUserText(m);
@@ -196,7 +412,7 @@ public class ConversationStreamSupport {
             blocks.add(TextBlock.builder().text(text).build());
         }
         for (Json.Attachment a : Json.readAttachments(m.getAttachments())) {
-            if (!ConversationFileGrant.TYPE_IMAGE.equals(a.type())) continue;
+            if (!ConversationFileGrant.TYPE_IMAGE.equals(a.type()) || a.consumed()) continue;
             ImageBlock img = imageBlock(Paths.get(a.path()));
             if (img != null) blocks.add(img);
         }
@@ -227,8 +443,9 @@ public class ConversationStreamSupport {
         sb.append("（本条消息附带了以下").append(atts.size() > 1 ? atts.size() + "项" : "").append("附件，文件/文件夹可用文件工具直接读写：");
         for (Json.Attachment a : atts) {
             String label = "dir".equals(a.type()) ? "[文件夹] "
-                    : ConversationFileGrant.TYPE_IMAGE.equals(a.type()) ? "[图片] "
-                    : "[文件] ";
+                    : ConversationFileGrant.TYPE_IMAGE.equals(a.type())
+                            ? (a.consumed() ? "[图片·已阅，如需重看可调用 view_image 工具] " : "[图片] ")
+                            : "[文件] ";
             sb.append("\n- ").append(label).append(a.path());
         }
         sb.append("）");
@@ -285,7 +502,11 @@ public class ConversationStreamSupport {
     }
 
     public void openSegment(SseEmitter emitter, Conversation conv, Agent agent, SegState seg) {
-        Message m = saveMessage(conv, agent, "", "text");
+        openSegment(emitter, conv, agent, seg, null);
+    }
+
+    public void openSegment(SseEmitter emitter, Conversation conv, Agent agent, SegState seg, TaskTag tag) {
+        Message m = saveMessage(conv, agent, "", "text", tag);
         send(emitter, "reply_start", Map.of(
                 "messageId", m.getId(),
                 "agentId", agent.getId(),

@@ -19,6 +19,8 @@ public class AppLog {
     public static final String TYPE_COORDINATION = "coordination";
     public static final String TYPE_DISCUSSION = "discussion";
     public static final String TYPE_IMAGE = "image";
+    public static final String TYPE_COMPACT = "compact";
+    public static final String TYPE_TASK = "task";
     public static final String TYPE_API_ERROR = "api_error";
 
     @Id

@@ -10,7 +10,14 @@ public interface MessageRepository extends JpaRepository<Message, String> {
 
     List<Message> findByConversationIdOrderByCreatedAtAsc(String conversationId);
 
+    List<Message> findByConversationIdAndTaskIdOrderByCreatedAtAsc(String conversationId, String taskId);
+
     List<Message> findByConversationIdOrderByCreatedAtDesc(String conversationId, Pageable pageable);
+
+    List<Message> findByConversationIdAndTaskIdOrderByCreatedAtDesc(String conversationId, String taskId, Pageable pageable);
+
+    List<Message> findByConversationIdAndTaskIdAndCreatedAtLessThanOrderByCreatedAtDesc(
+            String conversationId, String taskId, Long createdAt, Pageable pageable);
 
     List<Message> findByConversationIdAndCreatedAtLessThanOrderByCreatedAtDesc(String conversationId, Long createdAt, Pageable pageable);
 
