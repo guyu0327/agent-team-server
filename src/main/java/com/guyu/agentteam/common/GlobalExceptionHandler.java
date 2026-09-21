@@ -10,6 +10,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.Map;
@@ -47,6 +48,15 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(NoResourceFoundException.class)
     public ResponseEntity<Map<String, Object>> noResource(NoResourceFoundException e) {
         return build(404, "资源不存在");
+    }
+
+    /**
+     * SSE 客户端断开（切页 / 关闭订阅 / 窗口操作）：连接已不可用，无需也无法写响应体，
+     * 降级为 INFO，不再按未知 500 打堆栈、不再记 api_error 运行日志
+     */
+    @ExceptionHandler(AsyncRequestNotUsableException.class)
+    public void sseDisconnected(AsyncRequestNotUsableException e) {
+        log.info("SSE 客户端已断开，停止推送：{}", e.getMessage());
     }
 
     @ExceptionHandler(Exception.class)

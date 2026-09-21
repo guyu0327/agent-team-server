@@ -1,5 +1,6 @@
 package com.guyu.agentteam.config;
 
+import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.common.SecretCipher;
 import com.sun.jna.Platform;
 import jakarta.annotation.PostConstruct;
@@ -22,7 +23,7 @@ public class SecretMigrationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(SecretMigrationRunner.class);
     private static final String DPAPI_PREFIX = "dpapi:";
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = Json.mapper();
 
     private final JdbcTemplate jdbc;
 

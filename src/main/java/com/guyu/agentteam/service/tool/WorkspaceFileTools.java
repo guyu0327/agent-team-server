@@ -1,11 +1,10 @@
 package com.guyu.agentteam.service.tool;
 
 import com.guyu.agentteam.common.ApiException;
-import com.guyu.agentteam.entity.AppSetting;
 import com.guyu.agentteam.entity.ConversationFileGrant;
 import com.guyu.agentteam.entity.OperationGrant;
-import com.guyu.agentteam.repository.AppSettingRepository;
 import com.guyu.agentteam.repository.ConversationFileGrantRepository;
+import com.guyu.agentteam.service.SettingsStore;
 import io.agentscope.core.tool.Toolkit;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.local.LocalFilesystemWithShell;
@@ -43,7 +42,7 @@ public class WorkspaceFileTools {
     public static final String KEY_ROOT = "workspace.root";
     public static final String KEY_EXTRA_DIRS = "workspace.extraDirs";
 
-    private final AppSettingRepository settings;
+    private final SettingsStore store;
     private final ConversationFileGrantRepository grants;
     /** 未做过任何设置时使用的主工作区目录（来自 yaml） */
     private final Path defaultRoot;
@@ -51,20 +50,20 @@ public class WorkspaceFileTools {
     /** 允许读写的根目录，第一个是主工作区，其余是白名单目录 */
     private volatile List<Path> allowedRoots = List.of();
 
-    public WorkspaceFileTools(AppSettingRepository settings,
+    public WorkspaceFileTools(SettingsStore store,
                               ConversationFileGrantRepository grants,
                               @Value("${app.workspace.root:./workspace}") String defaultRootDir) {
-        this.settings = settings;
+        this.store = store;
         this.grants = grants;
         this.defaultRoot = Paths.get(defaultRootDir).toAbsolutePath().normalize();
     }
 
     @PostConstruct
     void load() {
-        String savedRoot = readSetting(KEY_ROOT);
+        String savedRoot = store.read(KEY_ROOT);
         List<Path> roots = new ArrayList<>();
         roots.add(savedRoot == null ? defaultRoot : Paths.get(savedRoot).toAbsolutePath().normalize());
-        String savedExtra = readSetting(KEY_EXTRA_DIRS);
+        String savedExtra = store.read(KEY_EXTRA_DIRS);
         if (savedExtra != null) {
             for (String line : savedExtra.split("\n")) {
                 if (!line.isBlank()) {
@@ -102,8 +101,8 @@ public class WorkspaceFileTools {
         } catch (IOException e) {
             throw ApiException.badRequest("无法创建目录：" + e.getMessage());
         }
-        saveSetting(KEY_ROOT, list.get(0).toString());
-        saveSetting(KEY_EXTRA_DIRS, String.join("\n", list.stream().skip(1).map(Path::toString).toList()));
+        store.write(KEY_ROOT, list.get(0).toString());
+        store.write(KEY_EXTRA_DIRS, String.join("\n", list.stream().skip(1).map(Path::toString).toList()));
         allowedRoots = List.copyOf(list);
     }
 
@@ -111,23 +110,6 @@ public class WorkspaceFileTools {
         for (Path p : roots) {
             Files.createDirectories(p);
         }
-    }
-
-    private String readSetting(String key) {
-        return settings.findById(key).map(AppSetting::getSettingValue)
-                .filter(v -> v != null && !v.isBlank())
-                .orElse(null);
-    }
-
-    private void saveSetting(String key, String value) {
-        AppSetting s = settings.findById(key).orElseGet(() -> {
-            AppSetting n = new AppSetting();
-            n.setSettingKey(key);
-            return n;
-        });
-        s.setSettingValue(value);
-        s.setUpdatedAt(System.currentTimeMillis());
-        settings.save(s);
     }
 
     /** 当前生效的主工作区目录（绝对路径） */
@@ -161,6 +143,15 @@ public class WorkspaceFileTools {
 
     /** 拼进智能体 system prompt 的文件工具使用说明（含本会话授权的文件/目录） */
     public String promptNote(String conversationId) {
+        return promptNote(conversationId, false);
+    }
+
+    /**
+     * 拼进智能体 system prompt 的文件工具使用说明。
+     * background=true（定时任务后台触发回合）时受控操作按任务配置自动放行/拒绝，
+     * 提示词据实描述，避免模型向用户谎报「正在等待批准」或因以为要等人而放弃执行。
+     */
+    public String promptNote(String conversationId, boolean background) {
         StringBuilder sb = new StringBuilder("文件工具说明：沙箱内可使用 read_file（读取文本，支持 offset/limit 分页）、")
                 .append("grep_files（按内容搜索文件）、glob_files（按通配符查找文件）、list_files（列出目录内容）、")
                 .append("view_image（查看图片：把 png/jpg 等图片文件重新注入为可看的图像，适用于重看已阅的历史图片）。")
@@ -180,11 +171,19 @@ public class WorkspaceFileTools {
                         .append(g.getPath()).append("\n");
             }
         }
-        sb.append("write_file（写入/覆盖文本文件）、edit_file（精确替换内容）与 execute（执行 shell 命令，")
-                .append("Windows 下为 cmd，working_directory 相对主工作区根目录）是受控操作：")
-                .append("调用时会向用户展示操作详情并等待批准（允许一次 / 本会话此类操作允许 / 拒绝），")
-                .append("被拒绝或超时未响应的操作不会执行，请勿反复重试同一次调用。")
-                .append("普通文件读写请优先使用文件工具。")
+        if (background) {
+            sb.append("write_file（写入/覆盖文本文件）、edit_file（精确替换内容）与 execute（执行 shell 命令，")
+                    .append("Windows 下为 cmd，working_directory 相对主工作区根目录）是受控操作：")
+                    .append("本次是定时任务的后台触发回合，没有人在审批卡片前，操作会按该任务的配置自动放行或被直接拒绝，")
+                    .append("既不会弹出审批卡片也不会等待用户——请直接调用工具，不要在回复里声称正在等待批准或请求批准；")
+                    .append("被拒绝的操作不会执行，请勿反复重试同一次调用。");
+        } else {
+            sb.append("write_file（写入/覆盖文本文件）、edit_file（精确替换内容）与 execute（执行 shell 命令，")
+                    .append("Windows 下为 cmd，working_directory 相对主工作区根目录）是受控操作：")
+                    .append("调用时会向用户展示操作详情并等待批准（允许一次 / 本会话此类操作允许 / 拒绝），")
+                    .append("被拒绝或超时未响应的操作不会执行，请勿反复重试同一次调用。");
+        }
+        sb.append("普通文件读写请优先使用文件工具。")
                 .append("如果任务要求把成果写到文件，必须实际调用 write_file 完成写入，不要只在回复里贴出内容；")
                 .append("文件操作没有记忆或缓存：即使之前写过同一文件，每一次都必须当轮重新调用工具，")
                 .append("并在收到工具返回的「已写入」回执后才能告知用户成功；未调用工具就宣称已写入是严重错误。");
@@ -213,14 +212,19 @@ public class WorkspaceFileTools {
                 WorkspaceFileTools.class.getClassLoader(), new Class<?>[]{AbstractFilesystem.class},
                 (proxy, method, args) -> {
                     if (method.getDeclaringClass() == Object.class) {
-                        return method.invoke(proxy, args);
+                        // 不能对 proxy 反射调用 Object 方法（会重回 handler 无限递归爆栈）；接口代理只会分派这三个
+                        return switch (method.getName()) {
+                            case "equals" -> proxy == args[0];
+                            case "hashCode" -> System.identityHashCode(proxy);
+                            default -> "RoutingFilesystem@" + System.identityHashCode(proxy);
+                        };
                     }
                     Object denied = gateIfControlled(method.getName(), args, sink);
                     if (denied != null) {
                         return denied;
                     }
                     List<Path> roots = rootsSupplier.get();
-                    Path target = targetPathOf(args);
+                    Path target = targetPathOf(method.getName(), args);
                     return method.invoke(filesystemFor(roots, target), args);
                 });
         return new FilesystemTool(routing);
@@ -295,19 +299,33 @@ public class WorkspaceFileTools {
         return buildFilesystem(roots.get(0), roots.subList(1, roots.size()));
     }
 
-    /** 从工具调用参数里找绝对路径（支持模型回传的 /C:/... 前缀形态），找不到返回 null */
-    private Path targetPathOf(Object[] args) {
-        if (args == null) return null;
-        for (Object a : args) {
-            if (!(a instanceof String s)) continue;
-            String t = s.trim();
-            if (t.startsWith("/")) t = t.substring(1);
-            if (t.length() >= 2 && t.charAt(1) == ':') {
-                try {
-                    return Paths.get(t);
-                } catch (Exception ignored) {
-                    // 非法路径参数交给框架按原样处理并报错
-                }
+    /**
+     * 从工具调用参数里解析路由目标：只看 path 参数位（args[0] 是 RuntimeContext，其余方法 path 固定在
+     * args[1]，仅 move 是 args[1]+args[2]）——正文/内容参数里的「D:\xxx」不能参与路由，
+     * 否则提到该路径的写入会被错误路由到那个盘。支持模型回传的 /C:/... 前缀形态，
+     * 剥离后回写 args，保证框架拿到的路径与路由判断一致。找不到绝对路径返回 null（按相对路径走主工作区）。
+     */
+    private Path targetPathOf(String method, Object[] args) {
+        if (args == null || args.length < 2) return null;
+        Path first = normalizeArg(args, 1);
+        if ("move".equals(method)) {
+            Path second = normalizeArg(args, 2);
+            if (first == null) first = second;
+        }
+        return first;
+    }
+
+    /** 解析单个路径参数并原地回写剥离后的形态 */
+    private Path normalizeArg(Object[] args, int index) {
+        if (!(args[index] instanceof String s)) return null;
+        String t = s.trim();
+        if (t.startsWith("/")) t = t.substring(1);
+        if (t.length() >= 2 && t.charAt(1) == ':') {
+            try {
+                args[index] = t;
+                return Paths.get(t);
+            } catch (Exception ignored) {
+                // 非法路径参数交给框架按原样处理并报错
             }
         }
         return null;

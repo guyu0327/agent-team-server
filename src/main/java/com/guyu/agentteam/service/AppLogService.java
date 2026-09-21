@@ -21,7 +21,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * 运行日志落库：业务线程只入内存队列，后台单线程批量写库，
- * 避免 SQLite 单连接被日志写入阻塞消息落库等主流程；队列满时丢弃新日志。
+ * 避免 SQLite 单连接被日志写入阻塞消息落库等主流程；队列满时丢弃最旧日志（保最新）。
  * 保留 30 天，每次批量写入后低频触发过期清理。
  */
 @Service
@@ -62,9 +62,22 @@ public class AppLogService {
         running = false;
         writer.shutdown();
         try {
-            writer.awaitTermination(3, TimeUnit.SECONDS);
+            if (!writer.awaitTermination(3, TimeUnit.SECONDS)) {
+                writer.shutdownNow();
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            writer.shutdownNow();
+        }
+        // 尾部日志显式排空：等待期排不完的（SQLite 单连接写慢）直接同步落库，退出时不再丢尾
+        List<AppLog> rest = new ArrayList<>();
+        queue.drainTo(rest);
+        if (!rest.isEmpty()) {
+            try {
+                tx.executeWithoutResult(status -> logs.saveAll(rest));
+            } catch (Exception e) {
+                log.warn("退出时尾部日志落库失败（丢弃 {} 条）: {}", rest.size(), e.getMessage());
+            }
         }
     }
 
@@ -80,8 +93,11 @@ public class AppLogService {
         l.setAgentId(agentId);
         l.setContent(content == null ? "" : content);
         l.setCreatedAt(System.currentTimeMillis());
-        if (!queue.offer(l)) {
-            // 队列已满说明写入跟不上，丢弃并避免自身刷屏
+        // 队列满时丢最旧腾位（出错时恰是日志高峰，丢最新的代价最大），避免自身刷屏
+        while (!queue.offer(l)) {
+            if (queue.poll() == null) {
+                break;
+            }
             dropWarn();
         }
     }

@@ -24,6 +24,11 @@ public final class Json {
     private Json() {
     }
 
+    /** 全项目共享的 Jackson 3 实例：所有 JSON 互转统一走它，避免多处自建实例行为漂移（Jackson 2 已全部迁出） */
+    public static ObjectMapper mapper() {
+        return MAPPER;
+    }
+
     public static String writeAttachments(List<Attachment> attachments) {
         return MAPPER.writeValueAsString(attachments);
     }

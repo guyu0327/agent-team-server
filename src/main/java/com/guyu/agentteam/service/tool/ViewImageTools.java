@@ -1,7 +1,6 @@
 package com.guyu.agentteam.service.tool;
 
 import com.guyu.agentteam.common.Images;
-import io.agentscope.core.message.Base64Source;
 import io.agentscope.core.message.ImageBlock;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.ToolResultBlock;
@@ -14,7 +13,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Base64;
 import java.util.List;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -25,8 +23,6 @@ import java.util.stream.Collectors;
  */
 @Service
 public class ViewImageTools {
-
-    private static final long MAX_IMAGE_BYTES = 8L * 1024 * 1024;
 
     private final WorkspaceFileTools fileTools;
 
@@ -69,19 +65,16 @@ public class ViewImageTools {
                 if (!Files.isRegularFile(target)) {
                     return ToolResultBlock.error("图片文件不存在：" + target);
                 }
-                if (Files.size(target) > MAX_IMAGE_BYTES) {
+                if (Files.size(target) > Images.MAX_IMAGE_BYTES) {
                     return ToolResultBlock.error("图片超过 8MB 上限，无法加载：" + target);
                 }
-                String mime = Images.mediaType(target.getFileName().toString());
-                if (mime == null) {
+                if (Images.mediaType(target.getFileName().toString()) == null) {
                     return ToolResultBlock.error("不是支持的图片格式（png/jpg/jpeg/gif/webp/bmp）：" + target);
                 }
-                ImageBlock img = ImageBlock.builder()
-                        .source(Base64Source.builder()
-                                .mediaType(mime)
-                                .data(Base64.getEncoder().encodeToString(Files.readAllBytes(target)))
-                                .build())
-                        .build();
+                ImageBlock img = Images.toImageBlock(target, Images.MAX_IMAGE_BYTES);
+                if (img == null) {
+                    return ToolResultBlock.error("读取图片失败：" + target);
+                }
                 String forward = target.toString().replace('\\', '/');
                 return ToolResultBlock.of(List.of(
                         TextBlock.builder().text("已加载图片：" + forward + "，请直接描述或分析你看到的内容。").build(),

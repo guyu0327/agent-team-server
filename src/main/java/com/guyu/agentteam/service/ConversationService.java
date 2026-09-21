@@ -87,9 +87,7 @@ public class ConversationService {
             }
         }
         long now = System.currentTimeMillis();
-        Conversation c = baseConversation(userId, now);
-        c.setType("single");
-        conversations.save(c);
+        Conversation c = newConversation(userId, "single", CATEGORY_CHAT, "");
         members.save(new ConversationMember(c.getId(), agentId, now));
         return toDto(c);
     }
@@ -103,11 +101,9 @@ public class ConversationService {
             agents.findById(agentId).orElseThrow(() -> ApiException.badRequest("智能体不存在: " + agentId));
         }
         long now = System.currentTimeMillis();
-        Conversation c = baseConversation(userId, now);
-        c.setType("group");
-        c.setName(req.name() == null ? "" : req.name().trim());
+        Conversation c = newConversation(userId, "group", CATEGORY_CHAT,
+                req.name() == null ? "" : req.name().trim());
         c.setChatMode(validateMode(req.chatMode()));
-        conversations.save(c);
         for (String agentId : req.memberIds().stream().distinct().toList()) {
             members.save(new ConversationMember(c.getId(), agentId, now));
         }
@@ -266,18 +262,23 @@ public class ConversationService {
         conversations.save(c);
     }
 
+    /** 单页上限：请求 size+1 条判断 hasMore，避免满页时多一次空请求 */
+    private static final int PAGE_MAX = 200;
+
     @Transactional(readOnly = true)
     public MessagePageDto page(String id, Long before, int limit, String taskId) {
+        int size = Math.max(1, Math.min(limit, PAGE_MAX));
         boolean filtered = taskId != null && !taskId.isBlank();
         List<Message> found = before == null
                 ? (filtered
-                        ? messages.findByConversationIdAndTaskIdOrderByCreatedAtDesc(id, taskId, PageRequest.of(0, limit))
-                        : messages.findByConversationIdOrderByCreatedAtDesc(id, PageRequest.of(0, limit)))
+                        ? messages.findByConversationIdAndTaskIdOrderByCreatedAtDesc(id, taskId, PageRequest.of(0, size + 1))
+                        : messages.findByConversationIdOrderByCreatedAtDesc(id, PageRequest.of(0, size + 1)))
                 : (filtered
-                        ? messages.findByConversationIdAndTaskIdAndCreatedAtLessThanOrderByCreatedAtDesc(id, taskId, before, PageRequest.of(0, limit))
-                        : messages.findByConversationIdAndCreatedAtLessThanOrderByCreatedAtDesc(id, before, PageRequest.of(0, limit)));
-        boolean hasMore = found.size() >= limit;
-        List<MessageDto> list = new ArrayList<>(found.stream().map(MessageDto::from).toList());
+                        ? messages.findByConversationIdAndTaskIdAndCreatedAtLessThanOrderByCreatedAtDesc(id, taskId, before, PageRequest.of(0, size + 1))
+                        : messages.findByConversationIdAndCreatedAtLessThanOrderByCreatedAtDesc(id, before, PageRequest.of(0, size + 1)));
+        boolean hasMore = found.size() > size;
+        List<Message> page = hasMore ? found.subList(0, size) : found;
+        List<MessageDto> list = new ArrayList<>(page.stream().map(MessageDto::from).toList());
         Collections.reverse(list);
         return new MessagePageDto(list, hasMore);
     }
@@ -292,22 +293,34 @@ public class ConversationService {
                 c.getName() == null ? "" : c.getName(), agentId,
                 ids, c.getChatMode() == null ? "passive" : c.getChatMode(), c.isPinned(),
                 c.getLastMessage() == null ? "" : c.getLastMessage(),
-                c.getLastMessageAt(), unread, c.getArchivedAt());
+                c.getLastMessageAt(), unread, c.getArchivedAt(), c.getChannel());
     }
 
-    private Conversation baseConversation(String userId, long now) {
+    private Conversation baseConversation(String userId, long now, String type, String category, String name) {
         Conversation c = new Conversation();
         c.setId(Ids.next());
         c.setUserId(userId);
-        c.setType("single");
-        c.setCategory(CATEGORY_CHAT);
-        c.setName("");
+        c.setType(type);
+        c.setCategory(category);
+        c.setName(name);
         c.setChatMode("passive");
         c.setPinned(false);
         c.setLastMessage("");
         c.setCreatedAt(now);
         c.setUpdatedAt(now);
         return c;
+    }
+
+    /** 新建会话并落库：任务会话等外部建群场景复用，其余字段取默认（passive、未置顶、空预览） */
+    public Conversation newConversation(String userId, String type, String category, String name) {
+        return newConversation(userId, type, category, name, null);
+    }
+
+    /** 带来源通道的建会话：微信等外部通道用 channel 标记 */
+    public Conversation newConversation(String userId, String type, String category, String name, String channel) {
+        Conversation c = baseConversation(userId, System.currentTimeMillis(), type, category, name);
+        c.setChannel(channel);
+        return conversations.save(c);
     }
 
     private List<String> memberIds(String conversationId) {

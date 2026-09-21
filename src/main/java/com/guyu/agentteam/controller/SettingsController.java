@@ -1,6 +1,7 @@
 package com.guyu.agentteam.controller;
 
 import com.guyu.agentteam.common.ApiException;
+import com.guyu.agentteam.common.SqlitePaths;
 import com.guyu.agentteam.dto.AsrStreamStatusDto;
 import com.guyu.agentteam.dto.ContextCompressionDto;
 import com.guyu.agentteam.dto.ContextCompressionRequest;
@@ -104,14 +105,10 @@ public class SettingsController {
      */
     @GetMapping("/backup/database")
     public ResponseEntity<byte[]> backupDatabase() throws IOException, SQLException {
-        String url = env.getProperty("spring.datasource.url", "");
-        if (!url.startsWith("jdbc:sqlite:")) {
+        // 经 SqlitePaths 统一解析（剥 query 参数）：url 带参数时这里曾把参数当文件名导致快照导错路径
+        Path dbPath = SqlitePaths.dbFile(env.getProperty("spring.datasource.url", ""));
+        if (dbPath == null) {
             throw new ApiException(400, "当前数据源不是 SQLite，无法导出数据库快照");
-        }
-        String raw = url.substring("jdbc:sqlite:".length());
-        Path dbPath = Path.of(raw);
-        if (!dbPath.isAbsolute()) {
-            dbPath = Path.of("").toAbsolutePath().resolve(raw).normalize();
         }
         Path snapshot = dbPath.resolveSibling("agent_team_backup_" + System.nanoTime() + ".tmp");
         try {

@@ -5,14 +5,12 @@ import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.dto.ContextCompressionDto;
 import com.guyu.agentteam.entity.Agent;
 import com.guyu.agentteam.entity.AppLog;
-import com.guyu.agentteam.entity.AppSetting;
 import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.entity.ConversationFileGrant;
 import com.guyu.agentteam.entity.ConversationMember;
 import com.guyu.agentteam.entity.Message;
 import com.guyu.agentteam.entity.ModelPreset;
 import com.guyu.agentteam.repository.AgentRepository;
-import com.guyu.agentteam.repository.AppSettingRepository;
 import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.repository.ConversationRepository;
 import com.guyu.agentteam.repository.MessageRepository;
@@ -53,7 +51,7 @@ public class ContextCompressionService {
     private static final int DIGEST_MAX = 8000;
     private static final Duration SUMMARIZE_TIMEOUT = Duration.ofMinutes(2);
 
-    private final AppSettingRepository settings;
+    private final SettingsStore store;
     private final ConversationRepository conversations;
     private final MessageRepository messages;
     private final ConversationMemberRepository members;
@@ -61,13 +59,13 @@ public class ContextCompressionService {
     private final ModelPresetRepository presets;
     private final AgentModelFactory modelFactory;
     private final AppLogService appLogs;
-    private final ObjectMapper mapper = new ObjectMapper();
+    private final ObjectMapper mapper = Json.mapper();
 
-    public ContextCompressionService(AppSettingRepository settings, ConversationRepository conversations,
+    public ContextCompressionService(SettingsStore store, ConversationRepository conversations,
                                      MessageRepository messages, ConversationMemberRepository members,
                                      AgentRepository agents, ModelPresetRepository presets,
                                      AgentModelFactory modelFactory, AppLogService appLogs) {
-        this.settings = settings;
+        this.store = store;
         this.conversations = conversations;
         this.messages = messages;
         this.members = members;
@@ -102,24 +100,19 @@ public class ContextCompressionService {
         if (budgetChars < BUDGET_MIN || budgetChars > BUDGET_MAX) {
             throw new ApiException(400, "上下文预算需在 " + BUDGET_MIN + "-" + BUDGET_MAX + " 字符之间");
         }
-        AppSetting s = settings.findById(KEY).orElseGet(() -> {
-            AppSetting n = new AppSetting();
-            n.setSettingKey(KEY);
-            return n;
-        });
+        String json;
         try {
-            s.setSettingValue(mapper.writeValueAsString(new Settings(enabled, budgetChars)));
+            json = mapper.writeValueAsString(new Settings(enabled, budgetChars));
         } catch (Exception e) {
             throw new ApiException(500, "保存上下文压缩设置失败");
         }
-        s.setUpdatedAt(System.currentTimeMillis());
-        settings.save(s);
+        store.write(KEY, json);
         return new ContextCompressionDto(enabled, budgetChars);
     }
 
     public Settings load() {
-        String json = settings.findById(KEY).map(AppSetting::getSettingValue).orElse(null);
-        if (json == null || json.isBlank()) {
+        String json = store.read(KEY);
+        if (json == null) {
             return new Settings(DEFAULT_ENABLED, DEFAULT_BUDGET_CHARS);
         }
         try {
@@ -131,8 +124,7 @@ public class ContextCompressionService {
     }
 
     private int clamp(int v) {
-        if (v < BUDGET_MIN) return DEFAULT_BUDGET_CHARS;
-        return Math.min(v, BUDGET_MAX);
+        return Math.max(BUDGET_MIN, Math.min(v, BUDGET_MAX));
     }
 
     /** 会话的滚动摘要文本（systemPrompt 拼接用），无摘要返回 null */
@@ -196,7 +188,7 @@ public class ContextCompressionService {
 
     /** 回合成功结束后调用：把会话内所有未阅的图片附件标记为已阅，后续轮次不再注入视觉块 */
     public void markImagesConsumed(String conversationId) {
-        for (Message m : messages.findByConversationIdOrderByCreatedAtAsc(conversationId)) {
+        for (Message m : messages.findWithAttachmentsByConversationId(conversationId)) {
             List<Json.Attachment> atts = Json.readAttachments(m.getAttachments());
             if (atts.isEmpty()) {
                 continue;
@@ -291,7 +283,7 @@ public class ContextCompressionService {
     }
 
     /** 返回水位线之后（不含水位线那条）的消息；水位线找不到（已被物理删除）则全量返回 */
-    private List<Message> afterWatermark(List<Message> all, String watermark) {
+    public static List<Message> afterWatermark(List<Message> all, String watermark) {
         if (watermark == null || watermark.isBlank()) {
             return all;
         }
@@ -311,13 +303,15 @@ public class ContextCompressionService {
         return n;
     }
 
-    private long charsOf(Message m) {
+    /** 单条消息的注入字符估算（附件按每条 100 字符粗略计），预算截断与压缩触发共用同一口径 */
+    public static long charsOf(Message m) {
         long n = m.getContent() == null ? 0 : m.getContent().length();
         // 附件在 effectiveUserText 里会展开成注记文本，按每条 100 字符粗略估算
         return n + 100L * Json.readAttachments(m.getAttachments()).size();
     }
 
-    private Map<String, String> memberNames(String conversationId) {
+    /** 群成员 ID → 名称（历史署名与压缩记录共用） */
+    public Map<String, String> memberNames(String conversationId) {
         return members.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
                 .map(ConversationMember::getAgentId)
                 .map(agents::findById)

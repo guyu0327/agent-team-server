@@ -1,5 +1,6 @@
 package com.guyu.agentteam.service;
 
+import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.common.CurrentUser;
 import com.guyu.agentteam.common.Ids;
@@ -19,7 +20,7 @@ import com.guyu.agentteam.repository.ConversationRepository;
 import com.guyu.agentteam.repository.MessageRepository;
 import com.guyu.agentteam.repository.ScheduledTaskRepository;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.domain.PageRequest;
@@ -28,6 +29,7 @@ import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.time.LocalDate;
@@ -41,6 +43,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 /**
@@ -54,8 +57,9 @@ public class ScheduledTaskService {
 
     private static final long CATCHUP_MS = 24L * 60 * 60 * 1000;
     private static final long POSTPONE_MS = 60_000;
-    private static final ZoneId ZONE = ZoneId.systemDefault();
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = Json.mapper();
+    /** 周期任务连续触发失败达到该次数即自动暂停（内存计数：重启清零重新计） */
+    private static final int MAX_CONSECUTIVE_FAILS = 5;
 
     /** 归档会话上保存的任务配置快照（恢复任务时按此重建） */
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -73,14 +77,22 @@ public class ScheduledTaskService {
     private final MessageService messageService;
     private final AppLogService appLogs;
     private final ObjectProvider<ChatStreamService> chatStream;
+    /** 惰性解析（对方依赖本服务，直接注入会循环） */
+    private final ObjectProvider<ConversationService> conversationService;
+    /** 触发消息落库与状态推进的临界段事务 */
+    private final TransactionTemplate tx;
 
     private final ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
     private final Map<String, ScheduledFuture<?>> futures = new ConcurrentHashMap<>();
+    /** 任务连续触发失败计数（内存即可：重启清零后重新计数） */
+    private final Map<String, Integer> failCounts = new ConcurrentHashMap<>();
 
     public ScheduledTaskService(ScheduledTaskRepository tasks, ConversationRepository conversations,
                                 ConversationMemberRepository members, AgentRepository agents,
                                 MessageRepository messages, MessageService messageService,
-                                AppLogService appLogs, ObjectProvider<ChatStreamService> chatStream) {
+                                AppLogService appLogs, ObjectProvider<ChatStreamService> chatStream,
+                                ObjectProvider<ConversationService> conversationService,
+                                TransactionTemplate tx) {
         this.tasks = tasks;
         this.conversations = conversations;
         this.members = members;
@@ -89,6 +101,8 @@ public class ScheduledTaskService {
         this.messageService = messageService;
         this.appLogs = appLogs;
         this.chatStream = chatStream;
+        this.conversationService = conversationService;
+        this.tx = tx;
         scheduler.setPoolSize(1);
         scheduler.setThreadNamePrefix("sched-task-");
         scheduler.initialize();
@@ -330,10 +344,7 @@ public class ScheduledTaskService {
         archive.setTaskSnapshot(taskSnapshotJson(t));
         conversations.save(archive);
         members.save(new ConversationMember(archive.getId(), t.getAgentId(), now));
-        for (Message m : msgs) {
-            m.setConversationId(archive.getId());
-        }
-        messages.saveAll(msgs);
+        messages.moveTaskMessages(t.getConversationId(), archive.getId(), t.getId());
         // 原线程的预览可能指向被移走的消息，改指向剩余最新一条
         conversations.findById(t.getConversationId()).ifPresent(thread -> {
             List<Message> remaining = messages.findByConversationIdOrderByCreatedAtDesc(
@@ -385,13 +396,7 @@ public class ScheduledTaskService {
                 s.content(), s.kind(), runAt, s.timeOfDay(), s.daysOfWeek(), s.intervalMinutes(), null,
                 mode, s.catchUp() != null && s.catchUp(), s.autoWrite(), s.autoShell()));
         long now = System.currentTimeMillis();
-        List<Message> msgs = messages.findByConversationIdOrderByCreatedAtAsc(archive.getId());
-        for (Message m : msgs) {
-            m.setConversationId(dto.conversationId());
-            m.setTaskId(dto.id());
-            m.setTaskName(dto.name());
-        }
-        messages.saveAll(msgs);
+        messages.reassignMessagesToTask(archive.getId(), dto.conversationId(), dto.id(), dto.name());
         members.findByConversationIdOrderByCreatedAtAsc(archive.getId()).forEach(members::delete);
         conversations.delete(archive);
         // 线程预览改指向最新一条（含搬回的消息）
@@ -422,6 +427,8 @@ public class ScheduledTaskService {
             throw ApiException.badRequest("上一轮回复尚未结束，请稍后再试");
         }
         boolean paused = ScheduledTask.STATUS_PAUSED.equals(t.getStatus());
+        // 先取消已排期但未起跑的 future：防止手动执行与到点触发双跑（暂停中也可能有残留句柄）
+        cancelFuture(t.getId());
         fire(t, false);
         if (paused) {
             // fire 会顺带计算下一次时间，暂停中的任务手动执行完应保持无排期
@@ -482,6 +489,17 @@ public class ScheduledTaskService {
         tasks.deleteByConversationId(conversationId);
     }
 
+    /** 智能体删除级联：取消其名下全部任务——否则被删的编排者名下协作任务还会到点触发，系统试图让已删的智能体主持协作 */
+    @Transactional
+    public void cancelAllForOwner(String agentId) {
+        for (ScheduledTask t : tasks.findByAgentIdOrderByNextRunAtAsc(agentId)) {
+            cancelFuture(t.getId());
+            tasks.delete(t);
+            appLogs.record(AppLog.TYPE_TASK, t.getConversationId(), agentId,
+                    "智能体已删除，其定时任务「" + t.getName() + "」已级联取消");
+        }
+    }
+
     /** 任务改名后同步任务项目群名（群名固定为「任务：xxx」时才跟随） */
     private void syncGroupName(ScheduledTask t) {
         conversations.findById(t.getConversationId()).ifPresent(conv -> {
@@ -507,40 +525,25 @@ public class ScheduledTaskService {
         }
         agents.findById(agentId).orElseThrow(() -> ApiException.badRequest("智能体不存在: " + agentId));
         long now = System.currentTimeMillis();
-        Conversation c = new Conversation();
-        c.setId(Ids.next());
-        c.setUserId(userId);
-        c.setType("single");
-        c.setCategory(ConversationService.CATEGORY_TASK);
-        c.setName("");
-        c.setChatMode("passive");
-        c.setLastMessage("");
-        c.setCreatedAt(now);
-        c.setUpdatedAt(now);
-        conversations.save(c);
+        Conversation c = conversationService.getObject()
+                .newConversation(userId, "single", ConversationService.CATEGORY_TASK, "");
         members.save(new ConversationMember(c.getId(), agentId, now));
         return c;
     }
 
     /** 任务项目群：编排者/用户拉成员执行定时任务时创建（发起智能体 + 成员 + 用户） */
     private Conversation createTaskGroup(String userId, String agentId, List<String> memberIds, String taskName) {
-        for (String id : memberIds) {
+        // 名字解析可能让不同 token 命中同一人（如「小明」模糊匹配到「小明哥」），先去重再剔除发起者
+        List<String> ids = memberIds.stream().distinct()
+                .filter(id -> !id.equals(agentId)).toList();
+        for (String id : ids) {
             agents.findById(id).orElseThrow(() -> ApiException.badRequest("智能体不存在: " + id));
         }
         long now = System.currentTimeMillis();
-        Conversation c = new Conversation();
-        c.setId(Ids.next());
-        c.setUserId(userId);
-        c.setType("group");
-        c.setCategory(ConversationService.CATEGORY_TASK);
-        c.setName("任务：" + taskName);
-        c.setChatMode("passive");
-        c.setLastMessage("");
-        c.setCreatedAt(now);
-        c.setUpdatedAt(now);
-        conversations.save(c);
+        Conversation c = conversationService.getObject()
+                .newConversation(userId, "group", ConversationService.CATEGORY_TASK, "任务：" + taskName);
         members.save(new ConversationMember(c.getId(), agentId, now));
-        for (String id : memberIds) {
+        for (String id : ids) {
             members.save(new ConversationMember(c.getId(), id, now));
         }
         return c;
@@ -581,7 +584,8 @@ public class ScheduledTaskService {
         }
     }
 
-    private void schedule(ScheduledTask t) {
+    /** synchronized 保证 cancel+put 原子：并发 schedule 不会留下两个并存的 future（同一任务到点跑两次） */
+    private synchronized void schedule(ScheduledTask t) {
         cancelFuture(t.getId());
         if (!ScheduledTask.STATUS_ACTIVE.equals(t.getStatus()) || t.getNextRunAt() == null) {
             return;
@@ -598,6 +602,15 @@ public class ScheduledTaskService {
         }
     }
 
+    /** 删除竞态守卫：行已被并发删除时放弃保存——detached 实体走 merge 会把已删主键整行复活 */
+    private boolean saveIfPresent(ScheduledTask t) {
+        if (!tasks.existsById(t.getId())) {
+            return false;
+        }
+        tasks.save(t);
+        return true;
+    }
+
     /** 触发时以 DB 最新状态为准，避免持有过期快照 */
     private void runSafely(String taskId) {
         futures.remove(taskId);
@@ -607,21 +620,41 @@ public class ScheduledTaskService {
         }
         try {
             fire(t, false);
+            failCounts.remove(taskId);
         } catch (Exception e) {
             appLogs.record(AppLog.TYPE_ERROR, t.getConversationId(), t.getAgentId(),
                     "定时任务「" + t.getName() + "」触发失败：" + (e.getMessage() == null ? e.toString() : e.getMessage()));
-            if (!ScheduledTask.KIND_ONCE.equals(t.getKind())) {
-                t.setNextRunAt(System.currentTimeMillis() + POSTPONE_MS);
-                tasks.save(t);
-                schedule(t);
-            } else {
+            if (ScheduledTask.KIND_ONCE.equals(t.getKind())) {
                 t.setStatus(ScheduledTask.STATUS_DONE);
-                tasks.save(t);
+                saveIfPresent(t);
+                return;
             }
+            // 连续失败太多次（如配置坏掉的周期任务每分钟炸一次）：自动暂停止损，
+            // 避免一天上千条失败日志刷爆保留区；用户修复配置后手动恢复
+            if (failCounts.merge(taskId, 1, Integer::sum) >= MAX_CONSECUTIVE_FAILS) {
+                failCounts.remove(taskId);
+                t.setStatus(ScheduledTask.STATUS_PAUSED);
+                t.setNextRunAt(null);
+                cancelFuture(taskId);
+                if (!saveIfPresent(t)) {
+                    return;
+                }
+                appLogs.record(AppLog.TYPE_TASK, t.getConversationId(), t.getAgentId(),
+                        "定时任务「" + t.getName() + "」连续 " + MAX_CONSECUTIVE_FAILS + " 次触发失败，已自动暂停；请检查任务内容/时间配置后手动恢复");
+                return;
+            }
+            t.setNextRunAt(System.currentTimeMillis() + POSTPONE_MS);
+            if (!saveIfPresent(t)) {
+                return;
+            }
+            schedule(t);
         }
     }
 
     private void fire(ScheduledTask t, boolean catchUp) {
+        if (!tasks.existsById(t.getId())) {
+            return;
+        }
         Conversation conv = conversations.findById(t.getConversationId()).orElse(null);
         if (conv == null || conv.getArchivedAt() != null) {
             cancelFuture(t.getId());
@@ -632,32 +665,47 @@ public class ScheduledTaskService {
         // 上一轮未结束：顺延一分钟，避免同一会话两轮流交错
         if (stream != null && stream.isRunning(conv.getId())) {
             t.setNextRunAt(System.currentTimeMillis() + POSTPONE_MS);
-            tasks.save(t);
+            if (!saveIfPresent(t)) {
+                return;
+            }
             schedule(t);
             appLogs.record(AppLog.TYPE_TASK, conv.getId(), t.getAgentId(),
                     "定时任务「" + t.getName() + "」触发时会话忙碌，已顺延 1 分钟");
             return;
         }
+        // 按 mode 拼装（normal 任务绑定的不是项目群，不能说「任务群已就绪」）；
+        // 核心指令前置、否定约束合并到尾部，「任务卡委派」的说明在系统提示里，不在这里重复
+        boolean collab = ScheduledTask.MODE_COLLAB.equals(t.getMode());
         String content = "【定时任务触发·" + t.getName() + (catchUp ? "·错过补发" : "") + "】\n"
-                + "这是已存在的定时任务到点的自动触发，不是用户新的任务请求，也不要调用 schedule_task 再创建任务。\n"
-                + "请在本轮真正开始执行下面的任务内容：需要委派成员就直接调用 delegate 工具（当前任务群已就绪，无需再建群），"
-                + "需要写改文件就实际调用文件工具；任务内容若提到「以任务卡形式委派」，指的是把任务卡内容作为 delegate 的参数传给成员，"
-                + "而不是把任务卡作为聊天文本输出。不要只在回复里输出计划、任务卡或总结，"
-                + "也不要因为历史记录里已有类似执行结果就跳过本轮执行：\n" + t.getContent();
+                + "立即执行下面的任务内容：" + (collab
+                        ? "需要成员参与就直接调用 delegate 工具委派（当前任务项目群已就绪，无需再建群），需要写改文件就实际调用文件工具。"
+                        : "需要写改文件就实际调用文件工具；这是你的专属任务会话，由你独立完成。")
+                + "\n\n" + t.getContent() + "\n\n"
+                + "再说明一次：这是已存在的定时任务到点的自动触发，不是用户新的任务请求——"
+                + "不要调用 schedule_task 创建新任务、不要用输出计划/任务卡/总结代替真实执行、不要因历史记录里有类似结果就跳过本轮。";
         Message m = messageService.createUserMessage(conv, content, List.of());
         m.setTaskId(t.getId());
         m.setTaskName(t.getName());
-        messages.save(m);
         long now = System.currentTimeMillis();
-        t.setLastRunAt(now);
-        if (ScheduledTask.KIND_ONCE.equals(t.getKind())) {
-            t.setStatus(ScheduledTask.STATUS_DONE);
-        } else {
-            t.setNextRunAt(computeNext(t, now));
+        AtomicBoolean saved = new AtomicBoolean(true);
+        // 临界段同一事务：消息落库与排期推进分离时，中间失败会让周期任务排期未推进而立刻再触发
+        tx.executeWithoutResult(status -> {
+            messages.save(m);
+            t.setLastRunAt(now);
+            if (ScheduledTask.KIND_ONCE.equals(t.getKind())) {
+                t.setStatus(ScheduledTask.STATUS_DONE);
+            } else {
+                t.setNextRunAt(computeNext(t, now));
+            }
+            saved.set(saveIfPresent(t));
+            if (saved.get()) {
+                appLogs.record(AppLog.TYPE_TASK, conv.getId(), t.getAgentId(),
+                        "定时任务「" + t.getName() + "」触发" + (catchUp ? "（错过补发）" : ""));
+            }
+        });
+        if (!saved.get()) {
+            return;
         }
-        tasks.save(t);
-        appLogs.record(AppLog.TYPE_TASK, conv.getId(), t.getAgentId(),
-                "定时任务「" + t.getName() + "」触发" + (catchUp ? "（错过补发）" : ""));
         if (stream != null) {
             stream.stream(new ConversationStreamSupport.Broadcast(conv.getId()), conv, m);
         }
@@ -709,7 +757,7 @@ public class ScheduledTaskService {
 
     /** 下一次触发时间（毫秒），无法计算返回 null */
     private Long computeNext(ScheduledTask t, long from) {
-        LocalDateTime fromDt = LocalDateTime.ofInstant(Instant.ofEpochMilli(from), ZONE);
+        LocalDateTime fromDt = LocalDateTime.ofInstant(Instant.ofEpochMilli(from), ZoneId.systemDefault());
         switch (t.getKind()) {
             case ScheduledTask.KIND_ONCE -> {
                 return t.getRunAt();
@@ -723,7 +771,7 @@ public class ScheduledTaskService {
                 if (!candidate.isAfter(fromDt)) {
                     candidate = candidate.plusDays(1);
                 }
-                return candidate.atZone(ZONE).toInstant().toEpochMilli();
+                return candidate.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
             }
             case ScheduledTask.KIND_WEEKLY -> {
                 LocalTime time = parseTime(t.getTimeOfDay());
@@ -738,7 +786,7 @@ public class ScheduledTaskService {
                     }
                     LocalDateTime candidate = LocalDateTime.of(d, time);
                     if (candidate.isAfter(fromDt)) {
-                        return candidate.atZone(ZONE).toInstant().toEpochMilli();
+                        return candidate.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
                     }
                 }
                 return null;
@@ -800,16 +848,8 @@ public class ScheduledTaskService {
 
     // ---------- DTO ----------
 
+    /** 会话 DTO 统一走 ConversationService.toDto（避免两份逐字段拷贝随字段增加而漂移） */
     private ConversationDto toDto(Conversation c) {
-        List<String> ids = memberIds(c.getId());
-        String agentId = "single".equals(c.getType()) && !ids.isEmpty() ? ids.get(0) : null;
-        long lastRead = c.getLastReadAt() == null ? 0L : c.getLastReadAt();
-        long unread = messages.countByConversationIdAndCreatedAtGreaterThanAndSenderTypeNot(c.getId(), lastRead, "user");
-        return new ConversationDto(c.getId(), c.getType(),
-                c.getCategory() == null ? ConversationService.CATEGORY_CHAT : c.getCategory(),
-                c.getName() == null ? "" : c.getName(), agentId,
-                ids, c.getChatMode() == null ? "passive" : c.getChatMode(), c.isPinned(),
-                c.getLastMessage() == null ? "" : c.getLastMessage(),
-                c.getLastMessageAt(), unread, c.getArchivedAt());
+        return conversationService.getObject().toDto(c);
     }
 }

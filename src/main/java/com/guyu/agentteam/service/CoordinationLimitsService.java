@@ -1,9 +1,8 @@
 package com.guyu.agentteam.service;
 
+import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.dto.CoordinationLimitsDto;
-import com.guyu.agentteam.entity.AppSetting;
-import com.guyu.agentteam.repository.AppSettingRepository;
 import org.springframework.stereotype.Service;
 import tools.jackson.databind.ObjectMapper;
 
@@ -20,19 +19,19 @@ public class CoordinationLimitsService {
     private static final int MEMBER_MAX = 120;
     private static final String KEY = "coordination.limits";
 
-    private final AppSettingRepository settings;
-    private final ObjectMapper mapper = new ObjectMapper();
+    private final SettingsStore store;
+    private final ObjectMapper mapper = Json.mapper();
 
-    public CoordinationLimitsService(AppSettingRepository settings) {
-        this.settings = settings;
+    public CoordinationLimitsService(SettingsStore store) {
+        this.store = store;
     }
 
     public record Limits(int overallMinutes, int memberMinutes) {
     }
 
     public Limits load() {
-        String json = settings.findById(KEY).map(AppSetting::getSettingValue).orElse(null);
-        if (json == null || json.isBlank()) {
+        String json = store.read(KEY);
+        if (json == null) {
             return new Limits(DEFAULT_OVERALL_MINUTES, DEFAULT_MEMBER_MINUTES);
         }
         try {
@@ -52,18 +51,13 @@ public class CoordinationLimitsService {
         if (memberMinutes < 1 || memberMinutes > MEMBER_MAX) {
             throw new ApiException(400, "单成员超时需在 1-" + MEMBER_MAX + " 分钟之间");
         }
-        AppSetting s = settings.findById(KEY).orElseGet(() -> {
-            AppSetting n = new AppSetting();
-            n.setSettingKey(KEY);
-            return n;
-        });
+        String json;
         try {
-            s.setSettingValue(mapper.writeValueAsString(new Limits(overallMinutes, memberMinutes)));
+            json = mapper.writeValueAsString(new Limits(overallMinutes, memberMinutes));
         } catch (Exception e) {
             throw new ApiException(500, "保存协作限制失败");
         }
-        s.setUpdatedAt(System.currentTimeMillis());
-        settings.save(s);
+        store.write(KEY, json);
         return new CoordinationLimitsDto(overallMinutes, memberMinutes);
     }
 

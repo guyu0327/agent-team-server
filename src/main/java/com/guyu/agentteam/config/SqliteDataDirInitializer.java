@@ -3,8 +3,8 @@ package com.guyu.agentteam.config;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 
+import com.guyu.agentteam.common.SqlitePaths;
 import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -19,20 +19,12 @@ public class SqliteDataDirInitializer {
 
     @Bean
     static BeanPostProcessor sqliteDataDirCreator(Environment environment) {
-        String url = environment.getProperty("spring.datasource.url", "");
-        if (url.startsWith("jdbc:sqlite:")) {
-            String path = url.substring("jdbc:sqlite:".length());
-            int query = path.indexOf('?');
-            if (query >= 0) {
-                path = path.substring(0, query);
-            }
-            if (!path.isBlank() && !path.startsWith(":memory:")) {
-                Path dbFile = Paths.get(path).toAbsolutePath().normalize();
-                try {
-                    Files.createDirectories(dbFile.getParent());
-                } catch (IOException e) {
-                    throw new IllegalStateException("无法创建 SQLite 数据目录：" + dbFile.getParent(), e);
-                }
+        Path dbFile = SqlitePaths.dbFile(environment.getProperty("spring.datasource.url", ""));
+        if (dbFile != null) {
+            try {
+                Files.createDirectories(dbFile.getParent());
+            } catch (IOException e) {
+                throw new IllegalStateException("无法创建 SQLite 数据目录：" + dbFile.getParent(), e);
             }
         }
         return new BeanPostProcessor() {};

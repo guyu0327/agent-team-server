@@ -1,5 +1,6 @@
 package com.guyu.agentteam.service;
 
+import com.guyu.agentteam.common.Str;
 import com.guyu.agentteam.common.Ids;
 import com.guyu.agentteam.common.Images;
 import com.guyu.agentteam.common.Json;
@@ -16,7 +17,6 @@ import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import io.agentscope.core.agent.accumulator.TextAccumulator;
 import io.agentscope.core.message.AssistantMessage;
 import io.agentscope.core.model.ExecutionConfig;
-import io.agentscope.core.message.Base64Source;
 import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.ImageBlock;
 import io.agentscope.core.message.Msg;
@@ -29,12 +29,10 @@ import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,10 +46,7 @@ import java.util.concurrent.atomic.AtomicReference;
 @Service
 public class ConversationStreamSupport {
 
-    /** 转成 ImageBlock 的单图上限，防止 base64 撑爆模型请求 */
-    private static final long MAX_IMAGE_BYTES = 8L * 1024 * 1024;
-
-    private final ObjectMapper mapper = new ObjectMapper();
+    private final ObjectMapper mapper = Json.mapper();
 
     private final ConversationRepository conversations;
     private final MessageRepository messages;
@@ -180,6 +175,21 @@ public class ConversationStreamSupport {
         }
     }
 
+    /**
+     * 回合收尾（幂等）：正常回合的 done 已清快照，这里不再重复发；
+     * 异常路径（completeWithError）没发过 done，快照还在——补发一个让前端收尾，
+     * 观察者的「协作中」横幅和半截流式输出才不会永远挂着。
+     */
+    public void endRound(String conversationId, SseEmitter emitter) {
+        if (roundStates.remove(conversationId) != null) {
+            try {
+                send(emitter, "done", Map.of());
+            } catch (Exception ignored) {
+                // 连接已断/已 complete：快照已清，收尾目的已达成
+            }
+        }
+    }
+
     /** 观察者：前端通过 /events 常驻 SSE 订阅某会话，接收该会话定时任务触发回合的全部事件 */
     public void registerWatcher(String conversationId, SseEmitter emitter) {
         watchers.computeIfAbsent(conversationId, k -> ConcurrentHashMap.newKeySet()).add(emitter);
@@ -269,8 +279,8 @@ public class ConversationStreamSupport {
         };
     }
 
-    /** 定时任务回合标注：随消息落库，前端据此显示来源任务徽标并支持按任务筛选；auto* 为该回合的审批放行策略 */
-    public record TaskTag(String taskId, String taskName, boolean autoWrite, boolean autoShell) {
+    /** 定时任务回合标注：随消息落库，前端据此显示来源任务徽标并支持按任务筛选；auto* 为该回合的审批放行策略；collab 表示协作任务（编排者必须委派成员，自己包揽不算实际执行） */
+    public record TaskTag(String taskId, String taskName, boolean autoWrite, boolean autoShell, boolean collab) {
     }
 
     public Message saveMessage(Conversation conv, Agent agent, String content, String type) {
@@ -318,7 +328,7 @@ public class ConversationStreamSupport {
     }
 
     public Optional<ModelPreset> presetOf(Agent a) {
-        if (isBlank(a.getPresetId())) {
+        if (Str.isBlank(a.getPresetId())) {
             return Optional.empty();
         }
         return presets.findById(a.getPresetId());
@@ -364,24 +374,15 @@ public class ConversationStreamSupport {
         if (!s.enabled()) {
             return all;
         }
-        int start = 0;
         String watermark = conversations.findById(conversationId)
                 .map(conversation -> conversation.getDigestWatermark())
                 .filter(w -> w != null && !w.isBlank())
                 .orElse(null);
-        if (watermark != null) {
-            for (int i = 0; i < all.size(); i++) {
-                if (watermark.equals(all.get(i).getId())) {
-                    start = i + 1;
-                    break;
-                }
-            }
-        }
-        List<Message> effective = all.subList(start, all.size());
+        List<Message> effective = ContextCompressionService.afterWatermark(all, watermark);
         long acc = 0;
         int from = effective.size();
         for (int i = effective.size() - 1; i >= 0; i--) {
-            acc += charsOf(effective.get(i));
+            acc += ContextCompressionService.charsOf(effective.get(i));
             if (acc > s.budgetChars()) {
                 break;
             }
@@ -392,12 +393,6 @@ public class ConversationStreamSupport {
             from = effective.size() - 1;
         }
         return from == 0 ? effective : effective.subList(from, effective.size());
-    }
-
-    private long charsOf(Message m) {
-        long n = m.getContent() == null ? 0 : m.getContent().length();
-        // 附件在 effectiveUserText 里展开成注记文本，按每条 100 字符粗略估算
-        return n + 100L * Json.readAttachments(m.getAttachments()).size();
     }
 
     /**
@@ -420,17 +415,7 @@ public class ConversationStreamSupport {
     }
 
     private ImageBlock imageBlock(Path p) {
-        try {
-            if (!Files.isRegularFile(p) || Files.size(p) > MAX_IMAGE_BYTES) return null;
-            return ImageBlock.builder()
-                    .source(Base64Source.builder()
-                            .mediaType(Images.mediaType(p.getFileName().toString()))
-                            .data(Base64.getEncoder().encodeToString(Files.readAllBytes(p)))
-                            .build())
-                    .build();
-        } catch (IOException e) {
-            return null;
-        }
+        return Images.toImageBlock(p, Images.MAX_IMAGE_BYTES);
     }
 
     /** 用户消息带上附件说明，模型才知道该条消息在指哪些文件/文件夹/图片 */
@@ -456,9 +441,6 @@ public class ConversationStreamSupport {
         return m.getContent() != null && !m.getContent().isBlank();
     }
 
-    public boolean isBlank(String s) {
-        return s == null || s.isBlank();
-    }
 
     /** 单次模型调用的超时上限，须小于各服务的整体运行上限（成员 4 分钟 / 编排 8 分钟） */
     public static final Duration MODEL_CALL_TIMEOUT = Duration.ofMinutes(3);
@@ -497,8 +479,8 @@ public class ConversationStreamSupport {
     public static class SegState {
         public final AtomicReference<Message> msg = new AtomicReference<>();
         public final TextAccumulator text = new TextAccumulator();
-        /** 已开启的段数（含进行中），用于判断整次回复是否完全空白 */
-        public int opened;
+        /** 已开启的段数（含进行中），用于判断整次回复是否完全空白；跨线程读写需 volatile */
+        public volatile int opened;
     }
 
     public void openSegment(SseEmitter emitter, Conversation conv, Agent agent, SegState seg) {

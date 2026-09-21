@@ -1,5 +1,6 @@
 package com.guyu.agentteam.service.tool;
 
+import com.guyu.agentteam.common.Str;
 import com.guyu.agentteam.entity.Agent;
 import com.guyu.agentteam.entity.ModelPreset;
 import com.guyu.agentteam.repository.ModelPresetRepository;
@@ -61,7 +62,7 @@ public class ImageGenerationTools {
         if (preset == null || !adapters.containsKey(preset.getProtocol())) {
             return;
         }
-        if (isBlank(preset.getApiKey()) || isBlank(preset.getBaseUrl())) {
+        if (Str.isBlank(preset.getApiKey()) || Str.isBlank(preset.getBaseUrl())) {
             return;
         }
         toolkit.registerTool(new GenerateImageTool(adapters.get(preset.getProtocol()), preset, fileTools, listener));
@@ -75,7 +76,7 @@ public class ImageGenerationTools {
         }
         ModelPreset preset = presets.findById(presetId).orElse(null);
         return preset != null && adapters.containsKey(preset.getProtocol())
-                && !isBlank(preset.getApiKey()) && !isBlank(preset.getBaseUrl());
+                && !Str.isBlank(preset.getApiKey()) && !Str.isBlank(preset.getBaseUrl());
     }
 
     public static class GenerateImageTool {
@@ -105,7 +106,7 @@ public class ImageGenerationTools {
             if (prompt == null || prompt.isBlank()) {
                 return "生图失败：prompt 不能为空。";
             }
-            String normalized = size == null || size.isBlank() ? "1024x1024" : size.trim();
+            String normalized = size == null || size.isBlank() ? "1024x1024" : size.trim().toLowerCase();
             listener.onStart();
             try {
                 ImageGenAdapter.Result result = adapter.generate(preset, prompt, normalized);
@@ -114,7 +115,9 @@ public class ImageGenerationTools {
                         + "\n请在回复中原样引用该路径展示图片：![](" + toForwardSlash(saved) + ")";
             } catch (Exception e) {
                 String reason = e.getMessage() == null ? e.toString() : e.getMessage();
-                return "生图失败：" + reason + "。请检查图像预设配置（模型名/地址/密钥）后告知用户，不要反复重试。";
+                return "生图失败：" + reason
+                        + "。请根据该错误判断原因（如 size 参数格式问题就修正参数重试；密钥/地址等配置问题才需要检查图像预设），"
+                        + "并向用户如实说明，不要盲目反复重试。";
             } finally {
                 listener.onEnd();
             }
@@ -137,7 +140,4 @@ public class ImageGenerationTools {
         }
     }
 
-    private static boolean isBlank(String s) {
-        return s == null || s.isBlank();
-    }
 }

@@ -1,5 +1,6 @@
 package com.guyu.agentteam.ws;
 
+import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.dto.XfyunAsrConfigDto;
 import com.guyu.agentteam.service.AsrStreamService;
 import java.net.http.HttpClient;
@@ -36,7 +37,7 @@ class SessionBridge {
     /** 队列上限 ≈ 1.3s 音频；满则丢最旧，保延迟不保完整 */
     private static final int QUEUE_LIMIT = 32;
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = Json.mapper();
 
     private final WebSocketSession client;
     private final AsrStreamService streamService;
@@ -91,7 +92,15 @@ class SessionBridge {
             return;
         }
         while (!queue.offer(bytes)) {
-            queue.poll();
+            byte[] dropped = queue.poll();
+            if (dropped == null) {
+                return;
+            }
+            if (dropped.length == 0) {
+                // 挤到结束哨兵：还回去、丢当前帧——哨兵被挤掉后结束帧丢失，只能等 60s 上限兜底
+                queue.offer(dropped);
+                return;
+            }
         }
     }
 

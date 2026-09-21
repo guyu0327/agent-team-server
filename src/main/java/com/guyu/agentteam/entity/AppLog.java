@@ -21,6 +21,7 @@ public class AppLog {
     public static final String TYPE_IMAGE = "image";
     public static final String TYPE_COMPACT = "compact";
     public static final String TYPE_TASK = "task";
+    public static final String TYPE_WECHAT = "wechat";
     public static final String TYPE_API_ERROR = "api_error";
 
     @Id

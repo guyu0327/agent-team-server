@@ -183,6 +183,9 @@ public class ConversationController {
             throw ApiException.badRequest("消息内容不能为空");
         }
         Conversation conv = conversationService.getEntity(id);
+        if ("wechat".equals(conv.getChannel())) {
+            throw ApiException.badRequest("微信会话请在微信中继续对话");
+        }
         long now = System.currentTimeMillis();
         // 附件全部校验通过才继续：任何一个路径无效都直接拒绝，避免半发送状态
         List<ConversationFileGrant> grants = paths.stream()

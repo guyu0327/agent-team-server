@@ -30,8 +30,9 @@ public class GatedShellTool {
     }
 
     @Tool(description = "Execute a shell command (cmd on Windows). Use for git, npm, build, test, and other "
-            + "terminal operations. Requires user approval on every use: an approval card with the command is "
-            + "shown to the user. Returns combined output and exit code. If a dedicated tool exists (e.g., "
+            + "terminal operations. The first use in a conversation needs user approval via an approval card; "
+            + "once allowed for the session, later commands in the same conversation run without asking again. "
+            + "Returns combined output and exit code. If a dedicated tool exists (e.g., "
             + "read_file, write_file), you MUST use it instead of shell commands.")
     public String execute(
             @ToolParam(name = "command", description = "Shell command to execute") String command,

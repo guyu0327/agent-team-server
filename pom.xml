@@ -93,6 +93,13 @@
             <artifactId>agentscope-extensions-model-openai</artifactId>
             <version>${agentscope.version}</version>
         </dependency>
+
+        <!-- 微信 iLink 登录二维码编码（零依赖，纯矩阵生成，SVG 渲染自己拼） -->
+        <dependency>
+            <groupId>io.nayuki</groupId>
+            <artifactId>qrcodegen</artifactId>
+            <version>1.8.0</version>
+        </dependency>
     </dependencies>
 
     <build>

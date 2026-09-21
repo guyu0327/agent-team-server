@@ -4,7 +4,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 ## 相关仓库
 
-- 前端界面 [agent-team-web](https://github.com/guyu0327/agent-team-web)：Vue 3 + TypeScript + Pinia，类微信深色界面
+- 前端界面 [agent-team-web](https://github.com/guyu0327/agent-team-web)：Vue 3 + TypeScript + Pinia，聊天应用布局深色界面
 - 桌面壳 [agent-team-desktop](https://github.com/guyu0327/agent-team-desktop)：Electron 打包分发，自动拉起本服务并管理数据目录与备份
 
 ## 核心机制
@@ -22,11 +22,12 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | --- | --- |
 | `list_team` | 查看可委派的成员及职责与能力（是否具备图像生成等） |
 | `create_team` | 需要成员参与时（哪怕 1 个）先创建项目群，协作过程进群；编排者 + 成员 + 用户构成协作多方 |
-| `delegate` | 委派子任务；成员用自己的人设和模型独立执行，输出作为真实消息流式展示 |
+| `delegate` | 委派子任务；成员用自己的人设和模型独立执行，输出作为真实消息流式展示；任务卡同时以编排者名义落库进群（「【委派任务卡 → 成员】」），委派了什么、题是什么在消息流直接可见 |
 | `finish` | 提交最终总结，自动发回用户发起请求的单聊 |
 
 - 协作全程透明：编排者的每段发言、成员的完整输出都是真实持久化的聊天消息
 - 编排者发言按工具调用自动切分为多段气泡
+- 编排者系统提示明确：受控操作被拒绝（如终端命令未获授权）时必须在群里说明情况与调整方案，不许默默跳过
 - 编排者提前感知成员能力：`list_team` 返回成员职责与能力（是否具备图像生成），系统提示也注入成员能力清单，绘图任务只会委派给具备图像生成的成员
 - 回复进行中可随时终止：`POST /api/conversations/{id}/stop`（覆盖普通回复、编排协作与自由讨论，直接掐断在途模型请求并按拒绝唤醒待审批请求，已产生的输出保留）
 - 限制：ReAct 迭代不设上限；整体与单成员时长可在设置页配置（默认 60 / 5 分钟，持久化于 `app_settings` 的 `coordination.limits`），到时自动终止
@@ -63,7 +64,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 ### 智能体长期记忆（agent_memories）
 - 基于 AgentScope 的 `LongTermMemory` 接口以 **AGENT_CONTROL** 模式接入：框架自动给智能体注册 `recordToMemory` / `retrieveFromMemory` 两个工具，记什么、何时取回完全由智能体在 ReAct 循环中自行决定（用户分享偏好、背景、重要事实或明确要求记住时写入）
 - 存储为 SQLite `agent_memories` 表（V6 迁移），按智能体隔离、跨会话共享；单聊、群成员、编排协作（含受委派成员）全部生效
-- 每轮回复系统提示注入当前记忆清单（时间正序，预算 6000 字符），智能体无需主动检索即可「记得」用户；`retrieveFromMemory` 可按需取全量
+- 每轮回复系统提示注入当前记忆清单（时间正序，预算 6000 字符），智能体无需主动检索即可「记得」用户；`retrieveFromMemory` 按查询词过滤返回（命中部分限 8000 字符预算、从最新往回取），无查询词回退全部、全部不命中回退最新几条，避免检索空手而归或全量回注撑爆小上下文模型
 - 上限：单智能体 300 条（超出裁最旧）、单条 2000 字符；删除智能体时级联清空其记忆
 - 查看/清空：`GET /api/agents/{id}/memories`、`DELETE /api/agents/{id}/memories`
 
@@ -89,12 +90,20 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 任务模型：名称 + 内容 + 触发方式（`once` 单次 runAt / `daily` 每天 timeOfDay / `weekly` 每周 timeOfDay+daysOfWeek（1=周一…7=周日）/ `interval` 每 intervalMinutes 分钟），不引入 cron，字段结构化由后端校验（V7 迁移）；任务类型 `mode`：`normal` 普通（智能体独立执行，绑定其任务线程）/ `collab` 协作（编排者执行并拉非编排者成员建任务项目群，成员必选，V9 迁移）；`catch_up` 开关控制错过的单次任务启动后 24h 内是否补发，默认不补发（补发关闭时错过的任务直接转 done 并记日志）
 - 会话绑定：无协作成员 → 智能体专属任务线程（`category=task` 单聊，同智能体多任务共用一条，消息带 `task_id`/`task_name` 打标供筛选）；有协作成员 → 任务项目群（`category=task` 群聊「任务：名称」，触发时成员一起执行）；任务全部删光的会话不再出现在任务页
 - 触发管线：到点向绑定会话注入合成用户消息（前缀【定时任务触发·名称】，正文明确「这是已有任务的自动触发，直接执行、勿再创建」，并澄清「以任务卡形式委派」等说法指把卡片内容作为 `delegate` 参数传给成员而非聊天文本输出，落库打任务标），走 `ChatStreamService.stream()` 全管线（回复 / 协作 / 落库照旧）；触发回合内 `schedule_task` 工具直接拒绝（防把触发误当新请求循环建任务），同名同内容的重复创建也被后端拦截；上一轮未结束自动顺延 1 分钟；一次性任务触发后转 `done`，周期任务算下一次
-- 触发轮纠错：任务触发的编排协作轮若整轮零工具调用（只输出任务卡 / 计划 / 总结文本，未实际执行），自动追加一条带任务标的纠正指令用户消息重试一轮（「请立即调用 delegate / 文件工具实际执行」），并记运行日志 `task`；每个触发轮最多纠错重试一次，被终止或出错的回合不重试
+- 触发轮纠错：任务触发的编排协作轮若没有实际执行证据（纯文本收场、只调用了被拒绝或只读的工具、或协作任务未委派成员自己包揽），自动追加一条带任务标的纠正指令用户消息重试（「请立即调用 delegate / 文件工具实际执行」），并记运行日志 `task`；每个触发轮最多纠错重试两次（首次 + 两次纠正共三轮），被终止或出错的回合不重试
 - 实时可见：任务触发的回合用 `Broadcast` 扇出发射器，`GET /api/conversations/{id}/events`（SSE，令牌走 `token` 查询参数）常驻订阅后推给正在查看的前端；用户主动发消息仍走 POST 响应流，不重复
 - 错过补发：应用启动时恢复任务（`ApplicationReadyEvent`），开启 `catch_up` 的错过一次性任务 24 小时内补发（消息标注「错过补发」），未开启默认不补发直接转 `done` 并记日志；周期任务只重排未来
 - AI 工具：智能体在对话中可用 `schedule_task` / `update_task` / `list_tasks` / `cancel_task` 为用户安排或调整任务；系统提示与工具描述明确：周期性/定时需求一律走 `schedule_task`（需要成员参与传 `member_ids` 建协作任务群），不得用建普通群聊代替；用户侧走 REST（见 API 概览），日志类型 `task`
 - 删除归档与恢复：删除任务（单个或批量）后其消息整批移入归档会话（`category=task` + `archived_at`，历史页以「定时任务」标签展示），任务配置以 JSON 快照存进 `conversations.task_snapshot`（V8 迁移）；`POST /api/tasks/restore/{conversationId}` 按快照走创建流程重建任务（once 已过期顺延 1 分钟执行），归档消息随之搬回任务线程挂到新任务名下、归档会话删除（历史页不再显示）
 - 立即执行：`POST /api/tasks/{taskId}/run` 手动触发与到点相同的执行流程（会话忙碌直接报错不排队）；周期任务的下一次排期不受影响，暂停中的任务执行后保持暂停（不产生排期）
+
+### 微信通道（iLink Bot）
+- 扫码接入：`POST /api/wechat/login` 取二维码并长轮询扫码状态（支持配对码验证、二维码过期自动刷新、已绑定他实例检测），登录颁发的 bot_token 存于 `app_settings`（key=`wechat.bot`）；通道开关与参数持久化于 `wechat.channel`，`GET/PUT /api/wechat/settings` 读写——处理智能体（空 = 编排者优先）、回复长度上限（200–20000，默认 2000）、回合超时（1–60 分钟，默认 10）、后台自动放行（写改文件 / 终端命令，默认均不放行）
+- 收消息：后台守护线程对 `getupdates` 长轮询（`get_updates_buf` 断点续传 + message_id 去重兜底）；`wechat_bindings` 表（V11 迁移）把微信发送者绑定到系统单聊（`conversations.channel=wechat`，V12 迁移），绑定持久保留，断开重连后消息继续进原会话；-14 会话超时需重新扫码
+- 回复管线：收到的文本走 `ChatStreamService.stream()` 全管线（后台回合：审批按通道配置自动放行，决定记运行日志），聚合本轮全部智能体文本经 `sendmessage` 推回微信（回传 context_token，超长按上限截断）；上一轮未结束自动等空闲，回合异常/空回复也有明确提示回传
+- 智能体切换：通道配置的处理智能体即时生效——已有绑定会话的成员随之替换，无需重新绑定
+- 媒体消息（对照官方 openclaw-weixin 协议）：图片/文件/视频经微信 CDN 下载并 AES-128-ECB/PKCS7 解密（`full_url` 优先，密钥兼容 base64 原始与十六进制两种编码，≤50MB），存入主工作区「微信接收/」；图片以图片附件进入管线（模型直接注入视觉块），文件/视频作为文件附件供文件工具读写；语音优先使用微信侧转写文本当文字处理，无转写则回复暂不支持；下载/解密失败回复失败说明并记日志
+- 实时可见：与定时任务触发的回合一样经 `Broadcast` 扇出 SSE（`GET /api/conversations/{id}/events`），正在查看该会话的前端实时渲染流式输出；媒体落盘在沙箱内，`view_image` 与文件工具可直接访问
 
 ### 实时语音转写（讯飞流式听写）
 - WebSocket 端点 `/api/asr/stream`：前端发二进制 16k PCM 音频与 `{"type":"stop"}` 控制帧；后端按讯飞节奏（40ms / 1280B 一帧，base64）装帧转发到 `wss://iat-api.xfyun.cn/v2/iat`，识别结果转为 `{type:partial|final|error|end}` JSON 回传
@@ -113,7 +122,8 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 上下文压缩：历史超预算自动滚动摘要（设置页可调预算与开关），图片首轮看完即降级为文字注记，`view_image` 工具按需重看
 - 运行日志：协作/讨论/审批/生图/压缩/错误等关键事件异步落库，可按类型与时间范围查询
 - 智能体长期记忆：框架 AGENT_CONTROL 模式，智能体自己决定记住什么，SQLite 落库、跨会话生效，可查看与清空
-- 定时任务：单次 / 每天 / 每周 / 固定间隔四种触发，独立任务会话（线程或项目群）不污染普通聊天，用户与智能体均可增删改查，错过的单次任务 24h 内补发；后台触发回合按任务配置自动放行受控操作（写改默认放行、命令默认不放行），触发轮只输出文字未实际执行时自动纠错重试一轮
+- 定时任务：单次 / 每天 / 每周 / 固定间隔四种触发，独立任务会话（线程或项目群）不污染普通聊天，用户与智能体均可增删改查，错过的单次任务 24h 内补发；后台触发回合按任务配置自动放行受控操作（写改默认放行、命令默认不放行），触发轮只输出文字未实际执行时自动纠错重试（最多两次）
+- 微信通道：扫码接入微信 iLink Bot，手机微信直接与绑定智能体单聊；图片/文件/视频可处理、语音用微信转写文本；桌面端对应会话只读展示，回复实时可见
 
 ## 技术栈
 
@@ -181,7 +191,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 编排协作可能跨会话进行（建群协作、总结回单聊），`reply_start` 起的所有事件都携带 `conversationId`，客户端应按它路由消息。
 
-定时任务触发的回合没有 POST 请求方，事件经 `Broadcast` 扇出到 `GET /api/conversations/{id}/events`（同协议常驻 SSE 订阅，令牌走 `token` 查询参数），同一会话两类流互不重复。
+定时任务与微信通道触发的后台回合没有 POST 请求方，事件经 `Broadcast` 扇出到 `GET /api/conversations/{id}/events`（同协议常驻 SSE 订阅，令牌走 `token` 查询参数），同一会话两类流互不重复。
 
 ## API 概览
 
@@ -194,6 +204,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | `/api/tasks` | 定时任务 CRUD（`GET` 按会话分组、`POST` 创建、`PUT /{taskId}` 更新含暂停恢复、`DELETE /{taskId}`）、`/{taskId}/run` 立即执行一次、`/conversation/{id}` 会话任务列表、`/conversations` 任务会话列表（仅还剩任务的）、`/restore/{conversationId}` 从历史归档恢复任务 |
 | `/api/fs` | 图片内容读取（气泡缩略图数据源，只读） |
 | `/api/asr/stream` | 实时语音转写 WebSocket（桥接讯飞流式听写） |
+| `/api/wechat` | 微信 iLink 通道：连接状态（`GET /status`）、扫码登录（`POST /login` 发起、`GET /login/status` 轮询、`POST /login/verify` 配对码、`POST /login/cancel` 取消）、断开（`POST /disconnect`）、通道设置（`GET/PUT /settings`） |
 | `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、协作时长限制、上下文压缩（预算/开关）、数据库快照导出 |
 | `/api/logs` | 运行日志查询（按类型与时间范围分页） |
 
@@ -210,6 +221,7 @@ src/main/java/com/guyu/agentteam/
 │   ├── AppLogService            运行日志异步落库与过期清理
 │   ├── CoordinationLimitsService 协作/讨论时长限制（app_settings 持久化）
 │   ├── ScheduledTaskService      定时任务（CRUD/调度/恢复补发/触发，TaskScheduler + 句柄表）
+│   ├── wechat/                  微信 iLink 通道（扫码登录/长轮询收发/CDN 媒体下载解密/会话绑定）
 │   ├── AsrStreamService         实时语音识别配置与讯飞鉴权
 │   ├── orchestration/
 │   │   ├── OrchestrationService   编排协作循环与团队工具
@@ -219,6 +231,7 @@ src/main/java/com/guyu/agentteam/
 │       ├── GatedShellTool       审批门控的终端命令工具
 │       ├── ImageGenerationTools 文生图工具（按智能体图像预设注册）
 │       ├── ScheduledTaskTools   定时任务工具（schedule/update/list/cancel_task）
+│       ├── AbstractImageAdapter  文生图适配器基类（公共下载/落盘/尺寸逻辑）
 │       ├── DashscopeImageAdapter / OpenAiImageAdapter / SiliconflowImageAdapter  文生图协议适配器
 │       └── OpRequestSink        审批请求回调接口
 ├── ws/                    实时语音转写 WebSocket（讯飞桥接）

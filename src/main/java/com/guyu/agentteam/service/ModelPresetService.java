@@ -1,5 +1,6 @@
 package com.guyu.agentteam.service;
 
+import com.guyu.agentteam.common.Str;
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.common.Ids;
 import com.guyu.agentteam.dto.ModelPresetDto;
@@ -81,18 +82,15 @@ public class ModelPresetService {
         if (req.baseUrl() == null || req.baseUrl().isBlank()) {
             throw ApiException.badRequest("API 地址不能为空");
         }
-        if (!isBlank(req.protocol()) && !SUPPORTED_PROTOCOLS.contains(req.protocol().trim())) {
+        if (!Str.isBlank(req.protocol()) && !SUPPORTED_PROTOCOLS.contains(req.protocol().trim())) {
             throw ApiException.badRequest("不支持的预设类型：" + req.protocol());
         }
     }
 
-    private static boolean isBlank(String s) {
-        return s == null || s.isBlank();
-    }
 
     private void apply(ModelPreset p, ModelPresetUpsertRequest req, boolean isCreate) {
         p.setName(req.name().trim());
-        p.setProtocol(isBlank(req.protocol()) ? PROTOCOL_CHAT : req.protocol().trim());
+        p.setProtocol(Str.isBlank(req.protocol()) ? PROTOCOL_CHAT : req.protocol().trim());
         p.setBaseUrl(req.baseUrl().trim());
         p.setRemark(req.remark() == null ? "" : req.remark().trim());
         if (req.apiKey() != null && !req.apiKey().isBlank()) {

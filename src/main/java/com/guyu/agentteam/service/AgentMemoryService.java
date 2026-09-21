@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -27,6 +28,8 @@ public class AgentMemoryService {
     private static final int MAX_ENTRY_CHARS = 2000;
     /** 注入系统提示的字符预算，超出时只保留较新的记忆 */
     private static final int PROMPT_BUDGET_CHARS = 6000;
+    /** 工具检索路径的返回字符预算：几百条记忆全量回注会撑爆小上下文模型 */
+    private static final int RETRIEVE_BUDGET_CHARS = 8000;
 
     private final AgentMemoryRepository repo;
 
@@ -45,7 +48,8 @@ public class AgentMemoryService {
 
             @Override
             public Mono<String> retrieve(Msg query) {
-                return Mono.fromCallable(() -> retrieveAll(agentId))
+                return Mono.fromCallable(() -> AgentMemoryService.this.retrieve(
+                                agentId, query == null ? "" : query.getTextContent()))
                         .subscribeOn(Schedulers.boundedElastic());
             }
         };
@@ -73,14 +77,42 @@ public class AgentMemoryService {
         }
     }
 
-    private String retrieveAll(String agentId) {
+    /**
+     * 工具检索路径：按查询词过滤记忆，命中部分限预算返回（从最新往回取）；
+     * 无查询词回退全部（仍限预算），全部不命中回退最新几条，避免检索空手而归。
+     */
+    private String retrieve(String agentId, String queryText) {
         List<AgentMemory> all = repo.findByAgentIdOrderByCreatedAtAsc(agentId);
         if (all.isEmpty()) return "（长期记忆为空）";
-        StringBuilder sb = new StringBuilder("共 ").append(all.size()).append(" 条长期记忆：\n");
-        for (int i = 0; i < all.size(); i++) {
-            sb.append(i + 1).append(". ").append(all.get(i).getContent()).append('\n');
+        List<String> keywords = keywordsOf(queryText);
+        List<AgentMemory> matched = keywords.isEmpty() ? all
+                : all.stream().filter(m -> keywords.stream().anyMatch(k -> m.getContent().contains(k))).toList();
+        if (matched.isEmpty()) {
+            matched = all.subList(Math.max(0, all.size() - 5), all.size());
         }
-        return sb.toString();
+        ArrayDeque<String> kept = new ArrayDeque<>();
+        int used = 0;
+        for (int i = matched.size() - 1; i >= 0; i--) {
+            String line = "- " + matched.get(i).getContent();
+            if (!kept.isEmpty() && used + line.length() > RETRIEVE_BUDGET_CHARS) break;
+            kept.addFirst(line);
+            used += line.length();
+        }
+        return "共 " + all.size() + " 条长期记忆"
+                + (keywords.isEmpty() ? "" : "，与查询相关的 " + matched.size() + " 条")
+                + "：\n" + String.join("\n", kept);
+    }
+
+    /** 查询文本切关键词：按空白与中英文标点拆分，保留长度 ≥2 的片段 */
+    private static List<String> keywordsOf(String text) {
+        if (text == null || text.isBlank()) return List.of();
+        List<String> out = new ArrayList<>();
+        for (String w : text.split("[\\s\\p{Punct}，。！？、；：「」『』（）【】]+")) {
+            if (w.length() >= 2) {
+                out.add(w);
+            }
+        }
+        return out;
     }
 
     /** 注入系统提示的记忆块（时间正序、限预算），无记忆时返回空串 */

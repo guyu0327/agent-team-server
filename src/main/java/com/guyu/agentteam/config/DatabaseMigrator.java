@@ -14,7 +14,9 @@ import java.util.regex.Pattern;
 import javax.sql.DataSource;
 
 import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.EncodedResource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
+import org.springframework.jdbc.datasource.init.ScriptUtils;
 
 /**
  * 版本化数据库迁移：按版本号顺序执行 classpath:db/migration/V{n}__xxx.sql 中未应用的脚本，
@@ -75,14 +77,11 @@ public final class DatabaseMigrator {
 
     private static void apply(Connection conn, Resource script) throws Exception {
         String filename = script.getFilename();
-        String sql = stripComments(script.getContentAsString(StandardCharsets.UTF_8));
         conn.setAutoCommit(false);
-        try (Statement st = conn.createStatement()) {
-            for (String statement : sql.split(";")) {
-                if (!statement.isBlank()) {
-                    st.execute(statement.trim());
-                }
-            }
+        try {
+            // ScriptUtils 按语法拆分（识别字符串字面量内的分号与注释），比手写 split(";") 安全；
+            // 保留 _migration 版本记录机制
+            ScriptUtils.executeSqlScript(conn, new EncodedResource(script, StandardCharsets.UTF_8));
             PreparedStatement insert = conn.prepareStatement("INSERT INTO _migration(version, name, applied_at) VALUES(?, ?, ?)");
             insert.setInt(1, versionOf(filename));
             insert.setString(2, filename);
@@ -95,16 +94,6 @@ public final class DatabaseMigrator {
         } finally {
             conn.setAutoCommit(true);
         }
-    }
-
-    private static String stripComments(String sql) {
-        StringBuilder sb = new StringBuilder();
-        for (String line : sql.split("\n")) {
-            if (!line.stripLeading().startsWith("--")) {
-                sb.append(line).append('\n');
-            }
-        }
-        return sb.toString();
     }
 
     private static int versionOf(String filename) {

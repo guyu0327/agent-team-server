@@ -1,11 +1,12 @@
 package com.guyu.agentteam.service;
 
+import com.guyu.agentteam.common.Str;
+import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.common.SecretCipher;
 import com.guyu.agentteam.dto.AsrStreamStatusDto;
 import com.guyu.agentteam.dto.XfyunAsrConfigDto;
-import com.guyu.agentteam.entity.AppSetting;
-import com.guyu.agentteam.repository.AppSettingRepository;
+
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -31,16 +32,16 @@ public class AsrStreamService {
     private static final String WS_HOST = "iat-api.xfyun.cn";
     private static final String WS_PATH = "/v2/iat";
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper MAPPER = Json.mapper();
 
-    private final AppSettingRepository settings;
+    private final SettingsStore store;
 
-    public AsrStreamService(AppSettingRepository settings) {
-        this.settings = settings;
+    public AsrStreamService(SettingsStore store) {
+        this.store = store;
     }
 
     public XfyunAsrConfigDto getConfig() {
-        String json = readSetting();
+        String json = store.read(KEY_CONFIG);
         if (json == null) {
             return new XfyunAsrConfigDto("", "", "");
         }
@@ -65,7 +66,7 @@ public class AsrStreamService {
             throw ApiException.badRequest("appId 不能为空；全部留空则清除实时识别配置");
         }
         if (appId == null) {
-            saveSetting("");
+            store.write(KEY_CONFIG, "");
             return status(new XfyunAsrConfigDto("", "", ""));
         }
         XfyunAsrConfigDto current = getConfig();
@@ -77,7 +78,7 @@ public class AsrStreamService {
         XfyunAsrConfigDto cfg = new XfyunAsrConfigDto(appId, key, secret);
         XfyunAsrConfigDto stored = new XfyunAsrConfigDto(
                 cfg.appId(), SecretCipher.encrypt(cfg.apiKey()), SecretCipher.encrypt(cfg.apiSecret()));
-        saveSetting(MAPPER.writeValueAsString(stored));
+        store.write(KEY_CONFIG, MAPPER.writeValueAsString(stored));
         return status(cfg);
     }
 
@@ -86,13 +87,13 @@ public class AsrStreamService {
     }
 
     private AsrStreamStatusDto status(XfyunAsrConfigDto cfg) {
-        return new AsrStreamStatusDto(cfg.appId(), !isBlank(cfg.apiKey()), !isBlank(cfg.apiSecret()),
-                !isBlank(cfg.appId()) && !isBlank(cfg.apiKey()) && !isBlank(cfg.apiSecret()));
+        return new AsrStreamStatusDto(cfg.appId(), !Str.isBlank(cfg.apiKey()), !Str.isBlank(cfg.apiSecret()),
+                !Str.isBlank(cfg.appId()) && !Str.isBlank(cfg.apiKey()) && !Str.isBlank(cfg.apiSecret()));
     }
 
     public boolean isConfigured() {
         XfyunAsrConfigDto cfg = getConfig();
-        return !isBlank(cfg.appId()) && !isBlank(cfg.apiKey()) && !isBlank(cfg.apiSecret());
+        return !Str.isBlank(cfg.appId()) && !Str.isBlank(cfg.apiKey()) && !Str.isBlank(cfg.apiSecret());
     }
 
     /** 每次连接即时生成鉴权 URL；date 与讯飞服务器差需在 300s 内，本机时钟漂移过大时对端返回 401 */
@@ -117,9 +118,6 @@ public class AsrStreamService {
         }
     }
 
-    private boolean isBlank(String s) {
-        return s == null || s.isBlank();
-    }
 
     /** trim 后为空则返回 null（null 表示「未提供」，区别于空串） */
     private String trimOrNull(String s) {
@@ -129,20 +127,4 @@ public class AsrStreamService {
         return s.trim();
     }
 
-    private String readSetting() {
-        return settings.findById(KEY_CONFIG).map(AppSetting::getSettingValue)
-                .filter(v -> v != null && !v.isBlank())
-                .orElse(null);
-    }
-
-    private void saveSetting(String value) {
-        AppSetting s = settings.findById(KEY_CONFIG).orElseGet(() -> {
-            AppSetting n = new AppSetting();
-            n.setSettingKey(KEY_CONFIG);
-            return n;
-        });
-        s.setSettingValue(value);
-        s.setUpdatedAt(System.currentTimeMillis());
-        settings.save(s);
-    }
 }

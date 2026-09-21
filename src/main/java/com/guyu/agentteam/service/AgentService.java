@@ -29,16 +29,19 @@ public class AgentService {
     private final MessageRepository messages;
     private final ModelPresetRepository presets;
     private final AgentMemoryRepository agentMemories;
+    private final ScheduledTaskService scheduledTasks;
 
     public AgentService(AgentRepository agents, ConversationRepository conversations,
                         ConversationMemberRepository members, MessageRepository messages,
-                        ModelPresetRepository presets, AgentMemoryRepository agentMemories) {
+                        ModelPresetRepository presets, AgentMemoryRepository agentMemories,
+                        ScheduledTaskService scheduledTasks) {
         this.agents = agents;
         this.conversations = conversations;
         this.members = members;
         this.messages = messages;
         this.presets = presets;
         this.agentMemories = agentMemories;
+        this.scheduledTasks = scheduledTasks;
     }
 
     @Transactional(readOnly = true)
@@ -92,6 +95,8 @@ public class AgentService {
         }
         agents.delete(a);
         agentMemories.deleteAllByAgent(id);
+        // 名下定时任务级联取消：否则被删的编排者名下协作任务还会到点触发
+        scheduledTasks.cancelAllForOwner(id);
     }
 
     private Agent find(String id) {

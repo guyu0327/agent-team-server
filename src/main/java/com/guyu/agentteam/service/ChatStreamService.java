@@ -1,5 +1,6 @@
 package com.guyu.agentteam.service;
 
+import com.guyu.agentteam.common.Str;
 import com.guyu.agentteam.dto.MessageDto;
 import com.guyu.agentteam.entity.Agent;
 import com.guyu.agentteam.entity.AppLog;
@@ -107,6 +108,15 @@ public class ChatStreamService {
     }
 
     public void stream(SseEmitter emitter, Conversation conv, Message userMsg) {
+        stream(emitter, conv, userMsg, null);
+    }
+
+    /**
+     * 带外部回合标注的触发：微信通道等后台触发方自带的审批放行策略（taskId 为空即消息不落任务徽标，
+     * 只继承 background 语义——写改/命令按外部策略自动放行或立即拒绝）。
+     */
+    public void stream(SseEmitter emitter, Conversation conv, Message userMsg,
+                       ConversationStreamSupport.TaskTag externalTag) {
         support.send(emitter, "user_message", MessageDto.from(userMsg));
         executor.submit(() -> {
             try {
@@ -114,18 +124,22 @@ public class ChatStreamService {
                 // 每个回合都登记取消句柄：普通回复（单聊/群聊依次回复）与自由讨论一样支持随时终止
                 RunHandle handle = new RunHandle();
                 handle.discussion = freeChain;
-                // 定时任务触发的回合（合成用户消息带 taskId）：本轮全部落库消息继承任务标注，
-                // 并携带任务的审批放行策略（后台无人盯审批，写改/命令按任务配置自动放行或快速拒绝）
-                if (userMsg.getTaskId() != null) {
+                if (externalTag != null) {
+                    handle.taskTag = externalTag;
+                } else if (userMsg.getTaskId() != null) {
+                    // 定时任务触发的回合（合成用户消息带 taskId）：本轮全部落库消息继承任务标注，
+                    // 并携带任务的审批放行策略（后台无人盯审批，写改/命令按任务配置自动放行或快速拒绝）
                     boolean autoWrite = true;
                     boolean autoShell = false;
+                    boolean collab = false;
                     ScheduledTask task = tasks.findById(userMsg.getTaskId()).orElse(null);
                     if (task != null) {
                         autoWrite = task.isAutoWrite();
                         autoShell = task.isAutoShell();
+                        collab = ScheduledTask.MODE_COLLAB.equals(task.getMode());
                     }
                     handle.taskTag = new ConversationStreamSupport.TaskTag(
-                            userMsg.getTaskId(), userMsg.getTaskName(), autoWrite, autoShell);
+                            userMsg.getTaskId(), userMsg.getTaskName(), autoWrite, autoShell, collab);
                 }
                 runs.put(conv.getId(), handle);
                 if (freeChain) {
@@ -160,6 +174,9 @@ public class ChatStreamService {
                 emitter.complete();
             } catch (Exception e) {
                 emitter.completeWithError(e);
+            } finally {
+                // 异常路径没有 done 事件：补一次幂等收尾，观察者重放的「协作中」横幅才能落地
+                support.endRound(conv.getId(), emitter);
             }
         });
     }
@@ -194,7 +211,7 @@ public class ChatStreamService {
             return;
         }
         ModelPreset preset = presetOpt.get();
-        if (isBlank(preset.getApiKey()) || isBlank(preset.getBaseUrl())) {
+        if (Str.isBlank(preset.getApiKey()) || Str.isBlank(preset.getBaseUrl())) {
             support.persistError(conv, agent, "「" + agent.getName() + "」的模型预设缺少 API 地址或 Key，请先补全");
             support.send(emitter, "reply_error", Map.of("agentId", agent.getId(),
                     "error", "「" + agent.getName() + "」的模型预设未配置完整，已跳过"));
@@ -215,7 +232,7 @@ public class ChatStreamService {
         ConversationStreamSupport.SegState seg = new ConversationStreamSupport.SegState();
         ReActAgent react = ReActAgent.builder()
                 .name(agent.getName())
-                .sysPrompt(sysPromptOf(agent, conv.getId()))
+                .sysPrompt(sysPromptOf(agent, conv.getId(), handle != null && handle.taskTag != null))
                 .model(modelFactory.create(agent, preset, multiAgent))
                 .toolkit(toolkitOf(conv, emitter, agent, handle))
                 .maxIters(MAX_ITERS)
@@ -268,22 +285,18 @@ public class ChatStreamService {
         }
     }
 
-    private String sysPromptOf(Agent agent, String conversationId) {
-        String base = support.isBlank(agent.getSystemPrompt()) ? "" : agent.getSystemPrompt().trim();
-        String note = fileTools.promptNote(conversationId);
-        String sys = support.isBlank(base) ? note : base + "\n\n" + note;
-        sys += "\n\n当用户要求定时、定期、每天/每周固定时间、每隔一段时间或到点执行/提醒某事时，必须调用 schedule_task 创建定时任务并向用户确认时间，"
-                + "不要只在对话里口头答应；若该工作需要其他成员一起完成，把成员 id 传给 member_ids，到点触发会自动创建任务项目群并组织协作，"
-                + "不要用建普通群聊代替定时任务（群聊本身不会让工作定时发生）。任务的执行结果会出现在「定时任务」页对应的任务会话中。"
-                + "收到以「【定时任务触发·」开头的消息时，说明是某个已存在任务到点的自动触发：直接执行其中的任务内容，"
-                + "禁止调用 schedule_task 再创建新任务。";
+    private String sysPromptOf(Agent agent, String conversationId, boolean background) {
+        String base = Str.isBlank(agent.getSystemPrompt()) ? "" : agent.getSystemPrompt().trim();
+        String note = fileTools.promptNote(conversationId, background);
+        String sys = Str.isBlank(base) ? note : base + "\n\n" + note;
+        sys += "\n\n" + ScheduledTaskTools.scheduleHint(false) + "\n" + ScheduledTaskTools.triggerHint(false);
         String digest = compression.digestOf(conversationId);
-        if (!support.isBlank(digest)) {
+        if (!Str.isBlank(digest)) {
             sys += "\n\n【会话早期历史摘要】\n更早的完整对话已压缩为以下要点，请以此作为早期上下文"
                     + "（更早已阅的图片不再重复附上，需要重看可调用 view_image 工具）：\n" + digest.trim();
         }
         String memory = memoryService.promptBlock(agent.getId());
-        if (!support.isBlank(memory)) {
+        if (!Str.isBlank(memory)) {
             sys += "\n\n" + memory;
         }
         return sys;
@@ -324,7 +337,7 @@ public class ChatStreamService {
         if ("single".equals(conv.getType())) {
             return List.of(list.get(0));
         }
-        List<Agent> mentioned = list.stream().filter(a -> content.contains("@" + a.getName())).toList();
+        List<Agent> mentioned = list.stream().filter(a -> mentions(content, a.getName())).toList();
         if (!mentioned.isEmpty()) {
             // 被点名的若是编排者，由他单独协调；否则被点名的依次回复
             return mentioned.stream().filter(this::isOrchestrator).findFirst()
@@ -353,6 +366,22 @@ public class ChatStreamService {
                 .toList();
     }
 
+    /** @名字 精准命中：命中处后面不能紧跟名字字符，否则是「@小明哥」里误命中的「小明」 */
+    private boolean mentions(String content, String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        int idx = content.indexOf("@" + name);
+        while (idx >= 0) {
+            int end = idx + name.length() + 1;
+            if (end >= content.length() || !Character.isLetterOrDigit(content.charAt(end))) {
+                return true;
+            }
+            idx = content.indexOf("@" + name, idx + 1);
+        }
+        return false;
+    }
+
     /** 自由讨论接龙：每轮由主持人模型选出下一位发言人，直到判定结束/总超时/用户终止 */
     private void runDiscussionChain(SseEmitter emitter, Conversation conv, RunHandle handle) {
         List<Agent> pool = memberAgents(conv);
@@ -379,8 +408,7 @@ public class ChatStreamService {
 
     /** 群成员 ID → 名称，用于消息署名 */
     private Map<String, String> memberNames(Conversation conv) {
-        return memberAgents(conv).stream()
-                .collect(Collectors.toMap(Agent::getId, Agent::getName, (a, b) -> a));
+        return compression.memberNames(conv.getId());
     }
 
     /** 指令消息的 metadata 标记：MultiAgentFormatter 不把它并入 &lt;history&gt;，保持为真实用户轮 */
@@ -434,7 +462,8 @@ public class ChatStreamService {
                 String name = decision == null || !decision.hasStructuredData()
                         ? ""
                         : String.valueOf(decision.getStructuredData(ModeratorDecision.class).getSpeaker()).trim();
-                if (name.isEmpty() || name.toUpperCase().contains("END") || name.contains("结束")) {
+                // 全等判定：名字里恰好带「结束/END」子串的成员（如「终结者END」）不能被误判为讨论结束
+                if (name.isEmpty() || "END".equalsIgnoreCase(name) || "结束".equals(name)) {
                     return null;
                 }
                 return matchSpeaker(name, pool);
@@ -485,7 +514,7 @@ public class ChatStreamService {
 
     private boolean hasUsablePreset(Agent a) {
         return support.presetOf(a)
-                .map(p -> !isBlank(p.getApiKey()) && !isBlank(p.getBaseUrl()))
+                .map(p -> !Str.isBlank(p.getApiKey()) && !Str.isBlank(p.getBaseUrl()))
                 .orElse(false);
     }
 
@@ -532,9 +561,6 @@ public class ChatStreamService {
         }
     }
 
-    private boolean isBlank(String s) {
-        return s == null || s.isBlank();
-    }
 
     @PreDestroy
     void shutdown() {

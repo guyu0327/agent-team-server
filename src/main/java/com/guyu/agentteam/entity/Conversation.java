@@ -19,6 +19,8 @@ public class Conversation {
     /** 会话类别：chat=普通聊天（消息页）| task=定时任务线程/群（任务页） */
     private String category;
     private String name;
+    /** 来源通道：wechat=iLink 微信会话（桌面端只读），null=应用内会话 */
+    private String channel;
     /** 聊天模式：passive（默认）| free，仅群聊有意义 */
     private String chatMode;
     private boolean pinned;
