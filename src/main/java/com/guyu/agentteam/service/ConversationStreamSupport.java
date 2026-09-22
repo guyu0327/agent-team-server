@@ -82,6 +82,12 @@ public class ConversationStreamSupport {
         logEvent(event, data);
     }
 
+    /** 无响应流的后台场景（如微信通道切换标注落库）把事件直接扇出给会话观察者，前端消息流实时可见 */
+    public void broadcastToWatchers(String conversationId, String event, Object data) {
+        fanOut(conversationId, event, mapper.writeValueAsString(data));
+        logEvent(event, data);
+    }
+
     /** 定时任务触发的回合用 Broadcast：事件扇出给该会话的观察者（events 常驻 SSE），普通发送仍走各自请求的响应流 */
     private void dispatch(SseEmitter emitter, String event, String json) {
         try {
@@ -334,9 +340,54 @@ public class ConversationStreamSupport {
         return presets.findById(a.getPresetId());
     }
 
+    /** 最近一条系统标注（如微信会话的处理智能体切换记录），无则返回空串 */
+    public String latestSystemNote(String conversationId) {
+        return messages.findFirstByConversationIdAndTypeOrderByCreatedAtDesc(conversationId, "system")
+                .map(Message::getContent)
+                .orElse("");
+    }
+
     /** 会话文本历史转成 AgentScope 消息（新用户消息已包含在内）；用户消息中的图片附件转成 ImageBlock 供视觉模型查看 */
     public List<Msg> historyMsgs(String conversationId) {
         return historyMsgs(conversationId, null);
+    }
+
+    /**
+     * 单聊输入（含接管分界）：会话存在系统标注（如微信通道切换处理智能体）时，在标注时间点
+     * 插入一条合成用户消息，把之前的历史明确划给前任处理者。单聊历史不带署名，仅靠系统提示
+     * 里的接管说明扛不住长历史的惯性——模型会把用户对前任说的话当成对自己说的。
+     */
+    public List<Msg> singleChatInput(String conversationId) {
+        Message note = messages.findFirstByConversationIdAndTypeOrderByCreatedAtDesc(conversationId, "system")
+                .orElse(null);
+        if (note == null) {
+            return historyMsgs(conversationId);
+        }
+        List<Message> scoped = scopedByBudget(conversationId, textMessages(conversationId));
+        if (scoped.isEmpty() || scoped.get(0).getCreatedAt() >= note.getCreatedAt()) {
+            // 预算/摘要水位线裁剪后已看不到前任时期的消息，无需分界
+            return historyMsgs(conversationId);
+        }
+        List<Msg> out = new ArrayList<>();
+        boolean marked = false;
+        for (Message m : scoped) {
+            if (!marked && m.getCreatedAt() >= note.getCreatedAt()) {
+                out.add(takeoverMarker(note.getContent()));
+                marked = true;
+            }
+            out.add(toHistoryMsg(m, false, null));
+        }
+        return out;
+    }
+
+    /** 接管分界合成消息：以用户角色插进历史流，模型在该位置读到"之前都是与前任的对话" */
+    private static Msg takeoverMarker(String noteContent) {
+        return new UserMessage(List.of(TextBlock.builder().text(
+                "【系统标注】" + (noteContent == null ? "" : noteContent.trim())
+                        + "。截止这条标注之前的全部历史，都是用户与前任处理者之间的对话："
+                        + "智能体的回复是前任说的，不是你说的；用户当时的称呼、语气、情绪（无论亲密还是攻击性）也都是对前任发的，"
+                        + "与你无关。不要把那段对话当成你的经历、记忆，或你们之间已有的关系。"
+                        + "请从这条标注之后，以你自己的身份面对用户的最新消息。").build()));
     }
 
     /**
@@ -349,23 +400,29 @@ public class ConversationStreamSupport {
      */
     public List<Msg> historyMsgs(String conversationId, Map<String, String> agentNames) {
         boolean named = agentNames != null;
-        List<Message> all = messages.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
+        return scopedByBudget(conversationId, textMessages(conversationId)).stream()
+                .<Msg>map(m -> toHistoryMsg(m, named, agentNames))
+                .toList();
+    }
+
+    /** 会话内可进模型历史的消息：仅文本类型，且正文或用户附件非空 */
+    private List<Message> textMessages(String conversationId) {
+        return messages.findByConversationIdOrderByCreatedAtAsc(conversationId).stream()
                 .filter(m -> "text".equals(m.getType()))
                 .filter(m -> hasContent(m) || ("user".equals(m.getSenderType()) && !Json.readAttachments(m.getAttachments()).isEmpty()))
                 .toList();
-        return scopedByBudget(conversationId, all).stream()
-                .<Msg>map(m -> {
-                    if ("user".equals(m.getSenderType())) {
-                        return userMsg(m, named ? "用户" : null);
-                    }
-                    return named
-                            ? AssistantMessage.builder()
-                                    .name(agentNames.getOrDefault(m.getSenderId(), "成员"))
-                                    .textContent(m.getContent())
-                                    .build()
-                            : new AssistantMessage(m.getContent());
-                })
-                .toList();
+    }
+
+    private Msg toHistoryMsg(Message m, boolean named, Map<String, String> agentNames) {
+        if ("user".equals(m.getSenderType())) {
+            return userMsg(m, named ? "用户" : null);
+        }
+        return named
+                ? AssistantMessage.builder()
+                        .name(agentNames.getOrDefault(m.getSenderId(), "成员"))
+                        .textContent(m.getContent())
+                        .build()
+                : new AssistantMessage(m.getContent());
     }
 
     /** 应用摘要水位线与字符预算：水位线之前的历史已滚入摘要；装不进预算的旧消息本轮截断 */

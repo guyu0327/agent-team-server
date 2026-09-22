@@ -206,6 +206,7 @@ public class OrchestrationService {
         // 文件工具作用域跟随当前协作目标会话：建群前用发起会话授权，建群后切到项目群，群里的撤销立即生效。
         // 任务触发回合（taskTag 非空）是后台自动执行：按任务配置自动放行写改/命令，而非等待无人响应的审批卡片
         boolean background = taskTag != null;
+        boolean fromWechat = taskTag != null && taskTag.taskId() == null;
         OpRequestSink sink = (opType, opTarget, detail) -> {
             boolean allowed = approval.approve(emitter, orchestrator, target.get().getId(), opType, opTarget, detail,
                     background, taskTag != null && taskTag.autoWrite(), taskTag != null && taskTag.autoShell());
@@ -217,15 +218,18 @@ public class OrchestrationService {
         imageTools.register(toolkit, orchestrator, support.imageListener(emitter, () -> target.get().getId(), orchestrator));
         viewTools.register(toolkit, () -> target.get().getId());
         toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId, handle, executed, delegated));
-        // 定时任务工具：会话跟随协作目标（建群后任务绑定项目群），创建的任务归编排者名下
-        taskTools.register(toolkit, () -> target.get().getId(), orchestrator::getId,
-                () -> taskTag != null ? taskTag.taskName() : null);
+        // 定时任务工具：会话跟随协作目标（建群后任务绑定项目群），创建的任务归编排者名下；
+        // 微信发起的协作轮不挂（微信用户看不到应用内任务会话，同 ChatStreamService 的处理）
+        if (!fromWechat) {
+            taskTools.register(toolkit, () -> target.get().getId(), orchestrator::getId,
+                    () -> taskTag != null ? taskTag.taskName() : null);
+        }
 
         compression.compactIfNeeded(conv, orchestrator);
 
         ReActAgent agent = ReActAgent.builder()
                 .name(orchestrator.getName())
-                .sysPrompt(buildSysPrompt(orchestrator, team, conv.getId(), background))
+                .sysPrompt(buildSysPrompt(orchestrator, team, conv.getId(), background, fromWechat))
                 .model(modelFactory.create(orchestrator, preset))
                 .toolkit(toolkit)
                 .maxIters(MAX_ITERS)
@@ -236,7 +240,7 @@ public class OrchestrationService {
         handle.running.add(agent);
         boolean ok = true;
         try {
-            agent.streamEvents(support.historyMsgs(conv.getId()))
+            agent.streamEvents(support.singleChatInput(conv.getId()))
                     .takeUntilOther(handle.cancelSignal())
                     .doOnNext(e -> {
                         if (e.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
@@ -372,7 +376,8 @@ public class OrchestrationService {
         return t.length() <= 200 ? t : t.substring(0, 200) + "…";
     }
 
-    private String buildSysPrompt(Agent orchestrator, List<Agent> team, String conversationId, boolean background) {
+    private String buildSysPrompt(Agent orchestrator, List<Agent> team, String conversationId,
+                                  boolean background, boolean fromWechat) {
         StringBuilder sb = new StringBuilder();
         String base = orchestrator.getSystemPrompt();
         if (!Str.isBlank(base)) {
@@ -392,8 +397,11 @@ public class OrchestrationService {
             sb.append("6. 所有工作完成后必须调用 finish，summary 写给用户的最终总结答复，总结会发回用户发起请求的会话。\n");
         }
         sb.append("7. 如果任务要求把成果写到文件，委派时要把期望的输出路径（相对工作区根目录）写进任务描述，并提醒成员调用 write_file 完成写入。\n");
-        sb.append("8. ").append(ScheduledTaskTools.scheduleHint(true)).append('\n');
-        sb.append("9. ").append(ScheduledTaskTools.triggerHint(true)).append('\n');
+        // 微信发起的协作轮不注入定时任务机制（工具同样不挂）：任务结果微信侧不可见
+        if (!fromWechat) {
+            sb.append("8. ").append(ScheduledTaskTools.scheduleHint(true)).append('\n');
+            sb.append("9. ").append(ScheduledTaskTools.triggerHint(true)).append('\n');
+        }
         // 成员能力清单：让编排者无需逐个试探就知道谁能绘图，委派才能精准
         List<Agent> drawers = team.stream().filter(imageTools::hasCapability).toList();
         if (imageTools.hasCapability(orchestrator)) {
@@ -406,7 +414,7 @@ public class OrchestrationService {
         } else if (!team.isEmpty()) {
             sb.append("当前所有成员均不具备图像生成能力，涉及绘图的任务请自行完成或向用户说明。\n");
         }
-        sb.append(fileTools.promptNote(conversationId, background)).append("\n");
+        sb.append(fileTools.promptNote(conversationId, background, fromWechat)).append("\n");
         String digest = compression.digestOf(conversationId);
         if (!Str.isBlank(digest)) {
             sb.append("\n【会话早期历史摘要】\n更早的完整对话已压缩为以下要点，请以此作为早期上下文：\n")
@@ -586,7 +594,8 @@ public class OrchestrationService {
             memberToolkit.registerTool(fileTools.toolsFor(conv.getId(), memberSink));
             fileTools.registerShellTool(memberToolkit, conv::getId, memberSink);
             imageTools.register(memberToolkit, targetAgent, support.imageListener(emitter, conv::getId, targetAgent));
-            String memberNote = fileTools.promptNote(conv.getId(), memberBackground);
+            String memberNote = fileTools.promptNote(conv.getId(), memberBackground,
+                    tag != null && tag.taskId() == null);
             String memberSysPrompt = Str.isBlank(targetAgent.getSystemPrompt())
                     ? memberNote
                     : targetAgent.getSystemPrompt().trim() + "\n\n" + memberNote;

@@ -3,6 +3,7 @@ package com.guyu.agentteam.controller;
 import com.guyu.agentteam.dto.WechatLoginDto;
 import com.guyu.agentteam.dto.WechatSettingsRequest;
 import com.guyu.agentteam.dto.WechatStatusDto;
+import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.service.wechat.WechatChannelService;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -62,6 +63,16 @@ public class WechatController {
     public WechatStatusDto disconnect() {
         channel.disconnect();
         return status();
+    }
+
+    /** 重置微信会话：旧会话归档进历史（不可恢复聊天），返回新会话 id，手机消息无缝流入 */
+    @PostMapping("/reset")
+    public Map<String, String> reset(@RequestBody WechatResetRequest req) {
+        Conversation fresh = channel.resetConversation(req.conversationId());
+        return Map.of("conversationId", fresh.getId());
+    }
+
+    public record WechatResetRequest(String conversationId) {
     }
 
     @PutMapping("/settings")

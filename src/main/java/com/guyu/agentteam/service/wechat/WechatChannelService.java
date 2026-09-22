@@ -3,8 +3,10 @@ package com.guyu.agentteam.service.wechat;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.common.CurrentUser;
+import com.guyu.agentteam.common.Ids;
 import com.guyu.agentteam.common.Json;
 import com.guyu.agentteam.common.Str;
+import com.guyu.agentteam.dto.MessageDto;
 import com.guyu.agentteam.entity.Agent;
 import com.guyu.agentteam.entity.AppLog;
 import com.guyu.agentteam.entity.Conversation;
@@ -19,6 +21,7 @@ import com.guyu.agentteam.repository.MessageRepository;
 import com.guyu.agentteam.repository.WechatBindingRepository;
 import com.guyu.agentteam.service.AppLogService;
 import com.guyu.agentteam.service.ChatStreamService;
+import com.guyu.agentteam.service.ConversationStreamSupport;
 import com.guyu.agentteam.service.ConversationService;
 import com.guyu.agentteam.service.ConversationStreamSupport;
 import com.guyu.agentteam.service.MessageService;
@@ -42,7 +45,7 @@ import java.util.Set;
 /**
  * 微信 iLink Bot 通道：扫码登录拿 bot_token 后台长轮询收消息，
  * 按发送者绑定到系统单聊会话并复用 ChatStreamService 全管线跑一轮（后台自动放行策略，
- * 默认写改/终端都不放行），聚合该轮智能体回复经 sendmessage 推回微信。
+ * 默认写改/终端都不放行），智能体文本段落定一段即经 sendmessage 推一段回微信（逐段推送）。
  * bot_token 与绑定关系持久化；-14 会话超时后需重新扫码。
  */
 @Service
@@ -84,6 +87,7 @@ public class WechatChannelService {
     private final WorkspaceFileTools fileTools;
     private final ObjectProvider<ChatStreamService> chatStream;
     private final ObjectProvider<ConversationService> conversationService;
+    private final ConversationStreamSupport support;
     /** 轮询线程无事务上下文，成员替换等派生删除操作需显式包事务 */
     private final TransactionTemplate tx;
 
@@ -109,6 +113,7 @@ public class WechatChannelService {
                                 WorkspaceFileTools fileTools,
                                 ObjectProvider<ChatStreamService> chatStream,
                                 ObjectProvider<ConversationService> conversationService,
+                                ConversationStreamSupport support,
                                 TransactionTemplate tx) {
         this.api = api;
         this.settings = settings;
@@ -123,6 +128,7 @@ public class WechatChannelService {
         this.fileTools = fileTools;
         this.chatStream = chatStream;
         this.conversationService = conversationService;
+        this.support = support;
         this.tx = tx;
         this.credential = loadCredential();
     }
@@ -373,7 +379,7 @@ public class WechatChannelService {
                 }
                 WeixinApiClient.Updates u = api.getUpdates(cred.baseUrl(), cred.token(), updatesBuf);
                 if (u.errcode() == -14) {
-                    log(AppLog.TYPE_ERROR, null, null, "微信会话已超时失效，请到设置页重新扫码连接");
+                    log(AppLog.TYPE_ERROR, null, null, "微信会话已超时失效，请重新扫码连接");
                     saveCredential(null);
                     updatesBuf = "";
                     continue;
@@ -434,7 +440,6 @@ public class WechatChannelService {
             }
         }
         Message userMsg = messageService.createUserMessage(conv, text, grants);
-        log(AppLog.TYPE_WECHAT, conv.getId(), agent.getId(), "收到微信消息，已交给「" + agent.getName() + "」处理");
         ChatStreamService stream = chatStream.getIfAvailable();
         if (stream == null) {
             api.sendText(cred.baseUrl(), cred.token(), m.fromUserId(), m.contextToken(),
@@ -454,33 +459,39 @@ public class WechatChannelService {
         while (!stream.isRunning(conv.getId()) && System.currentTimeMillis() - startWait < 10_000) {
             sleepQuiet(100);
         }
-        // 等回合结束再聚合
+        // 逐段推送：文本段在应用内落定（含 finish 总结）即发微信，与桌面端节奏一致。
+        // 不再整轮拼一条长文本等轮次结束一次发——协作轮动辄分钟级，长文本迟发久了我方无感、
+        // 微信侧还可能静默丢弃（曾致 finish 总结用户收不到），分段短消息送达性更好
+        Set<String> pushed = new LinkedHashSet<>();
         while (stream.isRunning(conv.getId()) && System.currentTimeMillis() < deadline) {
+            pushPendingSegments(conv, userMsg, pushed, cred, m.fromUserId(), m.contextToken(), s);
             sleepQuiet(500);
         }
-        String reply = aggregate(conv, userMsg);
-        if (Str.isBlank(reply)) {
-            reply = "（本轮没有产生回复，请查看应用内的运行日志）";
+        pushPendingSegments(conv, userMsg, pushed, cred, m.fromUserId(), m.contextToken(), s);
+        if (pushed.isEmpty()) {
+            // 超时兜底：微信用户看不到应用内运行日志，文案要指向「再试一次」而非内部排查入口
+            api.sendText(cred.baseUrl(), cred.token(), m.fromUserId(), m.contextToken(),
+                    "（这轮回复没能按时完成，请稍后再问我一次）");
         }
-        api.sendText(cred.baseUrl(), cred.token(), m.fromUserId(), m.contextToken(), truncate(reply, s.maxReplyChars()));
-        log(AppLog.TYPE_WECHAT, conv.getId(), agent.getId(), "已回复微信消息：" + truncate(reply, 100));
     }
 
-    /** 读库收集本轮（用户消息之后）所有智能体文本段，按时间顺序拼接 */
-    private String aggregate(Conversation conv, Message userMsg) {
+    /** 把本轮尚未推送的智能体文本段逐条发往微信；发出即记入 pushed（失败也标记并记日志，避免轮询期反复重试） */
+    private void pushPendingSegments(Conversation conv, Message userMsg, Set<String> pushed,
+                                     BotCredential cred, String toUserId, String contextToken, ChannelSettings s) {
         long from = userMsg.getCreatedAt();
-        StringBuilder sb = new StringBuilder();
         for (Message msg : messages.findByConversationIdOrderByCreatedAtAsc(conv.getId())) {
             if (msg.getCreatedAt() < from || !"agent".equals(msg.getSenderType())
-                    || !"text".equals(msg.getType()) || Str.isBlank(msg.getContent())) {
+                    || !"text".equals(msg.getType()) || Str.isBlank(msg.getContent())
+                    || !pushed.add(msg.getId())) {
                 continue;
             }
-            if (sb.length() > 0) {
-                sb.append("\n\n");
+            try {
+                api.sendText(cred.baseUrl(), cred.token(), toUserId, contextToken,
+                        truncate(msg.getContent(), s.maxReplyChars()));
+            } catch (Exception e) {
+                log(AppLog.TYPE_ERROR, conv.getId(), null, "微信推送回复失败：" + message(e));
             }
-            sb.append(msg.getContent());
         }
-        return sb.toString();
     }
 
     /** 媒体落盘到主工作区「微信接收」子目录（沙箱内，文件工具与 view_image 可直接访问），返回消息附件 */
@@ -539,6 +550,11 @@ public class WechatChannelService {
             if (b != null) {
                 Conversation existing = conversations.findById(b.getConversationId()).orElse(null);
                 if (existing != null && existing.getArchivedAt() == null) {
+                    // 存量会话无 peer 标识时惰性回填，归档后仍能看出是哪位好友
+                    if (Str.isBlank(existing.getWechatPeer())) {
+                        existing.setWechatPeer(shortId(senderId));
+                        conversations.save(existing);
+                    }
                     syncMember(existing);
                     return existing;
                 }
@@ -546,6 +562,8 @@ public class WechatChannelService {
             }
             Conversation nc = conversationService.getObject().newConversation(
                     CurrentUser.ID, "single", ConversationService.CATEGORY_CHAT, "微信ClawBot", "wechat");
+            nc.setWechatPeer(shortId(senderId));
+            conversations.save(nc);
             members.save(new ConversationMember(nc.getId(), resolveAgent().getId(), System.currentTimeMillis()));
             WechatBinding nb = new WechatBinding();
             nb.setSenderUserId(senderId);
@@ -558,15 +576,68 @@ public class WechatChannelService {
         return c;
     }
 
-    /** 处理智能体变更即时生效：单聊成员与配置不一致时替换成员行 */
+    /**
+     * 重置微信会话：旧会话归档进历史会话（微信归档不可恢复聊天），新建会话并迁移绑定，
+     * 手机消息无缝流入新会话——列表里 ClawBot 不消失，旧聊天记录进历史留档。
+     */
+    public Conversation resetConversation(String conversationId) {
+        Conversation old = conversations.findById(conversationId)
+                .orElseThrow(() -> ApiException.notFound("会话不存在"));
+        if (!"wechat".equals(old.getChannel())) {
+            throw ApiException.badRequest("仅微信会话支持重置");
+        }
+        return tx.execute(status -> {
+            conversationService.getObject().archive(conversationId);
+            Conversation fresh = conversationService.getObject().newConversation(
+                    CurrentUser.ID, "single", ConversationService.CATEGORY_CHAT, "微信ClawBot", "wechat");
+            members.save(new ConversationMember(fresh.getId(), resolveAgent().getId(), System.currentTimeMillis()));
+            for (WechatBinding b : bindings.findByConversationId(conversationId)) {
+                b.setConversationId(fresh.getId());
+                bindings.save(b);
+                // 绑定随重置迁移到新会话，好友标识立即继承，列表里不出现无后缀空窗
+                if (Str.isBlank(fresh.getWechatPeer())) {
+                    fresh.setWechatPeer(shortId(b.getSenderUserId()));
+                    conversations.save(fresh);
+                }
+            }
+            log(AppLog.TYPE_WECHAT, fresh.getId(), null, "微信会话已重置：旧会话已归档到历史会话");
+            return fresh;
+        });
+    }
+
+    /** 处理智能体变更即时生效：单聊成员与配置不一致时替换成员行，并落一条系统切换标注 */
     private void syncMember(Conversation c) {
         Agent agent = resolveAgent();
         List<ConversationMember> ms = members.findByConversationIdOrderByCreatedAtAsc(c.getId());
         if (ms.size() == 1 && ms.get(0).getAgentId().equals(agent.getId())) {
             return;
         }
+        String fromName = agentName(ms.isEmpty() ? null : ms.get(0).getAgentId());
         members.deleteByConversationId(c.getId());
         members.save(new ConversationMember(c.getId(), agent.getId(), System.currentTimeMillis()));
+        saveSwitchNote(c.getId(), fromName, agent.getName());
+    }
+
+    private void saveSwitchNote(String conversationId, String fromName, String toName) {
+        Message m = new Message();
+        m.setId(Ids.next());
+        m.setConversationId(conversationId);
+        m.setSenderType("system");
+        // messages.sender_id 列 NOT NULL（V1 建表约束），系统标注无发送者，用固定占位
+        m.setSenderId("system");
+        m.setContent("处理智能体已由「" + fromName + "」切换为「" + toName + "」");
+        // system 类型不进模型历史（historyMsgs 只取 text），接管说明由系统提示注入；前端渲染为分隔条
+        m.setType("system");
+        m.setCreatedAt(System.currentTimeMillis());
+        messages.save(m);
+        // 落库即扇出给会话观察者：打开中的聊天页无需切页重进就能实时出现分隔条
+        support.broadcastToWatchers(conversationId, "system_note", MessageDto.from(m));
+        log(AppLog.TYPE_WECHAT, conversationId, null, "处理智能体切换：" + fromName + " → " + toName);
+    }
+
+    private String agentName(String agentId) {
+        if (agentId == null) return "（未知）";
+        return agents.findById(agentId).map(Agent::getName).orElse("（未知）");
     }
 
     private Agent resolveAgent() {

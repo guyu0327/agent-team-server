@@ -186,6 +186,11 @@ public class ConversationController {
         if ("wechat".equals(conv.getChannel())) {
             throw ApiException.badRequest("微信会话请在微信中继续对话");
         }
+        // 前端仅禁用同会话发送中连发，刷新页面/多窗口后仍可重发；任务触发轮与桌面轮
+        // 也靠这里互斥——服务端必须兜底，否则两轮交错且停止句柄被覆盖
+        if (chatStreamService.isRunning(id)) {
+            throw ApiException.badRequest("上一轮回复尚未结束，请稍候再发");
+        }
         long now = System.currentTimeMillis();
         // 附件全部校验通过才继续：任何一个路径无效都直接拒绝，避免半发送状态
         List<ConversationFileGrant> grants = paths.stream()

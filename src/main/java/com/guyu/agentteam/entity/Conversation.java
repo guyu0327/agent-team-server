@@ -21,6 +21,8 @@ public class Conversation {
     private String name;
     /** 来源通道：wechat=iLink 微信会话（桌面端只读），null=应用内会话 */
     private String channel;
+    /** 微信好友短标识（shortId，后 8 位）：会话按好友建，列表里以「微信ClawBot-xxxx」区分 */
+    private String wechatPeer;
     /** 聊天模式：passive（默认）| free，仅群聊有意义 */
     private String chatMode;
     private boolean pinned;

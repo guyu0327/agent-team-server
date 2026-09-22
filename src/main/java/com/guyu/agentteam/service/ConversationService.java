@@ -82,6 +82,10 @@ public class ConversationService {
         }
         agents.findById(agentId).orElseThrow(() -> ApiException.notFound("智能体不存在"));
         for (Conversation c : conversations.findByUserIdAndTypeAndCategoryAndArchivedAtIsNull(userId, "single", CATEGORY_CHAT)) {
+            // 微信通道的单聊属于微信好友会话（桌面只读），不能被桌面「发消息」复用，否则发送被拦
+            if ("wechat".equals(c.getChannel())) {
+                continue;
+            }
             if (memberIds(c.getId()).contains(agentId)) {
                 return toDto(c);
             }
@@ -215,6 +219,10 @@ public class ConversationService {
         if (c.getArchivedAt() == null) {
             return toDto(c);
         }
+        // 微信归档不可恢复为聊天：会话与微信绑定一一对应，恢复会产生脱离微信的副本
+        if ("wechat".equals(c.getChannel())) {
+            throw ApiException.badRequest("微信会话不支持恢复聊天，旧记录仅供留档查看");
+        }
         if ("single".equals(c.getType())) {
             String agentId = memberIds(id).isEmpty() ? null : memberIds(id).get(0);
             if (agentId != null) {
@@ -293,7 +301,7 @@ public class ConversationService {
                 c.getName() == null ? "" : c.getName(), agentId,
                 ids, c.getChatMode() == null ? "passive" : c.getChatMode(), c.isPinned(),
                 c.getLastMessage() == null ? "" : c.getLastMessage(),
-                c.getLastMessageAt(), unread, c.getArchivedAt(), c.getChannel());
+                c.getLastMessageAt(), unread, c.getArchivedAt(), c.getChannel(), c.getWechatPeer());
     }
 
     private Conversation baseConversation(String userId, long now, String type, String category, String name) {

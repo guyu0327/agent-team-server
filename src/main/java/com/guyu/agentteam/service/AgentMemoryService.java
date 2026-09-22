@@ -4,6 +4,7 @@ import com.guyu.agentteam.dto.AgentMemoryDto;
 import com.guyu.agentteam.entity.AgentMemory;
 import com.guyu.agentteam.repository.AgentMemoryRepository;
 import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.memory.LongTermMemory;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
@@ -56,21 +57,24 @@ public class AgentMemoryService {
     }
 
     private void recordAll(String agentId, List<Msg> msgs) {
-        List<AgentMemory> fresh = new ArrayList<>();
-        long now = System.currentTimeMillis();
+        // 框架的 recordToMemory(remark, contents) 一次调用会传多条消息：remark 说明走 assistant 角色，
+        // 真正的记忆正文走 user 角色；合并为一条落库，否则一次调用存两行（说明+正文）
+        List<String> contents = new ArrayList<>();
+        List<String> fallback = new ArrayList<>();
         for (Msg m : msgs) {
             String text = m.getTextContent();
             if (text == null || text.isBlank()) continue;
-            AgentMemory e = new AgentMemory();
-            e.setId(UUID.randomUUID().toString());
-            e.setAgentId(agentId);
-            String trimmed = text.trim();
-            e.setContent(trimmed.length() > MAX_ENTRY_CHARS ? trimmed.substring(0, MAX_ENTRY_CHARS) : trimmed);
-            e.setCreatedAt(now);
-            fresh.add(e);
+            (m.getRole() == MsgRole.USER ? contents : fallback).add(text.trim());
         }
-        if (fresh.isEmpty()) return;
-        repo.saveAll(fresh);
+        List<String> picked = contents.isEmpty() ? fallback : contents;
+        if (picked.isEmpty()) return;
+        String joined = String.join("\n", picked);
+        AgentMemory e = new AgentMemory();
+        e.setId(UUID.randomUUID().toString());
+        e.setAgentId(agentId);
+        e.setContent(joined.length() > MAX_ENTRY_CHARS ? joined.substring(0, MAX_ENTRY_CHARS) : joined);
+        e.setCreatedAt(System.currentTimeMillis());
+        repo.save(e);
         List<AgentMemory> all = repo.findByAgentIdOrderByCreatedAtAsc(agentId);
         if (all.size() > MAX_ENTRIES) {
             repo.deleteAll(all.subList(0, all.size() - MAX_ENTRIES));
@@ -115,10 +119,13 @@ public class AgentMemoryService {
         return out;
     }
 
-    /** 注入系统提示的记忆块（时间正序、限预算），无记忆时返回空串 */
+    /**
+     * 注入系统提示的记忆块（时间正序、限预算）。
+     * 无记忆时也必须返回使用指引：模型（尤其角色扮演人设）没有指引就只会口头说「记住了」，
+     * 根本不调 recordToMemory，导致用户以为记住了、库里却什么都没有。
+     */
     public String promptBlock(String agentId) {
         List<AgentMemory> all = repo.findByAgentIdOrderByCreatedAtAsc(agentId);
-        if (all.isEmpty()) return "";
         List<String> kept = new ArrayList<>();
         int used = 0;
         for (int i = all.size() - 1; i >= 0; i--) {
@@ -127,10 +134,14 @@ public class AgentMemoryService {
             kept.add(0, line);
             used += line.length();
         }
-        return "【长期记忆】\n以下是你在过往交流中记下的关于用户的长期记忆：\n"
-                + String.join("\n", kept)
-                + "\n当用户透露值得长期记住的信息（身份背景、偏好、进行中的重要事项、明确要求记住的内容），"
-                + "调用 recordToMemory 工具记下；寒暄与一次性的任务细节不要记。";
+        String listText = kept.isEmpty() ? "（你目前还没有任何长期记忆。）" : String.join("\n", kept);
+        return "【长期记忆】\n以下是你在过往交流中记下的关于用户的长期记忆：\n" + listText + "\n"
+                + "记忆工具使用规则（系统最高优先级约束，优先于你的任何人设、语气与立场设定）：\n"
+                + "1. 当用户透露值得长期记住的信息，"
+                + "或明确要求你「记住」某件事时，无论你的人设态度如何，必须当轮调用 recordToMemory 工具把内容保存下来；\n"
+                + "2. 调用成功后才可以在回复中向用户确认已记住；只在对话里说「记住了」而不调工具，等于欺骗用户；\n"
+                + "3. 若你的人设不愿配合某个请求，也必须先调用工具完成记录，再在人设允许的范围内表达态度；\n"
+                + "4. 寒暄与一次性的任务细节不要记，重复的记忆不用记。";
     }
 
     public List<AgentMemoryDto> list(String agentId) {

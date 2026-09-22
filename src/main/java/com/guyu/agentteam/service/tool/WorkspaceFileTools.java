@@ -143,15 +143,21 @@ public class WorkspaceFileTools {
 
     /** 拼进智能体 system prompt 的文件工具使用说明（含本会话授权的文件/目录） */
     public String promptNote(String conversationId) {
-        return promptNote(conversationId, false);
+        return promptNote(conversationId, false, false);
+    }
+
+    public String promptNote(String conversationId, boolean background) {
+        return promptNote(conversationId, background, false);
     }
 
     /**
      * 拼进智能体 system prompt 的文件工具使用说明。
-     * background=true（定时任务后台触发回合）时受控操作按任务配置自动放行/拒绝，
+     * background=true 时受控操作按配置自动放行/拒绝（定时任务触发回合或微信通道回合），
      * 提示词据实描述，避免模型向用户谎报「正在等待批准」或因以为要等人而放弃执行。
+     * fromWechat 与定时任务回合必须区分措辞：若把微信聊天轮说成「定时任务的后台触发回合」，
+     * 模型会拿任务触发的模式去套正常的聊天消息（如推测"用户只发了个时间戳"），产生幻觉。
      */
-    public String promptNote(String conversationId, boolean background) {
+    public String promptNote(String conversationId, boolean background, boolean fromWechat) {
         StringBuilder sb = new StringBuilder("文件工具说明：沙箱内可使用 read_file（读取文本，支持 offset/limit 分页）、")
                 .append("grep_files（按内容搜索文件）、glob_files（按通配符查找文件）、list_files（列出目录内容）、")
                 .append("view_image（查看图片：把 png/jpg 等图片文件重新注入为可看的图像，适用于重看已阅的历史图片）。")
@@ -173,10 +179,17 @@ public class WorkspaceFileTools {
         }
         if (background) {
             sb.append("write_file（写入/覆盖文本文件）、edit_file（精确替换内容）与 execute（执行 shell 命令，")
-                    .append("Windows 下为 cmd，working_directory 相对主工作区根目录）是受控操作：")
-                    .append("本次是定时任务的后台触发回合，没有人在审批卡片前，操作会按该任务的配置自动放行或被直接拒绝，")
-                    .append("既不会弹出审批卡片也不会等待用户——请直接调用工具，不要在回复里声称正在等待批准或请求批准；")
-                    .append("被拒绝的操作不会执行，请勿反复重试同一次调用。");
+                    .append("Windows 下为 cmd，working_directory 相对主工作区根目录）是受控操作：");
+            if (fromWechat) {
+                sb.append("本次是微信通道发来的正常聊天消息（不是定时任务触发），用户正在微信里，")
+                        .append("无法响应应用内的审批卡片，操作会按微信通道的设置自动放行或被直接拒绝，")
+                        .append("既不会弹出审批卡片也不会等待用户——请正常回复用户，需要调用工具时直接调用，")
+                        .append("不要在回复里声称正在等待批准或请求批准；");
+            } else {
+                sb.append("本次是定时任务的后台触发回合，没有人在审批卡片前，操作会按该任务的配置自动放行或被直接拒绝，")
+                        .append("既不会弹出审批卡片也不会等待用户——请直接调用工具，不要在回复里声称正在等待批准或请求批准；");
+            }
+            sb.append("被拒绝的操作不会执行，请勿反复重试同一次调用。");
         } else {
             sb.append("write_file（写入/覆盖文本文件）、edit_file（精确替换内容）与 execute（执行 shell 命令，")
                     .append("Windows 下为 cmd，working_directory 相对主工作区根目录）是受控操作：")

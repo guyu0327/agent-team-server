@@ -99,9 +99,9 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 ### 微信通道（iLink Bot）
 - 扫码接入：`POST /api/wechat/login` 取二维码并长轮询扫码状态（支持配对码验证、二维码过期自动刷新、已绑定他实例检测），登录颁发的 bot_token 存于 `app_settings`（key=`wechat.bot`）；通道开关与参数持久化于 `wechat.channel`，`GET/PUT /api/wechat/settings` 读写——处理智能体（空 = 编排者优先）、回复长度上限（200–20000，默认 2000）、回合超时（1–60 分钟，默认 10）、后台自动放行（写改文件 / 终端命令，默认均不放行）
-- 收消息：后台守护线程对 `getupdates` 长轮询（`get_updates_buf` 断点续传 + message_id 去重兜底）；`wechat_bindings` 表（V11 迁移）把微信发送者绑定到系统单聊（`conversations.channel=wechat`，V12 迁移），绑定持久保留，断开重连后消息继续进原会话；-14 会话超时需重新扫码
-- 回复管线：收到的文本走 `ChatStreamService.stream()` 全管线（后台回合：审批按通道配置自动放行，决定记运行日志），聚合本轮全部智能体文本经 `sendmessage` 推回微信（回传 context_token，超长按上限截断）；上一轮未结束自动等空闲，回合异常/空回复也有明确提示回传
-- 智能体切换：通道配置的处理智能体即时生效——已有绑定会话的成员随之替换，无需重新绑定
+- 收消息：后台守护线程对 `getupdates` 长轮询（`get_updates_buf` 断点续传 + message_id 去重兜底）；`wechat_bindings` 表（V11 迁移）把微信发送者绑定到系统单聊（`conversations.channel=wechat`，V12 迁移），会话列 `wechat_peer`（V13 迁移）记录好友标识后 8 位，列表以「微信ClawBot-xxxx」区分好友（存量会话下条消息自动回填，重置会话立即继承）；绑定持久保留，断开重连后消息继续进原会话；-14 会话超时需重新扫码
+- 回复管线：收到的文本走 `ChatStreamService.stream()` 全管线（后台回合：审批按通道配置自动放行，决定记运行日志；微信聊天轮不注入定时任务提示与任务工具，受控操作提示区分「微信聊天」与「任务后台触发」两种语境），智能体文本段落定一段即经 `sendmessage` 推一段回微信（逐段推送：等待期 500ms 增量 + 轮末补扫 + 空轮兜底文案，回传 context_token，超长按上限截断，失败记运行日志）；上一轮未结束自动等空闲
+- 智能体切换与重置：通道配置的处理智能体即时生效——已有绑定会话的成员随之替换，无需重新绑定；切换落系统标注（扇出观察者实时可见），模型输入在标注处插入接管分界，前任对话不归新处理者继承；`POST /api/wechat/reset` 重置会话：旧会话整卷归档到历史会话（微信归档仅供留档查看、不可恢复聊天），好友绑定迁移到全新会话
 - 媒体消息（对照官方 openclaw-weixin 协议）：图片/文件/视频经微信 CDN 下载并 AES-128-ECB/PKCS7 解密（`full_url` 优先，密钥兼容 base64 原始与十六进制两种编码，≤50MB），存入主工作区「微信接收/」；图片以图片附件进入管线（模型直接注入视觉块），文件/视频作为文件附件供文件工具读写；语音优先使用微信侧转写文本当文字处理，无转写则回复暂不支持；下载/解密失败回复失败说明并记日志
 - 实时可见：与定时任务触发的回合一样经 `Broadcast` 扇出 SSE（`GET /api/conversations/{id}/events`），正在查看该会话的前端实时渲染流式输出；媒体落盘在沙箱内，`view_image` 与文件工具可直接访问
 
@@ -123,7 +123,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 运行日志：协作/讨论/审批/生图/压缩/错误等关键事件异步落库，可按类型与时间范围查询
 - 智能体长期记忆：框架 AGENT_CONTROL 模式，智能体自己决定记住什么，SQLite 落库、跨会话生效，可查看与清空
 - 定时任务：单次 / 每天 / 每周 / 固定间隔四种触发，独立任务会话（线程或项目群）不污染普通聊天，用户与智能体均可增删改查，错过的单次任务 24h 内补发；后台触发回合按任务配置自动放行受控操作（写改默认放行、命令默认不放行），触发轮只输出文字未实际执行时自动纠错重试（最多两次）
-- 微信通道：扫码接入微信 iLink Bot，手机微信直接与绑定智能体单聊；图片/文件/视频可处理、语音用微信转写文本；桌面端对应会话只读展示，回复实时可见
+- 微信通道：扫码接入微信 iLink Bot，手机微信直接与绑定智能体单聊，会话按好友标识后缀区分；图片/文件/视频可处理、语音用微信转写文本；桌面端对应会话只读展示，回复逐段推回微信
 
 ## 技术栈
 
@@ -204,7 +204,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | `/api/tasks` | 定时任务 CRUD（`GET` 按会话分组、`POST` 创建、`PUT /{taskId}` 更新含暂停恢复、`DELETE /{taskId}`）、`/{taskId}/run` 立即执行一次、`/conversation/{id}` 会话任务列表、`/conversations` 任务会话列表（仅还剩任务的）、`/restore/{conversationId}` 从历史归档恢复任务 |
 | `/api/fs` | 图片内容读取（气泡缩略图数据源，只读） |
 | `/api/asr/stream` | 实时语音转写 WebSocket（桥接讯飞流式听写） |
-| `/api/wechat` | 微信 iLink 通道：连接状态（`GET /status`）、扫码登录（`POST /login` 发起、`GET /login/status` 轮询、`POST /login/verify` 配对码、`POST /login/cancel` 取消）、断开（`POST /disconnect`）、通道设置（`GET/PUT /settings`） |
+| `/api/wechat` | 微信 iLink 通道：连接状态（`GET /status`）、扫码登录（`POST /login` 发起、`GET /login/status` 轮询、`POST /login/verify` 配对码、`POST /login/cancel` 取消）、断开（`POST /disconnect`）、重置会话（`POST /reset`，旧会话归档、绑定迁移新会话）、通道设置（`GET/PUT /settings`） |
 | `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、协作时长限制、上下文压缩（预算/开关）、数据库快照导出 |
 | `/api/logs` | 运行日志查询（按类型与时间范围分页） |
 

@@ -8,6 +8,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 
 public interface MessageRepository extends JpaRepository<Message, String> {
 
@@ -25,6 +26,9 @@ public interface MessageRepository extends JpaRepository<Message, String> {
     List<Message> findByConversationIdAndCreatedAtLessThanOrderByCreatedAtDesc(String conversationId, Long createdAt, Pageable pageable);
 
     long countByConversationIdAndCreatedAtGreaterThanAndSenderTypeNot(String conversationId, Long createdAt, String senderType);
+
+    /** 最近一条指定类型的消息（如 system 切换标注），无则 empty */
+    Optional<Message> findFirstByConversationIdAndTypeOrderByCreatedAtDesc(String conversationId, String type);
 
     boolean existsByConversationId(String conversationId);
 
