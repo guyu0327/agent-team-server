@@ -270,6 +270,26 @@ public class ConversationService {
         conversations.save(c);
     }
 
+    /** 重置群聊：旧群归档进历史会话，按原名称、成员与聊天模式重建新群并返回 */
+    @Transactional
+    public ConversationDto resetGroup(String id) {
+        Conversation c = getEntity(id);
+        if (!"group".equals(c.getType()) || !CATEGORY_CHAT.equals(c.getCategory())) {
+            throw ApiException.badRequest("仅普通群聊支持重置");
+        }
+        String name = c.getName();
+        String chatMode = c.getChatMode();
+        List<String> memberIds = memberIds(id);
+        archive(id);
+        Conversation fresh = newConversation(c.getUserId(), "group", CATEGORY_CHAT, name);
+        fresh.setChatMode(validateMode(chatMode));
+        long now = System.currentTimeMillis();
+        for (String agentId : memberIds) {
+            members.save(new ConversationMember(fresh.getId(), agentId, now));
+        }
+        return toDto(fresh);
+    }
+
     /** 单页上限：请求 size+1 条判断 hasMore，避免满页时多一次空请求 */
     private static final int PAGE_MAX = 200;
 

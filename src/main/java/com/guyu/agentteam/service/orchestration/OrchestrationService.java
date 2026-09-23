@@ -170,7 +170,7 @@ public class OrchestrationService {
         sendCoordination(emitter, "coordination_end", orchestrator, conv.getId());
         String groupId = createdGroupId.get();
         if (groupId != null) {
-            sendCoordination(emitter, "coordination_end", orchestrator, groupId);
+            sendCoordinationForGroup(emitter, "coordination_end", orchestrator, groupId);
         }
         handle.keys.forEach(runs::remove);
     }
@@ -346,6 +346,16 @@ public class OrchestrationService {
     private void sendCoordination(SseEmitter emitter, String event, Agent agent, String conversationId) {
         try {
             support.send(emitter, event, Map.of("agentId", agent.getId(), "conversationId", conversationId));
+        } catch (UncheckedIOException ignored) {
+            // 客户端已断开
+        }
+    }
+
+    /** 协调状态事件发往协作中新建的项目群：另按群登记快照并扇出给群观察者，群里的协调条切换/重进后可恢复 */
+    private void sendCoordinationForGroup(SseEmitter emitter, String event, Agent agent, String conversationId) {
+        try {
+            support.sendCrossConversation(emitter, event, conversationId,
+                    Map.of("agentId", agent.getId(), "conversationId", conversationId));
         } catch (UncheckedIOException ignored) {
             // 客户端已断开
         }
@@ -528,7 +538,7 @@ public class OrchestrationService {
             runs.put(dto.id(), handle);
             target.set(conversationService.getEntity(dto.id()));
             support.send(emitter, "conversation_created", dto);
-            sendCoordination(emitter, "coordination_start", orchestrator, dto.id());
+            sendCoordinationForGroup(emitter, "coordination_start", orchestrator, dto.id());
             String joined = picked.stream().map(Agent::getName).collect(Collectors.joining("、"));
             return "项目群「" + dto.name() + "」已创建，成员：" + joined
                     + "。后续你的安排和委派成员的输出都会展示在该群里，请继续用 delegate 推进任务；"

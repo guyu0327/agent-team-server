@@ -88,6 +88,19 @@ public class ConversationStreamSupport {
         logEvent(event, data);
     }
 
+    /**
+     * 协作状态事件发往「非发起会话」（编排者单聊里新建的项目群）：响应流照发之外，
+     * 再按目标会话实时扇出给观察者并登记回合快照供后续观察者重放。
+     * 普通响应流回合默认不留快照，群里的「正在协调团队」条切换/重进后会凭空消失。
+     */
+    public void sendCrossConversation(SseEmitter emitter, String event, String conversationId, Object data) {
+        String json = mapper.writeValueAsString(data);
+        trackRound(conversationId, event, data);
+        fanOut(conversationId, event, json);
+        dispatch(emitter, event, json);
+        logEvent(event, data);
+    }
+
     /** 定时任务触发的回合用 Broadcast：事件扇出给该会话的观察者（events 常驻 SSE），普通发送仍走各自请求的响应流 */
     private void dispatch(SseEmitter emitter, String event, String json) {
         try {

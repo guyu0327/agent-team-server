@@ -133,6 +133,14 @@ public class ConversationController {
         conversationService.archive(id);
     }
 
+    /** 重置群聊：先中断进行中的回复/协作，旧群归档进历史会话，原群名/成员/聊天模式重建新群 */
+    @PostMapping("/{id}/reset")
+    public ConversationDto resetGroup(@PathVariable String id) {
+        orchestrationService.stop(id);
+        chatStreamService.stop(id);
+        return conversationService.resetGroup(id);
+    }
+
     /** 从历史会话恢复到消息列表（单聊冲突时原活跃会话自动入历史） */
     @PostMapping("/{id}/restore")
     public ConversationDto restore(@PathVariable String id) {
