@@ -1,6 +1,8 @@
 package com.guyu.agentteam.service.orchestration;
 
+import com.guyu.agentteam.common.Ids;
 import com.guyu.agentteam.common.Str;
+import com.guyu.agentteam.dto.AddMembersRequest;
 import com.guyu.agentteam.dto.ConversationDto;
 import com.guyu.agentteam.dto.GroupChatRequest;
 import com.guyu.agentteam.dto.MessageDto;
@@ -22,6 +24,7 @@ import com.guyu.agentteam.service.ConversationStreamSupport;
 import com.guyu.agentteam.service.FileGrantService;
 import com.guyu.agentteam.service.MessageService;
 import com.guyu.agentteam.service.OpApprovalService;
+import com.guyu.agentteam.service.SkillSupport;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.ScheduledTaskTools;
@@ -32,6 +35,7 @@ import io.agentscope.core.agent.accumulator.TextAccumulator;
 import io.agentscope.core.event.AgentEventType;
 import io.agentscope.core.event.AgentResultEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
+import io.agentscope.core.event.ThinkingBlockDeltaEvent;
 import io.agentscope.core.memory.LongTermMemoryMode;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
@@ -83,6 +87,9 @@ public class OrchestrationService {
     private final com.guyu.agentteam.service.tool.ScheduledTaskTools taskTools;
     private final MessageService messageService;
     private final MessageRepository messages;
+    private final SkillSupport skillSupport;
+    private final com.guyu.agentteam.service.tool.WebTools webTools;
+    private final com.guyu.agentteam.service.tool.SkillTools skillTools;
     /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
     private final Map<String, RunHandle> runs = new ConcurrentHashMap<>();
 
@@ -95,7 +102,10 @@ public class OrchestrationService {
                                 ContextCompressionService compression,
                                 AgentMemoryService memoryService,
                                 com.guyu.agentteam.service.tool.ScheduledTaskTools taskTools,
-                                MessageService messageService, MessageRepository messages) {
+                                MessageService messageService, MessageRepository messages,
+                                SkillSupport skillSupport,
+                                com.guyu.agentteam.service.tool.WebTools webTools,
+                                com.guyu.agentteam.service.tool.SkillTools skillTools) {
         this.agents = agents;
         this.members = members;
         this.support = support;
@@ -113,13 +123,18 @@ public class OrchestrationService {
         this.taskTools = taskTools;
         this.messageService = messageService;
         this.messages = messages;
+        this.skillSupport = skillSupport;
+        this.webTools = webTools;
+        this.skillTools = skillTools;
     }
 
     public void run(SseEmitter emitter, Conversation conv, Agent orchestrator, ModelPreset preset,
                     ConversationStreamSupport.TaskTag taskTag) {
-        List<Agent> team = teamPool(conv, orchestrator);
+        // 可变列表：add_member 中途拉人后，delegate/list_team 立即可见新成员
+        List<Agent> team = new ArrayList<>(teamPool(conv, orchestrator));
         RunHandle handle = new RunHandle();
         handle.taskTag = taskTag;
+        handle.orchestratorName = orchestrator.getName();
         handle.keys.add(conv.getId());
         runs.put(conv.getId(), handle);
         // 协作目标会话：默认是当前会话，create_team 后切到项目群
@@ -148,7 +163,8 @@ public class OrchestrationService {
             messages.save(m);
             support.send(emitter, "user_message", MessageDto.from(m));
             appLogs.record(AppLog.TYPE_TASK, conv.getId(), orchestrator.getId(),
-                    "定时任务「" + taskTag.taskName() + "」触发轮未实际执行（无委派/写改等有效操作），已追加纠正指令重试");
+                    "定时任务「" + taskTag.taskName() + "」触发轮未实际执行（编排者「" + orchestrator.getName()
+                            + "」，无委派/写改等有效操作），已追加纠正指令重试");
             compression.compactIfNeeded(conv, orchestrator);
         }
         if (taskTriggerRound && !settled && !handle.stopRequested.get()) {
@@ -161,7 +177,8 @@ public class OrchestrationService {
                     "error", err,
                     "conversationId", conv.getId()));
             appLogs.record(AppLog.TYPE_TASK, conv.getId(), orchestrator.getId(),
-                    "定时任务「" + taskTag.taskName() + "」重试后仍未实际执行，已中止本轮");
+                    "定时任务「" + taskTag.taskName() + "」重试后仍未实际执行，编排者「" + orchestrator.getName()
+                            + "」已中止本轮");
         }
         // 协作完整走完才把发起会话的图片标记为已阅（被终止过的不标）
         if (!handle.stopRequested.get()) {
@@ -217,6 +234,8 @@ public class OrchestrationService {
         fileTools.registerShellTool(toolkit, () -> target.get().getId(), sink);
         imageTools.register(toolkit, orchestrator, support.imageListener(emitter, () -> target.get().getId(), orchestrator));
         viewTools.register(toolkit, () -> target.get().getId());
+        webTools.register(toolkit, support.webListener(emitter, () -> target.get().getId(), orchestrator, seg.webLog));
+        skillTools.register(toolkit, orchestrator, sink);
         toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId, handle, executed, delegated));
         // 定时任务工具：会话跟随协作目标（建群后任务绑定项目群），创建的任务归编排者名下；
         // 微信发起的协作轮不挂（微信用户看不到应用内任务会话，同 ChatStreamService 的处理）
@@ -227,13 +246,16 @@ public class OrchestrationService {
 
         compression.compactIfNeeded(conv, orchestrator);
 
-        ReActAgent agent = ReActAgent.builder()
+        ReActAgent.Builder builder = ReActAgent.builder()
                 .name(orchestrator.getName())
                 .sysPrompt(buildSysPrompt(orchestrator, team, conv.getId(), background, fromWechat))
                 .model(modelFactory.create(orchestrator, preset))
-                .toolkit(toolkit)
+                .toolkit(toolkit);
+        skillSupport.applySkills(builder, orchestrator);
+        ReActAgent agent = builder
                 .maxIters(MAX_ITERS)
                 .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                .toolExecutionConfig(ConversationStreamSupport.toolCallExecutionConfig())
                 .longTermMemory(memoryService.store(orchestrator.getId()))
                 .longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
                 .build();
@@ -253,6 +275,11 @@ public class OrchestrationService {
                                     "messageId", seg.msg.get().getId(),
                                     "delta", delta,
                                     "conversationId", target.get().getId()));
+                        } else if (e.getType() == AgentEventType.THINKING_BLOCK_DELTA) {
+                            seg.thinking.append(((ThinkingBlockDeltaEvent) e).getDelta());
+                            // 推理模型的思考过程流式透出：气泡未打开时前端显示在思考条，打开后显示在气泡内
+                            support.send(emitter, "thinking_delta", ConversationStreamSupport.thinkingPayload(
+                                    orchestrator.getId(), target.get().getId(), seg, ((ThinkingBlockDeltaEvent) e).getDelta()));
                         } else if (e.getType() == AgentEventType.TOOL_CALL_START) {
                             // 工具调用会把一次发言切成多段：先收口当前文本段
                             support.closeSegment(emitter, target.get(), orchestrator, seg);
@@ -268,12 +295,19 @@ public class OrchestrationService {
         } catch (Exception e) {
             ok = false;
             support.closeSegment(emitter, target.get(), orchestrator, seg);
-            if (ConversationStreamSupport.isCancelSignal(e, handle.stopRequested)) {
+            boolean timeout = ConversationStreamSupport.isBlockingTimeout(e);
+            // 只有 stopRequested 才按用户终止处理：异常链里的 InterruptedException 未必来自用户
+            // （框架/传输层超时都可能夹带），凭它判定曾把协作超时误报成「用户终止」
+            if (handle.stopRequested.get()) {
                 notifyCancelled(emitter, conv, orchestrator, finished);
             } else {
-                String err = ConversationStreamSupport.isBlockingTimeout(e) ? "编排超时，已中止"
+                String err = timeout ? "编排超时，已中止"
                         : (e.getMessage() == null ? e.toString() : e.getMessage());
-                support.persistError(conv, orchestrator, "「" + orchestrator.getName() + "」编排失败：" + err);
+                // 消息给用户简短提示，日志补全异常链（超时另记整体上限，便于核对配置）
+                support.persistError(conv, orchestrator, "「" + orchestrator.getName() + "」编排失败：" + err,
+                        timeout ? "协作整体上限 " + limitsService.load().overallMinutes() + " 分钟；"
+                                + ConversationStreamSupport.errorDetail(e)
+                                : ConversationStreamSupport.errorDetail(e));
                 support.send(emitter, "reply_error", Map.of(
                         "agentId", orchestrator.getId(),
                         "error", "编排失败：" + err,
@@ -297,7 +331,8 @@ public class OrchestrationService {
         handle.running.forEach(ReActAgent::interrupt);
         // 卡在审批等待的请求按拒绝唤醒，前端同步关闭卡片
         handle.keys.forEach(key -> approval.cancelAllForConversation(key));
-        appLogs.record(AppLog.TYPE_COORDINATION, conversationId, null, "用户手动终止协作");
+        appLogs.record(AppLog.TYPE_COORDINATION, conversationId, null,
+                "用户手动终止协作（编排者「" + handle.orchestratorName + "」）");
         return true;
     }
 
@@ -306,6 +341,8 @@ public class OrchestrationService {
         final AtomicBoolean stopRequested = new AtomicBoolean(false);
         /** 定时任务回合标注：任务触发的协作把本轮消息全部打上来源任务 */
         ConversationStreamSupport.TaskTag taskTag;
+        /** 发起本次协作的编排者名字（多编排者场景下日志区分用） */
+        String orchestratorName;
         /** 运行中的 ReActAgent（编排者本人 + 正在执行 delegate 的成员） */
         final Set<ReActAgent> running = ConcurrentHashMap.newKeySet();
         /** 该运行注册过的所有会话ID（发起请求的单聊 + 协作中创建的项目群） */
@@ -377,15 +414,6 @@ public class OrchestrationService {
                 .toList();
     }
 
-    /** 日志用的任务描述摘要 */
-    private static String excerpt(String text) {
-        if (text == null) {
-            return "";
-        }
-        String t = text.replaceAll("\\s+", " ").trim();
-        return t.length() <= 200 ? t : t.substring(0, 200) + "…";
-    }
-
     private String buildSysPrompt(Agent orchestrator, List<Agent> team, String conversationId,
                                   boolean background, boolean fromWechat) {
         StringBuilder sb = new StringBuilder();
@@ -398,8 +426,8 @@ public class OrchestrationService {
                 .append("协作规范：\n")
                 .append("1. 先调用 list_team 了解可委派的成员及其职责和能力。\n")
                 .append("2. 只要本次任务需要委派任何成员参与（哪怕只有 1 个），就必须在第一次 delegate 之前先调用 create_team 创建项目群，之后所有安排和委派都在群里进行——你、参与的成员和用户共同构成协作多方。只有完全不需要任何成员、你独立完成时，才可以不建群。若当前会话已经是群聊（如任务项目群），直接 delegate 即可，无需 create_team。\n")
-                .append("3. 把需求拆解为子任务，用 delegate 依次委派给最合适的成员（按成员能力匹配，涉及生成/绘制图片的任务只能委派给具备图像生成能力的成员）；任务描述要完整明确，包含必要的上下文、要求和期望产出。\n")
-                .append("4. 成员的输出会直接展示给用户，委派时的任务卡也会自动在群里展示，不要复述成员的完整输出或任务卡原文；你只需在每次委派前后简短说明你的安排和判断。某步操作被拒绝（如终端命令未获授权）时，要在群里简短说明情况和你的调整方案，不要默默跳过。\n")
+                .append("3. 把需求拆解为子任务，用 delegate 依次委派给最合适的成员（按成员能力匹配，涉及生成/绘制图片的任务只能委派给具备图像生成能力的成员）；任务描述要完整明确，包含必要的上下文、要求和期望产出。协作中途发现缺少具备特定能力或职责的成员时，可调用 add_member 把他拉进当前项目群，再委派任务给他。\n")
+                .append("4. 成员的输出会直接展示给用户，委派时的任务卡不会在群里展示（仅记入运行日志）；你要在每次委派前后用简短的自然语言说明把什么任务委派给了谁、为什么这样安排，不要复述成员的完整输出或任务卡原文。某步操作被拒绝（如终端命令未获授权）时，要在群里简短说明情况和你的调整方案，不要默默跳过。\n")
                 .append("5. 单次只委派一个成员，等他的结果返回后再决定下一步（例如先实现再验证）。\n");
         if (team.isEmpty()) {
             sb.append("6. 当前团队没有其他成员，你自己完成任务后调用 finish 总结。\n");
@@ -492,7 +520,7 @@ public class OrchestrationService {
             return sb.toString();
         }
 
-        @Tool(name = "create_team", description =
+        @Tool(name = "create_team", concurrencySafe = false, description =
                 "创建一个项目群，把完成该任务所需的成员拉进群里协作。只要需要委派成员参与（哪怕只有 1 个），"
                         + "必须先创建项目群再开始委派。创建后你的安排和委派的成员输出都会展示在群里，"
                         + "最终总结仍会发回用户发起请求的会话")
@@ -545,6 +573,66 @@ public class OrchestrationService {
                     + "完成后调用 finish，总结会自动发回与用户的单聊。";
         }
 
+        @Tool(name = "add_member", concurrencySafe = false, description =
+                "协作中途发现缺少成员时，把一名成员拉进当前项目群参与协作。"
+                        + "拉进后立即可用 delegate 给他委派任务；成员名单不限于建群时的 list_team，可以是用户的任何其他智能体")
+        public String addMember(
+                @ToolParam(name = "member", required = true, description = "要拉入群的成员名称") String member) {
+            if (finished.get()) {
+                return "任务已结束，不能再拉人进群";
+            }
+            Conversation conv = target.get();
+            if (!"group".equals(conv.getType())) {
+                return "项目群尚未创建，请先调用 create_team 建群（或建群时直接在 members 里带上该成员）";
+            }
+            String name = member == null ? "" : member.trim();
+            if (team.stream().anyMatch(a -> a.getName().equals(name))) {
+                return "「" + name + "」已经在当前群里，可直接 delegate";
+            }
+            // 群里没有才能拉：从该用户的全部智能体里按名查找（team 只是当前群成员快照）
+            Agent newbie = agents.findByOrderByCreatedAtAsc().stream()
+                    .filter(a -> a.getUserId() != null && a.getUserId().equals(originConv.getUserId()))
+                    .filter(a -> a.getName().equals(name))
+                    .findFirst()
+                    .orElse(null);
+            if (newbie == null) {
+                String names = agents.findByOrderByCreatedAtAsc().stream()
+                        .filter(a -> a.getUserId() != null && a.getUserId().equals(originConv.getUserId()))
+                        .filter(a -> !a.getId().equals(orchestrator.getId()))
+                        .map(Agent::getName)
+                        .collect(Collectors.joining("、"));
+                return "找不到成员「" + name + "」。可用成员：" + (names.isEmpty() ? "（无）" : names);
+            }
+            ConversationDto dto = conversationService.addMembers(conv.getId(),
+                    new AddMembersRequest(List.of(newbie.getId())));
+            team.add(newbie);
+            executed.set(true);
+            appLogs.record(AppLog.TYPE_COORDINATION, conv.getId(), newbie.getId(),
+                    "编排者「" + orchestrator.getName() + "」将「" + newbie.getName() + "」拉进群聊协作");
+            saveSystemNote(conv, orchestrator.getName() + "将「" + newbie.getName() + "」拉进了群聊");
+            support.sendCrossConversation(emitter, "conversation_updated", conv.getId(), dto);
+            String cap = imageTools.hasCapability(newbie)
+                    ? "他具备图像生成能力，可委派绘图任务。"
+                    : "";
+            return "已把「" + newbie.getName() + "」拉进项目群。" + cap
+                    + "现在可以直接用 delegate 给他委派任务。";
+        }
+
+        /** 系统标注分隔条：落库（不进模型历史）+ 响应流与群观察者双路扇出，前端按消息 id 去重 */
+        private void saveSystemNote(Conversation conv, String content) {
+            Message m = new Message();
+            m.setId(Ids.next());
+            m.setConversationId(conv.getId());
+            m.setSenderType("system");
+            // messages.sender_id 列 NOT NULL，系统标注无发送者，用固定占位
+            m.setSenderId("system");
+            m.setContent(content);
+            m.setType("system");
+            m.setCreatedAt(System.currentTimeMillis());
+            messages.save(m);
+            support.sendCrossConversation(emitter, "system_note", conv.getId(), MessageDto.from(m));
+        }
+
         @Tool(name = "delegate", description =
                 "把一个子任务委派给团队成员。只能在群聊（项目群）中调用，单聊里请先 create_team 建群。"
                         + "成员用它自己的人设和模型独立完成任务，"
@@ -572,7 +660,7 @@ public class OrchestrationService {
             delegated.set(true);
             Conversation conv = target.get();
             appLogs.record(AppLog.TYPE_COORDINATION, conv.getId(), targetAgent.getId(),
-                    "编排者委派任务给「" + targetAgent.getName() + "」：" + excerpt(task));
+                    "编排者「" + orchestrator.getName() + "」委派任务给「" + targetAgent.getName() + "」\n" + taskCard(task));
             Optional<ModelPreset> p = support.presetOf(targetAgent);
             if (p.isEmpty() || Str.isBlank(p.get().getApiKey()) || Str.isBlank(p.get().getBaseUrl())) {
                 support.persistError(conv, targetAgent, "「" + targetAgent.getName() + "」的模型预设缺失或不完整，无法参与协作");
@@ -584,7 +672,6 @@ public class OrchestrationService {
             }
 
             closeSegment();
-            postDelegateCard(conv, targetAgent, task);
             Message placeholder = support.saveMessage(conv, targetAgent, "", "text", handle.taskTag);
             support.send(emitter, "reply_start", Map.of(
                     "messageId", placeholder.getId(),
@@ -592,6 +679,7 @@ public class OrchestrationService {
                     "conversationId", conv.getId()));
 
             TextAccumulator acc = new TextAccumulator();
+            StringBuilder memberThinking = new StringBuilder();
             AtomicReference<Msg> result = new AtomicReference<>();
             // 成员的文件工具跟随当前协作会话：建群后用群内授权副本，群里撤销对成员立即生效。
             // 任务触发回合里成员与编排者同策略：按任务配置自动放行/拒绝，不走无人响应的人工审批
@@ -604,6 +692,10 @@ public class OrchestrationService {
             memberToolkit.registerTool(fileTools.toolsFor(conv.getId(), memberSink));
             fileTools.registerShellTool(memberToolkit, conv::getId, memberSink);
             imageTools.register(memberToolkit, targetAgent, support.imageListener(emitter, conv::getId, targetAgent));
+            // 成员整轮只有一条消息（placeholder）：联网活动收集到局部 log，落库时一次性附着
+            ConversationStreamSupport.WebActivityLog memberWeb = new ConversationStreamSupport.WebActivityLog();
+            webTools.register(memberToolkit, support.webListener(emitter, conv::getId, targetAgent, memberWeb));
+            skillTools.register(memberToolkit, targetAgent, memberSink);
             String memberNote = fileTools.promptNote(conv.getId(), memberBackground,
                     tag != null && tag.taskId() == null);
             String memberSysPrompt = Str.isBlank(targetAgent.getSystemPrompt())
@@ -614,13 +706,16 @@ public class OrchestrationService {
                 memberSysPrompt += "\n\n" + memberMemory;
             }
             boolean cancelled = false;
-            ReActAgent memberAgent = ReActAgent.builder()
+            ReActAgent.Builder memberBuilder = ReActAgent.builder()
                     .name(targetAgent.getName())
                     .sysPrompt(memberSysPrompt)
                     .model(modelFactory.create(targetAgent, p.get()))
-                    .toolkit(memberToolkit)
+                    .toolkit(memberToolkit);
+            skillSupport.applySkills(memberBuilder, targetAgent);
+            ReActAgent memberAgent = memberBuilder
                     .maxIters(MAX_ITERS)
                     .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                    .toolExecutionConfig(ConversationStreamSupport.toolCallExecutionConfig())
                     .longTermMemory(memoryService.store(targetAgent.getId()))
                     .longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
                     .build();
@@ -636,6 +731,14 @@ public class OrchestrationService {
                                         "messageId", placeholder.getId(),
                                         "delta", d,
                                         "conversationId", conv.getId()));
+                            } else if (ev.getType() == AgentEventType.THINKING_BLOCK_DELTA) {
+                                memberThinking.append(((ThinkingBlockDeltaEvent) ev).getDelta());
+                                // 被委派成员的思考过程：占位气泡已存在（delegate 时创建），固定带 messageId 进气泡
+                                support.send(emitter, "thinking_delta", Map.of(
+                                        "agentId", targetAgent.getId(),
+                                        "conversationId", conv.getId(),
+                                        "messageId", placeholder.getId(),
+                                        "delta", ((ThinkingBlockDeltaEvent) ev).getDelta()));
                             } else if (ev.getType() == AgentEventType.AGENT_RESULT) {
                                 result.set(((AgentResultEvent) ev).getResult());
                             }
@@ -644,10 +747,29 @@ public class OrchestrationService {
             } catch (UncheckedIOException e) {
                 throw e;
             } catch (Exception e) {
-                if (!ConversationStreamSupport.isCancelSignal(e, handle.stopRequested)) {
-                    String err = ConversationStreamSupport.isBlockingTimeout(e) ? "执行超时"
-                            : (e.getMessage() == null ? e.toString() : e.getMessage());
-                    support.markError(placeholder, "执行失败：" + err);
+                boolean timeout = ConversationStreamSupport.isBlockingTimeout(e);
+                // 只有 stopRequested 才按用户终止处理（stop() 先置标志位再 interrupt）：
+                // 异常链里的 InterruptedException 未必来自用户（框架/传输层超时都可能夹带），
+                // 凭它判定曾把成员轮的传输层超时误报成「协作已被用户终止」
+                if (handle.stopRequested.get()) {
+                    cancelled = true;
+                } else if (timeout) {
+                    // 单成员轮到点（协作限制 memberMinutes）：明确按超时报，给编排者决策依据；
+                    // 日志补全轮次上限与底层异常链，便于核对超时配置
+                    support.markError(placeholder, "（执行超时，已中止）",
+                            "成员轮次上限 " + limitsService.load().memberMinutes() + " 分钟；"
+                                    + ConversationStreamSupport.errorDetail(e));
+                    support.send(emitter, "reply_error", Map.of(
+                            "messageId", placeholder.getId(),
+                            "agentId", targetAgent.getId(),
+                            "error", "执行超时，已中止",
+                            "conversationId", conv.getId()));
+                    return "成员「" + targetAgent.getName() + "」执行超时，请决定下一步。";
+                } else {
+                    String err = e.getMessage() == null ? e.toString() : e.getMessage();
+                    // 消息给用户简短提示，日志补全异常链
+                    support.markError(placeholder, "执行失败：" + err,
+                            ConversationStreamSupport.errorDetail(e));
                     support.send(emitter, "reply_error", Map.of(
                             "messageId", placeholder.getId(),
                             "agentId", targetAgent.getId(),
@@ -655,12 +777,11 @@ public class OrchestrationService {
                             "conversationId", conv.getId()));
                     return "成员「" + targetAgent.getName() + "」执行失败（" + err + "），请决定下一步。";
                 }
-                cancelled = true;
             } finally {
                 handle.running.remove(memberAgent);
                 memberAgent.close();
             }
-            // 用户终止（ interrupt 报错或流被框架正常收尾两种形态都归到这里）：
+            // 用户终止：正常收尾或异常路径都要求 stopRequested 标志位才算数。
             // 保留成员已流出的部分内容，无内容则标记为错误
             if (cancelled || handle.stopRequested.get()) {
                 if (!acc.hasContent()) {
@@ -672,13 +793,11 @@ public class OrchestrationService {
                             "conversationId", conv.getId()));
                 } else {
                     placeholder.setContent(acc.getAccumulated());
+                    placeholder.setWebActivity(memberWeb.drainToJson());
+                    placeholder.setThinking(ConversationStreamSupport.drainThinking(memberThinking));
                     support.persist(placeholder);
                     support.touchConversation(conv, targetAgent, acc.getAccumulated());
-                    support.send(emitter, "reply_end", Map.of(
-                            "messageId", placeholder.getId(),
-                            "agentId", targetAgent.getId(),
-                            "content", acc.getAccumulated(),
-                            "conversationId", conv.getId()));
+                    sendMemberReplyEnd(placeholder, targetAgent, acc.getAccumulated());
                 }
                 return "协作已被用户终止。";
             }
@@ -696,39 +815,39 @@ public class OrchestrationService {
                 return "成员「" + targetAgent.getName() + "」没有返回内容，请决定下一步。";
             }
             placeholder.setContent(full);
+            placeholder.setWebActivity(memberWeb.drainToJson());
+            placeholder.setThinking(ConversationStreamSupport.drainThinking(memberThinking));
             support.persist(placeholder);
             support.touchConversation(conv, targetAgent, full);
-            support.send(emitter, "reply_end", Map.of(
-                    "messageId", placeholder.getId(),
-                    "agentId", targetAgent.getId(),
-                    "content", full,
-                    "conversationId", conv.getId()));
+            sendMemberReplyEnd(placeholder, targetAgent, full);
             return "成员「" + targetAgent.getName() + "」已完成任务，输出如下：\n\n" + full
                     + "\n\n请继续协调其他成员，或调用 finish 给用户总结。";
         }
 
+        /** 成员回复收尾 SSE：reply_end 附带联网活动（有才带），与 closeSegment 的载荷结构一致 */
+        private void sendMemberReplyEnd(Message placeholder, Agent member, String content) {
+            Map<String, Object> payload = new java.util.LinkedHashMap<>();
+            payload.put("messageId", placeholder.getId());
+            payload.put("agentId", member.getId());
+            payload.put("content", content);
+            payload.put("conversationId", target.get().getId());
+            List<Map<String, Object>> webActivity =
+                    com.guyu.agentteam.common.Json.readWebActivity(placeholder.getWebActivity());
+            if (webActivity != null) payload.put("webActivity", webActivity);
+            if (!Str.isBlank(placeholder.getThinking())) payload.put("thinking", placeholder.getThinking());
+            support.send(emitter, "reply_end", payload);
+        }
+
         /**
-         * 委派任务卡以编排者名义落库并在群里展示（reply_start/end 两连发复用前端气泡逻辑）。
-         * 任务卡只存在于 delegate 参数里时，用户在消息流中看不到「委派了什么/题是什么」，
-         * 只会看到成员凭空开始干活。
+         * 委派任务卡不再插入消息流（群里只看编排者的自然语言说明与成员输出），
+         * 全文并入 TYPE_COORDINATION 运行日志留档，点开日志条目可展开查看。
          */
-        private void postDelegateCard(Conversation conv, Agent targetAgent, String task) {
+        private String taskCard(String task) {
             String t = task == null ? "" : task.trim();
-            if (t.isEmpty()) return;
             if (t.length() > 2000) {
                 t = t.substring(0, 2000) + "\n…（任务卡过长已截断）";
             }
-            String content = "【委派任务卡 → " + targetAgent.getName() + "】\n" + t;
-            Message m = support.saveMessage(conv, orchestrator, content, "text", handle.taskTag);
-            support.send(emitter, "reply_start", Map.of(
-                    "messageId", m.getId(),
-                    "agentId", orchestrator.getId(),
-                    "conversationId", conv.getId()));
-            support.send(emitter, "reply_end", Map.of(
-                    "messageId", m.getId(),
-                    "agentId", orchestrator.getId(),
-                    "content", content,
-                    "conversationId", conv.getId()));
+            return t;
         }
 
         @Tool(name = "finish", description = "任务完成后调用，把给用户的最终总结答复提交出来，结束本次协作。总结会发回用户发起请求的会话")

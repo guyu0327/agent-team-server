@@ -22,7 +22,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | --- | --- |
 | `list_team` | 查看可委派的成员及职责与能力（是否具备图像生成等） |
 | `create_team` | 需要成员参与时（哪怕 1 个）先创建项目群，协作过程进群；编排者 + 成员 + 用户构成协作多方 |
-| `delegate` | 委派子任务；成员用自己的人设和模型独立执行，输出作为真实消息流式展示；任务卡同时以编排者名义落库进群（「【委派任务卡 → 成员】」），委派了什么、题是什么在消息流直接可见 |
+| `delegate` | 委派子任务；成员用自己的人设和模型独立执行，输出作为真实消息流式展示；完整任务卡不再插入消息流，改记入运行日志（`coordination` 类型，点击展开全文），群里只看编排者的自然语言安排说明与成员输出（编排者提示词要求委派前后自然语言说明把什么任务委派给了谁、为什么） |
 | `finish` | 提交最终总结，自动发回用户发起请求的单聊 |
 
 - 协作全程透明：编排者的每段发言、成员的完整输出都是真实持久化的聊天消息
@@ -70,7 +70,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 查看/清空：`GET /api/agents/{id}/memories`、`DELETE /api/agents/{id}/memories`
 
 ### 运行日志（app_logs）
-- 关键事件落库，便于排查问题：`error` / `op_request` / `op_decision` / `coordination` / `discussion` / `image` / `compact` / `api_error`
+- 关键事件落库，便于排查问题：`error` / `op_request` / `op_decision` / `coordination` / `discussion` / `image` / `compact` / `task` / `wechat` / `api_error`（编排委派的完整任务卡也记在此处，`coordination` 类型）
 - 写入经内存队列异步批量落库（业务线程只入队），避免 SQLite 单连接被日志阻塞；队列满丢弃新日志并限流告警
 - 保留 30 天，批量写入后低频触发过期清理；查询走 `GET /api/logs`，支持 `type` / `from` / `to` / 分页，前端「设置-数据管理-查看日志」即基于此
 
@@ -86,6 +86,25 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 智能体可绑定一个图像预设（可空）：绑定的智能体（单聊、群成员、编排者均生效）在 ReAct 循环中获得 `generate_image(prompt, size)` 工具，调用文生图服务后把图片保存到主工作区 `generated/` 目录（文件名时间戳+随机、只增不覆盖），并在回复中以 Markdown 引用路径展示
 - 支持的模型：DashScope 同步端点（z-image-turbo、qwen-image）、OpenAI Images 兼容接口（dall-e-3、gpt-image-1 及同形聚合服务）与硅基流动（Kwai-Kolors/Kolors、Qwen/Qwen-Image，返回的图片 URL 一小时有效、适配器即时下载落盘）；wanx 等异步任务型暂不支持
 - 生图写入位置固定且不覆盖已有文件，属用户主动要求的创作行为，豁免审批卡片；未绑定图像预设的智能体看不到该工具
+
+### 智能体技能（skills）
+- 技能 = 一份 Markdown 能力文档：`data/skills/<skillId>/SKILL.md`（frontmatter `name` / `description` + 正文，可附带脚本/模板等辅助文件），技能页 CRUD（`/api/skills`），改技能即时生效无需重启
+- 注入链路：单聊/群聊/任务/讨论成员、编排者、协作中被 `delegate` 成员三条构建路径都会把技能目录（ID+名称+描述）注入系统提示，智能体按需自行加载正文；编排者与主持人判定轮、上下文压缩轮不注入
+- 使用范围：`agents.skill_ids`（V14 迁移）记录绑定，支持「全局」（所有智能体含新建的都可用，运行时即时生效）或逐智能体勾选（`PUT /api/skills/{skillId}/scope`）；智能体编辑表单与技能页共用同一绑定数据源，求并集生效
+- 自助安装：`install_skill` 工具（受控审批卡片展示技能名/描述/正文与辅助文件清单，批准后写入技能库并默认自动启用到发起安装的智能体，下一轮生效）；同一轮并行安装曾互相覆盖绑定，现 `install_skill` / `create_team` / `add_member` 等写操作标记 `concurrencySafe=false` 串行执行（`delegate` 成员协作仍并行）；重复 ID/重名在弹卡前即拦截
+- `list_skills` 工具（只读）：输出每个技能的名称/描述、辅助文件清单（过滤 `.git` 等版本库元数据）、启用智能体数与「是否包含自己（含你/不含你）」标注（按库内最新绑定判断，同轮刚安装也能反映），帮助智能体判断技能可用性
+- 辅助文件：`install_skill` 可选 `files` 参数多文件安装（路径白名单校验防穿越）；技能详情页可查看清单并直达所在文件夹
+
+### 联网工具（web_search / fetch_webpage）
+- 无条件注册到所有智能体（单聊/群聊成员、编排者、被委派成员、微信与定时任务轮均生效），只读免审批：`web_search`（AnySearch 搜索，返回现成 Markdown 结果，`max_results` 1–10）与 `fetch_webpage`（直连 HTTP 抓取 + jsoup 正文提取，自动剔除脚本/导航噪声、兼容 GBK 站点，仅允许 http/https，响应体 2MB 上限，正文默认 6000 字符可调）
+- AnySearch 走 MCP 兼容 JSON-RPC（`api.anysearch.com/mcp`），匿名免费档零配置即用；可选配置 API Key 提升额度（`GET/PUT/DELETE /api/settings/anysearch`，DPAPI 加密存储、只回传 `hasKey` 状态）
+- 联网记录：每次搜索/抓取经 SSE `web_activity` 事件实时推送前端提示条，并随发言段落持久化到 `messages.web_activity`（V15 迁移，JSON），聊天页气泡下方「联网记录」折叠条可回看（关键词/站点/网址/标题与失败原因）
+
+### 思考过程（推理模型）
+- 框架全链路现成支持：AgentScope 的 OpenAI 扩展把 `reasoning_content`（DeepSeek-R1 / GLM / Qwen 等推理模型）/ `reasoning` / `reasoning_details` 解析为 `ThinkingBlock`，ReActAgent 以 `THINKING_BLOCK_START/DELTA/END` 事件无条件发射（`StreamOptions.includeReasoningChunk` 只影响旧版 `stream()`，不影响我们使用的 `streamEvents()`）
+- 三个订阅点（单聊/群成员直答与讨论、编排者轮、协作被 `delegate` 成员轮）均把思考增量转为 SSE `thinking_delta`（payload `{agentId, conversationId, messageId?, delta}`）：气泡未开时无 `messageId` → 前端思考条实时滚动；段落气泡已开时带 `messageId` → 思考文本在成员气泡内实时显示
+- 思考全文随回复持久化到 `messages.thinking`（V16 迁移，独立字段，单条 2 万字符截断）：逐段 drain——每段发言携带其前面的思考；正文为空的段落也会先落思考再收段，不跨段泄漏；`reply_end` 事件附带 `thinking` 供前端补全
+- 边界设计：思考不进对话上下文——历史注入只拼 `content`，图片已阅、上下文压缩、多智能体历史合并均不受影响；普通模型无思考输出，全链路显示不受影响
 
 ### 定时任务（scheduled_tasks）
 - 任务模型：名称 + 内容 + 触发方式（`once` 单次 runAt / `daily` 每天 timeOfDay / `weekly` 每周 timeOfDay+daysOfWeek（1=周一…7=周日）/ `interval` 每 intervalMinutes 分钟），不引入 cron，字段结构化由后端校验（V7 迁移）；任务类型 `mode`：`normal` 普通（智能体独立执行，绑定其任务线程）/ `collab` 协作（编排者执行并拉非编排者成员建任务项目群，成员必选，V9 迁移）；`catch_up` 开关控制错过的单次任务启动后 24h 内是否补发，默认不补发（补发关闭时错过的任务直接转 done 并记日志）
@@ -118,6 +137,9 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 单聊、群聊、群成员管理、解散、置顶、重命名、已读未读；群聊重置（`POST /{id}/reset`，按原群名/成员/聊天模式重建新群，旧群归档）；删除/解散/重置/开始新会话统一下沉为会话归档（历史会话），可恢复或彻底删除
 - OpenAI 兼容模型接入：每个智能体可关联不同预设、独立温度与角色设定
 - 文生图：预设按协议分类（对话 / DashScope 文生图 / OpenAI Images 文生图），智能体绑定图像预设即获得 `generate_image` 工具，图片落工作区并在气泡中展示
+- 智能体技能：Markdown 技能文档（可带辅助文件）按目录管理，全局或逐智能体启用，三条构建链路注入系统提示；智能体可用 `install_skill`（审批后落库并默认自启用）与 `list_skills` 自助扩展能力
+- 联网工具：`web_search`（AnySearch，匿名即用、Key 可选）与 `fetch_webpage`（jsoup 正文提取）只读免审批，联网记录实时展示并随消息持久化
+- 思考过程：推理模型（DeepSeek-R1 / GLM / Qwen 等）思考文本经 `thinking_delta` 实时透出，全文随回复持久化（独立字段、不进对话上下文），前端折叠条可回看
 - 编排者开关（`is_orchestrator`）：任意智能体可设为团队编排者，且能感知成员的绘图能力
 - 受控操作审批：AI 写入、修改文件与执行终端命令前弹卡片询问用户，支持允许一次 / 本会话允许（批量放行同类待审批）/ 拒绝
 - 上下文压缩：历史超预算自动滚动摘要（设置页可调预算与开关），图片首轮看完即降级为文字注记，`view_image` 工具按需重看
@@ -134,7 +156,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | 编排 | AgentScope Java 2.0.1（ReActAgent + Toolkit + harness 文件/shell 工具） |
 | 模型接入 | agentscope-extensions-model-openai（OpenAI 兼容接口） |
 | 数据 | Spring Data JPA + SQLite（单文件，WAL 模式） |
-| 其他 | Lombok、SseEmitter（SSE 流式推送） |
+| 其他 | Lombok、SseEmitter（SSE 流式推送）、jsoup（网页正文提取） |
 
 ## 快速开始
 
@@ -159,9 +181,9 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 ### 密钥加密存储
 
-- 模型预设的 API Key 与讯飞语音识别的 APIKey/APISecret 在数据库中经 Windows DPAPI 加密存储（`dpapi:` 前缀标识，JNA 调用，启动时自动迁移存量明文），数据库文件或备份被拷走后密钥不可解
+- 模型预设的 API Key、讯飞语音识别的 APIKey/APISecret 与 AnySearch 的 API Key 在数据库中经 Windows DPAPI 加密存储（`dpapi:` 前缀标识，JNA 调用，启动时自动迁移存量明文），数据库文件或备份被拷走后密钥不可解
 - 加密绑定当前 Windows 账户：直接把 `agent_team.db` 拷到其他账户/机器会因解密失败而显示为未配置，需重新填写；非 Windows 环境降级为明文存储
-- 密钥永不回传前端：`GET /api/model-presets` 与 `GET/PUT /api/settings/asr-stream` 只返回 `hasKey` 等状态；更新时密钥留空表示保持不变（讯飞三项全部留空表示清除配置）
+- 密钥永不回传前端：`GET /api/model-presets`、`GET/PUT /api/settings/asr-stream` 与 `GET /api/settings/anysearch` 只返回 `hasKey` 等状态；更新时密钥留空表示保持不变（讯飞三项全部留空表示清除配置，AnySearch 走 `DELETE` 清除）
 
 ### 配置项
 
@@ -181,10 +203,12 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | `reply_start` | 智能体开始回复（messageId / agentId / conversationId） |
 | `reply_pending` | 一位成员即将回复（agentId / conversationId）：模型思考窗口（含接龙/依次回复间隔期）先行预告，首个非空增量才发 `reply_start`，前端据此显示「谁在思考」 |
 | `delta` | 流式增量文本 |
-| `reply_end` | 一段回复完成（含最终全文） |
+| `thinking_delta` | 推理模型思考增量（`agentId` / `conversationId` / `delta`；仅当该段气泡已开时附带 `messageId`，前端据此路由到思考条或气泡内思考框） |
+| `reply_end` | 一段回复完成（含最终全文；推理模型另带 `thinking` 思考全文） |
 | `reply_error` | 回复失败或为空 |
 | `op_request` | 受控操作审批请求（`requestId` / `opType`: write\|edit\|shell / `agentName` / `target` / `detail`），等待 `POST /{id}/op-grant` 决定，期间该操作阻塞（最长 120 秒） |
 | `image_start` / `image_end` | 文生图工具开始 / 结束（`generate_image` 执行窗口，前端据此显示生成动画；start 含 `agentName`，均携带 `conversationId`） |
+| `web_activity` | 联网工具执行动态（搜索/抓取的关键词、网址、标题与成功与否），前端显示「正在搜索/正在抓取」提示条并随消息持久化为联网记录 |
 | `conversation_created` | 编排者创建了项目群（含完整会话对象） |
 | `coordination_start` / `coordination_end` | 编排协调状态开始 / 结束（按会话） |
 | `discussion_start` / `discussion_end` | 自由讨论开始 / 结束（按会话） |
@@ -203,10 +227,11 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | `/api/model-presets` | 模型预设 CRUD |
 | `/api/conversations` | 会话、消息、SSE 流式回复、会话文件授权（`/{id}/files`）、受控操作审批（`/{id}/op-grant`）、历史会话归档/恢复（`/{id}/archive`、`/{id}/restore`）、群聊重置（`/{id}/reset`） |
 | `/api/tasks` | 定时任务 CRUD（`GET` 按会话分组、`POST` 创建、`PUT /{taskId}` 更新含暂停恢复、`DELETE /{taskId}`）、`/{taskId}/run` 立即执行一次、`/conversation/{id}` 会话任务列表、`/conversations` 任务会话列表（仅还剩任务的）、`/restore/{conversationId}` 从历史归档恢复任务 |
+| `/api/skills` | 技能 CRUD（`GET` 列表 / `GET /{skillId}` 详情含辅助文件 / `POST` 新建 / `PUT /{skillId}` 更新 / `DELETE /{skillId}` 删除）、使用范围（`PUT /{skillId}/scope`：全局或逐智能体勾选） |
 | `/api/fs` | 图片内容读取（气泡缩略图数据源，只读） |
 | `/api/asr/stream` | 实时语音转写 WebSocket（桥接讯飞流式听写） |
 | `/api/wechat` | 微信 iLink 通道：连接状态（`GET /status`）、扫码登录（`POST /login` 发起、`GET /login/status` 轮询、`POST /login/verify` 配对码、`POST /login/cancel` 取消）、断开（`POST /disconnect`）、重置会话（`POST /reset`，旧会话归档、绑定迁移新会话）、通道设置（`GET/PUT /settings`） |
-| `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、协作时长限制、上下文压缩（预算/开关）、数据库快照导出 |
+| `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、联网搜索 AnySearch 配置（`/anysearch`，GET/PUT/DELETE，仅回传 `hasKey`）、协作时长限制、上下文压缩（预算/开关）、数据库快照导出 |
 | `/api/logs` | 运行日志查询（按类型与时间范围分页） |
 
 ## 目录结构
@@ -224,6 +249,8 @@ src/main/java/com/guyu/agentteam/
 │   ├── ScheduledTaskService      定时任务（CRUD/调度/恢复补发/触发，TaskScheduler + 句柄表）
 │   ├── wechat/                  微信 iLink 通道（扫码登录/长轮询收发/CDN 媒体下载解密/会话绑定）
 │   ├── AsrStreamService         实时语音识别配置与讯飞鉴权
+│   ├── AnySearchService         联网搜索配置（DPAPI 加密）与 AnySearch MCP 调用
+│   ├── SkillService / SkillSupport  技能文件管理（frontmatter 解析/绑定/辅助文件清单）与三链路注入
 │   ├── orchestration/
 │   │   ├── OrchestrationService   编排协作循环与团队工具
 │   │   └── AgentModelFactory      模型预设 → AgentScope 模型
@@ -232,6 +259,8 @@ src/main/java/com/guyu/agentteam/
 │       ├── GatedShellTool       审批门控的终端命令工具
 │       ├── ImageGenerationTools 文生图工具（按智能体图像预设注册）
 │       ├── ScheduledTaskTools   定时任务工具（schedule/update/list/cancel_task）
+│       ├── SkillTools           技能自助安装/查询工具（install_skill 串行审批 / list_skills 含你标注）
+│       ├── WebTools             联网工具（web_search / fetch_webpage，只读免审批）
 │       ├── AbstractImageAdapter  文生图适配器基类（公共下载/落盘/尺寸逻辑）
 │       ├── DashscopeImageAdapter / OpenAiImageAdapter / SiliconflowImageAdapter  文生图协议适配器
 │       └── OpRequestSink        审批请求回调接口

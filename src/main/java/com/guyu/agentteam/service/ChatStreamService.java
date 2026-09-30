@@ -17,12 +17,15 @@ import com.guyu.agentteam.service.orchestration.OrchestrationService;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.ScheduledTaskTools;
+import com.guyu.agentteam.service.tool.SkillTools;
 import com.guyu.agentteam.service.tool.ViewImageTools;
+import com.guyu.agentteam.service.tool.WebTools;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.ReActAgent;
 import io.agentscope.core.event.AgentEventType;
 import io.agentscope.core.memory.LongTermMemoryMode;
 import io.agentscope.core.event.TextBlockDeltaEvent;
+import io.agentscope.core.event.ThinkingBlockDeltaEvent;
 import io.agentscope.core.message.MessageMetadataKeys;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
@@ -80,6 +83,9 @@ public class ChatStreamService {
     private final AgentMemoryService memoryService;
     private final ScheduledTaskTools taskTools;
     private final ScheduledTaskRepository tasks;
+    private final SkillSupport skillSupport;
+    private final WebTools webTools;
+    private final SkillTools skillTools;
 
     public ChatStreamService(ConversationMemberRepository members,
                              AgentRepository agents, AgentModelFactory modelFactory,
@@ -89,7 +95,9 @@ public class ChatStreamService {
                              OrchestrationService orchestration, OpApprovalService approval,
                              AppLogService appLogs, CoordinationLimitsService limitsService,
                              ContextCompressionService compression, AgentMemoryService memoryService,
-                             ScheduledTaskTools taskTools, ScheduledTaskRepository tasks) {
+                             ScheduledTaskTools taskTools, ScheduledTaskRepository tasks,
+                             SkillSupport skillSupport, WebTools webTools,
+                             SkillTools skillTools) {
         this.members = members;
         this.agents = agents;
         this.modelFactory = modelFactory;
@@ -105,6 +113,9 @@ public class ChatStreamService {
         this.memoryService = memoryService;
         this.taskTools = taskTools;
         this.tasks = tasks;
+        this.skillSupport = skillSupport;
+        this.webTools = webTools;
+        this.skillTools = skillTools;
     }
 
     public void stream(SseEmitter emitter, Conversation conv, Message userMsg) {
@@ -230,13 +241,16 @@ public class ChatStreamService {
                 "conversationId", conv.getId()));
 
         ConversationStreamSupport.SegState seg = new ConversationStreamSupport.SegState();
-        ReActAgent react = ReActAgent.builder()
+        ReActAgent.Builder builder = ReActAgent.builder()
                 .name(agent.getName())
                 .sysPrompt(sysPromptOf(agent, conv.getId(), handle != null ? handle.taskTag : null))
                 .model(modelFactory.create(agent, preset, multiAgent))
-                .toolkit(toolkitOf(conv, emitter, agent, handle))
+                .toolkit(toolkitOf(conv, emitter, agent, handle, seg));
+        skillSupport.applySkills(builder, agent);
+        ReActAgent react = builder
                 .maxIters(MAX_ITERS)
                 .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                .toolExecutionConfig(ConversationStreamSupport.toolCallExecutionConfig())
                 .longTermMemory(memoryService.store(agent.getId()))
                 .longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
                 .build();
@@ -256,6 +270,12 @@ public class ChatStreamService {
                                     "messageId", seg.msg.get().getId(),
                                     "delta", delta,
                                     "conversationId", conv.getId()));
+                        } else if (ev.getType() == AgentEventType.THINKING_BLOCK_DELTA) {
+                            String think = ((ThinkingBlockDeltaEvent) ev).getDelta();
+                            seg.thinking.append(think);
+                            // 推理模型的思考过程流式透出：气泡未打开时前端显示在思考条，打开后显示在气泡内
+                            support.send(emitter, "thinking_delta", ConversationStreamSupport.thinkingPayload(
+                                    agent.getId(), conv.getId(), seg, think));
                         } else if (ev.getType() == AgentEventType.TOOL_CALL_START) {
                             support.closeSegment(emitter, conv, agent, seg);
                         }
@@ -271,13 +291,20 @@ public class ChatStreamService {
             throw e;
         } catch (Exception e) {
             support.closeSegment(emitter, conv, agent, seg);
-            if (handle != null && ConversationStreamSupport.isCancelSignal(e, handle.stopRequested)) {
+            boolean timeout = ConversationStreamSupport.isBlockingTimeout(e);
+            // 只有 stopRequested 才按用户终止处理：异常链里的 InterruptedException 未必来自用户
+            // （框架/传输层超时都可能夹带），凭它判定会吞掉真实的回复失败
+            if (handle != null && handle.stopRequested.get()) {
                 // 终止：已保留部分内容，由外层循环按 stopRequested 收尾
                 return;
             }
-            String err = ConversationStreamSupport.isBlockingTimeout(e) ? "回复超时，已中止"
+            String err = timeout ? "回复超时，已中止"
                     : (e.getMessage() == null ? e.toString() : e.getMessage());
-            support.persistError(conv, agent, "「" + agent.getName() + "」回复失败：" + err);
+            // 消息给用户简短提示，日志补全异常链（超时另记轮次上限，便于核对配置）
+            support.persistError(conv, agent, "「" + agent.getName() + "」回复失败：" + err,
+                    timeout ? "回复上限 " + limitsService.load().memberMinutes() + " 分钟；"
+                            + ConversationStreamSupport.errorDetail(e)
+                            : ConversationStreamSupport.errorDetail(e));
             support.send(emitter, "reply_error", Map.of("agentId", agent.getId(), "error", err));
         } finally {
             if (handle != null) handle.running.remove(react);
@@ -319,7 +346,8 @@ public class ChatStreamService {
         return sys;
     }
 
-    private Toolkit toolkitOf(Conversation conv, SseEmitter emitter, Agent agent, RunHandle handle) {
+    private Toolkit toolkitOf(Conversation conv, SseEmitter emitter, Agent agent, RunHandle handle,
+                              ConversationStreamSupport.SegState seg) {
         ConversationStreamSupport.TaskTag tag = handle != null ? handle.taskTag : null;
         // 任务触发回合为后台执行（无人响应审批卡片）：按任务配置自动放行或立即拒绝，
         // 不走 120 秒等待；普通聊天回合维持人工审批
@@ -332,6 +360,8 @@ public class ChatStreamService {
         fileTools.registerShellTool(toolkit, conv::getId, sink);
         imageTools.register(toolkit, agent, support.imageListener(emitter, conv::getId, agent));
         viewTools.register(toolkit, conv::getId);
+        webTools.register(toolkit, support.webListener(emitter, conv::getId, agent, seg.webLog));
+        skillTools.register(toolkit, agent, sink);
         boolean fromWechat = tag != null && tag.taskId() == null;
         if (!fromWechat) {
             taskTools.register(toolkit, conv::getId, agent::getId,

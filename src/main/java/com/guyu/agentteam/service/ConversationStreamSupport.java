@@ -14,6 +14,7 @@ import com.guyu.agentteam.repository.ConversationRepository;
 import com.guyu.agentteam.repository.MessageRepository;
 import com.guyu.agentteam.repository.ModelPresetRepository;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
+import com.guyu.agentteam.service.tool.WebTools;
 import io.agentscope.core.agent.accumulator.TextAccumulator;
 import io.agentscope.core.message.AssistantMessage;
 import io.agentscope.core.model.ExecutionConfig;
@@ -33,13 +34,13 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** 普通回复与编排回复共用的 SSE 发送和消息持久化逻辑 */
@@ -140,6 +141,8 @@ public class ConversationStreamSupport {
 
     private static final class ConvRoundState {
         volatile String coordinator;
+        /** 即将发言的成员（reply_pending 思考窗口）：重放缺失会让思考条在切页重连后凭空消失 */
+        volatile String pendingAgent;
         volatile boolean discussing;
         final Map<String, InFlightSegment> segments = new ConcurrentHashMap<>();
     }
@@ -156,7 +159,8 @@ public class ConversationStreamSupport {
     private void trackRound(String conversationId, String event, Object data) {
         ConvRoundState st;
         switch (event) {
-            case "reply_start", "coordination_start" ->
+            // reply_pending 是单智能体回合的首个事件，此时快照尚不存在，须一并建快照
+            case "reply_start", "coordination_start", "reply_pending" ->
                     st = roundStates.computeIfAbsent(conversationId, k -> new ConvRoundState());
             case "done" -> {
                 roundStates.remove(conversationId);
@@ -169,8 +173,13 @@ public class ConversationStreamSupport {
         }
         Map<?, ?> p = data instanceof Map<?, ?> m ? m : Map.of();
         switch (event) {
-            case "reply_start" -> st.segments.put(String.valueOf(p.get("messageId")),
-                    new InFlightSegment(String.valueOf(p.get("agentId"))));
+            case "reply_pending" -> st.pendingAgent = String.valueOf(p.get("agentId"));
+            case "reply_start" -> {
+                // 占位气泡出现，思考窗口结束，重放改由气泡内打字点接管
+                st.pendingAgent = null;
+                st.segments.put(String.valueOf(p.get("messageId")),
+                        new InFlightSegment(String.valueOf(p.get("agentId"))));
+            }
             case "delta" -> {
                 InFlightSegment seg = st.segments.get(String.valueOf(p.get("messageId")));
                 if (seg != null && p.get("delta") != null) {
@@ -181,7 +190,10 @@ public class ConversationStreamSupport {
             case "reply_error" -> {
                 // 带 messageId 的是单段失败已落库；不带的是整轮错误，进行中的段一并丢弃
                 if (p.get("messageId") != null) st.segments.remove(String.valueOf(p.get("messageId")));
-                else st.segments.clear();
+                else {
+                    st.segments.clear();
+                    st.pendingAgent = null;
+                }
             }
             case "coordination_start" -> st.coordinator = String.valueOf(p.get("agentId"));
             case "coordination_end" -> st.coordinator = null;
@@ -189,7 +201,7 @@ public class ConversationStreamSupport {
             case "discussion_end" -> st.discussing = false;
             default -> { /* user_message / conversation_created / image_* 无需跟踪 */ }
         }
-        if (st.coordinator == null && !st.discussing && st.segments.isEmpty()) {
+        if (st.coordinator == null && !st.discussing && st.segments.isEmpty() && st.pendingAgent == null) {
             roundStates.remove(conversationId);
         }
     }
@@ -230,6 +242,11 @@ public class ConversationStreamSupport {
             if (st.discussing) {
                 emitter.send(SseEmitter.event().name("discussion_start").data(
                         Map.of("conversationId", conversationId), MediaType.APPLICATION_JSON));
+            }
+            if (st.pendingAgent != null) {
+                emitter.send(SseEmitter.event().name("reply_pending").data(
+                        Map.of("agentId", st.pendingAgent, "conversationId", conversationId),
+                        MediaType.APPLICATION_JSON));
             }
             for (Map.Entry<String, InFlightSegment> e : st.segments.entrySet()) {
                 emitter.send(SseEmitter.event().name("reply_start").data(
@@ -298,6 +315,43 @@ public class ConversationStreamSupport {
         };
     }
 
+    /**
+     * 联网活动 → SSE（web_activity，实时卡片）+ 收集进 {@link WebActivityLog}（随发言段落落库），
+     * 普通回复与编排协作共用。
+     */
+    public WebTools.WebActivityListener webListener(SseEmitter emitter, Supplier<String> conversationId,
+                                                    Agent agent, WebActivityLog log) {
+        return activity -> {
+            Map<String, Object> payload = new java.util.LinkedHashMap<>(activity);
+            payload.put("agentId", agent.getId());
+            payload.put("agentName", agent.getName());
+            payload.put("conversationId", conversationId.get());
+            send(emitter, "web_activity", payload);
+            // 落库只留 end 结果（含 sites/title/ok），start 半截事件仅用于实时提示
+            if ("end".equals(activity.get("phase"))) {
+                log.add(activity);
+            }
+        };
+    }
+
+    /** 一次发言的联网活动收集器：工具执行时逐条 add，段落开启时 drain 成 JSON 附着到消息 */
+    public static class WebActivityLog {
+
+        private final List<Map<String, Object>> items = new ArrayList<>();
+
+        public synchronized void add(Map<String, Object> item) {
+            items.add(item);
+        }
+
+        /** 序列化并清空；无活动返回 null（消息列保持 null，前端不渲染折叠条） */
+        public synchronized String drainToJson() {
+            if (items.isEmpty()) return null;
+            String json = Json.mapper().writeValueAsString(List.copyOf(items));
+            items.clear();
+            return json;
+        }
+    }
+
     /** 定时任务回合标注：随消息落库，前端据此显示来源任务徽标并支持按任务筛选；auto* 为该回合的审批放行策略；collab 表示协作任务（编排者必须委派成员，自己包揽不算实际执行） */
     public record TaskTag(String taskId, String taskName, boolean autoWrite, boolean autoShell, boolean collab) {
     }
@@ -327,15 +381,55 @@ public class ConversationStreamSupport {
     }
 
     public void persistError(Conversation conv, Agent agent, String error) {
+        persistError(conv, agent, error, null);
+    }
+
+    /** detail 非空时日志在用户文案基础上补全异常细节；用户消息保持简短提示不动 */
+    public void persistError(Conversation conv, Agent agent, String error, String detail) {
         saveMessage(conv, agent, error, "error");
-        appLogs.record(AppLog.TYPE_ERROR, conv.getId(), agent.getId(), error);
+        appLogs.record(AppLog.TYPE_ERROR, conv.getId(), agent.getId(), withDetail(error, detail));
     }
 
     public void markError(Message placeholder, String error) {
+        markError(placeholder, error, null);
+    }
+
+    public void markError(Message placeholder, String error, String detail) {
         placeholder.setType("error");
         placeholder.setContent(error);
         messages.save(placeholder);
-        appLogs.record(AppLog.TYPE_ERROR, placeholder.getConversationId(), placeholder.getSenderId(), error);
+        appLogs.record(AppLog.TYPE_ERROR, placeholder.getConversationId(), placeholder.getSenderId(),
+                withDetail(error, detail));
+    }
+
+    private static String withDetail(String error, String detail) {
+        return detail == null || detail.isBlank() ? error : error + "；完整报错：" + detail;
+    }
+
+    /**
+     * 异常的排障描述：从外层异常逐层追到根因，每层带「类型: 消息」（消息为空只记类型）。
+     * 消息给用户的是简短提示，日志靠它还原完整报错。
+     */
+    public static String errorDetail(Throwable e) {
+        StringBuilder sb = new StringBuilder();
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (sb.length() > 0) {
+                sb.append(" <- ");
+            }
+            sb.append(t.getClass().getSimpleName());
+            String msg = t.getMessage();
+            if (msg != null && !msg.isBlank()) {
+                sb.append(": ").append(msg);
+            }
+            if (sb.length() > 600) {
+                sb.append("…（已截断）");
+                break;
+            }
+            if (t.getCause() == t) {
+                break;
+            }
+        }
+        return sb.toString();
     }
 
     public void touchConversation(Conversation conv, Agent agent, String content) {
@@ -512,13 +606,17 @@ public class ConversationStreamSupport {
     }
 
 
-    /** 单次模型调用的超时上限，须小于各服务的整体运行上限（成员 4 分钟 / 编排 8 分钟） */
+    /**
+     * 模型调用无输出的上限：reactor Flux.timeout(Duration) 是块间空闲超时（每个块到达即重置），
+     * 不限制单次调用的总时长（总时长由传输层 responseTimeout 与各轮次 blockLast 上限约束）。
+     * 3 分钟没有任何输出基本等于连接已死。须小于各服务的整体运行上限。
+     */
     public static final Duration MODEL_CALL_TIMEOUT = Duration.ofMinutes(3);
 
     /**
-     * 单次模型调用的超时与重试策略（框架 ExecutionConfig）：
+     * 模型调用的超时与重试策略（框架 ExecutionConfig）：
      * 不设置时框架对模型调用既无超时也无重试；设置后对可重试错误（传输故障、可重试 HTTP 状态、超时、IO）
-     * 自动指数退避重试，单次调用超时以 ModelException 表达。整体运行上限仍由各服务的 blockLast 兜底。
+     * 自动指数退避重试，空闲超时以 ModelException 表达。整体运行上限仍由各服务的 blockLast 兜底。
      */
     public static ExecutionConfig modelCallExecutionConfig() {
         return ExecutionConfig.builder()
@@ -530,27 +628,65 @@ public class ConversationStreamSupport {
                 .build();
     }
 
+    /**
+     * 单次工具执行的时长上限：delegate 会同步执行整个成员轮（最长 memberMinutes），
+     * 框架工具默认上限仅 5 分钟（TOTAL），超过即取消工具并把成员轮以中断异常收场——
+     * 曾被误判成「协作已被用户终止」。放开到与成员轮上限（120 分钟）同量级；
+     * 工具失败/到点不自动重试（maxAttempts=1），交给编排者决策。
+     */
+    public static final Duration TOOL_CALL_TIMEOUT = Duration.ofMinutes(120);
+
+    public static ExecutionConfig toolCallExecutionConfig() {
+        return ExecutionConfig.builder()
+                .timeout(TOOL_CALL_TIMEOUT)
+                .maxAttempts(1)
+                .build();
+    }
+
     /** 整体运行上限的 blockLast 超时（reactor 特有，无类型化异常，只能按消息识别） */
     public static boolean isBlockingTimeout(Exception e) {
         return e instanceof IllegalStateException
                 && String.valueOf(e.getMessage()).contains("Timeout on blocking read");
     }
 
-    /** 用户已请求终止（stopRequested），或框架因 interrupt 抛出的中断错误（可能被包装在 cause 链里） */
-    public static boolean isCancelSignal(Throwable e, AtomicBoolean stopRequested) {
-        if (stopRequested.get()) return true;
-        for (Throwable t = e; t != null; t = t.getCause()) {
-            if (t instanceof InterruptedException) return true;
-        }
-        return false;
+    /**
+     * thinking_delta 事件载荷（推理模型的思考过程流式增量）：
+     * 占位/段落气泡已打开时带 messageId（前端把思考文本渲染进气泡），否则走独立思考条。
+     * 思考过程不落库、断线重连不重放，Map.of 不收 null 值故按条件构建。
+     */
+    public static Map<String, Object> thinkingPayload(String agentId, String conversationId, SegState seg, String delta) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("agentId", agentId);
+        payload.put("conversationId", conversationId);
+        if (seg.msg.get() != null) payload.put("messageId", seg.msg.get().getId());
+        payload.put("delta", delta);
+        return payload;
     }
 
     /** 一次回复中的一段发言：reply_start 到 reply_end 之间的增量文本；工具调用会把一次回复切成多段 */
     public static class SegState {
         public final AtomicReference<Message> msg = new AtomicReference<>();
         public final TextAccumulator text = new TextAccumulator();
+        /** 本段开启前的思考过程（推理模型，思考先于正文产出）：关闭时 drain 附着到本段消息 */
+        public final StringBuilder thinking = new StringBuilder();
+        /** 本段开启前的联网活动（工具在段与段之间执行）：开启时 drain 附着到本段消息 */
+        public final WebActivityLog webLog = new WebActivityLog();
         /** 已开启的段数（含进行中），用于判断整次回复是否完全空白；跨线程读写需 volatile */
         public volatile int opened;
+    }
+
+    /** 落库的思考过程上限：纯回看用途，超出截断防止单条消息过大 */
+    private static final int THINKING_MAX_CHARS = 20000;
+
+    /** 取走累计的思考过程全文并清空缓冲（超长截断加尾注），空返回 null */
+    public static String drainThinking(StringBuilder sb) {
+        if (sb.length() == 0) return null;
+        String s = sb.toString();
+        sb.setLength(0);
+        if (s.length() > THINKING_MAX_CHARS) {
+            s = s.substring(0, THINKING_MAX_CHARS) + "……[思考过长已截断]";
+        }
+        return s;
     }
 
     public void openSegment(SseEmitter emitter, Conversation conv, Agent agent, SegState seg) {
@@ -559,6 +695,11 @@ public class ConversationStreamSupport {
 
     public void openSegment(SseEmitter emitter, Conversation conv, Agent agent, SegState seg, TaskTag tag) {
         Message m = saveMessage(conv, agent, "", "text", tag);
+        // 工具活动发生在上一段关闭之后、本段开启之前，归到本段（模型正要基于这些结果发言）
+        m.setWebActivity(seg.webLog.drainToJson());
+        if (m.getWebActivity() != null) {
+            persist(m);
+        }
         send(emitter, "reply_start", Map.of(
                 "messageId", m.getId(),
                 "agentId", agent.getId(),
@@ -572,6 +713,8 @@ public class ConversationStreamSupport {
         if (m == null) return;
         String content = seg.text.getAccumulated();
         seg.text.reset();
+        // 无论本段是否空白都取走思考缓冲，避免残留进下一段
+        m.setThinking(drainThinking(seg.thinking));
         if (content.isBlank()) {
             markError(m, "（模型未返回内容）");
             send(emitter, "reply_error", Map.of(
@@ -584,10 +727,14 @@ public class ConversationStreamSupport {
         m.setContent(content);
         persist(m);
         touchConversation(conv, agent, content);
-        send(emitter, "reply_end", Map.of(
+        Map<String, Object> payload = new java.util.LinkedHashMap<>(Map.of(
                 "messageId", m.getId(),
                 "agentId", agent.getId(),
                 "content", content,
                 "conversationId", conv.getId()));
+        List<Map<String, Object>> webActivity = Json.readWebActivity(m.getWebActivity());
+        if (webActivity != null) payload.put("webActivity", webActivity);
+        if (m.getThinking() != null) payload.put("thinking", m.getThinking());
+        send(emitter, "reply_end", payload);
     }
 }

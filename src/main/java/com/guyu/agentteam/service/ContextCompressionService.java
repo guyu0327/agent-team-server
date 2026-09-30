@@ -236,9 +236,8 @@ public class ContextCompressionService {
             digest = digest.trim();
             return digest.length() > DIGEST_MAX ? digest.substring(0, DIGEST_MAX) + "…（摘要过长已截断）" : digest;
         } catch (Exception e) {
-            String err = e.getMessage() == null ? e.toString() : e.getMessage();
             appLogs.record(AppLog.TYPE_ERROR, conv.getId(), modelOwner.getId(),
-                    "上下文压缩失败，本轮按预算截断历史：" + err);
+                    "上下文压缩失败，本轮按预算截断历史：" + ConversationStreamSupport.errorDetail(e));
             return null;
         }
     }

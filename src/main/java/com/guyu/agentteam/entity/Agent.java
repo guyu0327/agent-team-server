@@ -25,6 +25,8 @@ public class Agent {
     private String imagePresetId;
     /** 为 true 时在聊天中作为团队编排者运行 AgentScope ReAct 循环 */
     private Boolean isOrchestrator;
+    /** 启用的技能 ID（skill 目录名），逗号分隔；空串=未启用任何技能 */
+    private String skillIds = "";
     private String systemPrompt;
     private Double temperature;
     private Long createdAt;

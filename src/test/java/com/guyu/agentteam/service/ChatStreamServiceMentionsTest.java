@@ -12,7 +12,7 @@ class ChatStreamServiceMentionsTest {
 
     private boolean mentions(String content, String name) throws Exception {
         ChatStreamService svc = new ChatStreamService(null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null, null, null, null, null);
         Method m = ChatStreamService.class.getDeclaredMethod("mentions", String.class, String.class);
         m.setAccessible(true);
         return (Boolean) m.invoke(svc, content, name);

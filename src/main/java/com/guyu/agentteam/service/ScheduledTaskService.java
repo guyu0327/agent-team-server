@@ -623,7 +623,7 @@ public class ScheduledTaskService {
             failCounts.remove(taskId);
         } catch (Exception e) {
             appLogs.record(AppLog.TYPE_ERROR, t.getConversationId(), t.getAgentId(),
-                    "定时任务「" + t.getName() + "」触发失败：" + (e.getMessage() == null ? e.toString() : e.getMessage()));
+                    "定时任务「" + t.getName() + "」触发失败：" + ConversationStreamSupport.errorDetail(e));
             if (ScheduledTask.KIND_ONCE.equals(t.getKind())) {
                 t.setStatus(ScheduledTask.STATUS_DONE);
                 saveIfPresent(t);

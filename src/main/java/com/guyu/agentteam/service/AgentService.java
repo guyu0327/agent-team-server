@@ -19,6 +19,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.stream.Collectors;
 
 @Service
 public class AgentService {
@@ -132,6 +133,9 @@ public class AgentService {
         a.setIsOrchestrator(Boolean.TRUE.equals(req.isOrchestrator()));
         a.setSystemPrompt(req.systemPrompt() == null ? "" : req.systemPrompt());
         a.setTemperature(req.temperature() == null ? 0.7 : req.temperature());
+        a.setSkillIds(req.skillIds() == null ? ""
+                : req.skillIds().stream().map(String::trim).filter(s -> !s.isEmpty()).distinct()
+                        .collect(Collectors.joining(",")));
     }
 
     private void deleteConversation(Conversation conv) {

@@ -2,6 +2,8 @@ package com.guyu.agentteam.controller;
 
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.common.SqlitePaths;
+import com.guyu.agentteam.dto.AnySearchConfigDto;
+import com.guyu.agentteam.dto.AnySearchStatusDto;
 import com.guyu.agentteam.dto.AsrStreamStatusDto;
 import com.guyu.agentteam.dto.ContextCompressionDto;
 import com.guyu.agentteam.dto.ContextCompressionRequest;
@@ -10,6 +12,7 @@ import com.guyu.agentteam.dto.CoordinationLimitsRequest;
 import com.guyu.agentteam.dto.WorkspaceSettingsDto;
 import com.guyu.agentteam.dto.WorkspaceSettingsRequest;
 import com.guyu.agentteam.dto.XfyunAsrConfigDto;
+import com.guyu.agentteam.service.AnySearchService;
 import com.guyu.agentteam.service.AsrStreamService;
 import com.guyu.agentteam.service.ContextCompressionService;
 import com.guyu.agentteam.service.CoordinationLimitsService;
@@ -18,6 +21,7 @@ import org.springframework.core.env.Environment;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -40,17 +44,20 @@ public class SettingsController {
 
     private final WorkspaceFileTools workspace;
     private final AsrStreamService asrStream;
+    private final AnySearchService anySearch;
     private final CoordinationLimitsService coordinationLimits;
     private final ContextCompressionService compression;
     private final DataSource dataSource;
     private final Environment env;
 
     public SettingsController(WorkspaceFileTools workspace, AsrStreamService asrStream,
+                              AnySearchService anySearch,
                               CoordinationLimitsService coordinationLimits,
                               ContextCompressionService compression,
                               DataSource dataSource, Environment env) {
         this.workspace = workspace;
         this.asrStream = asrStream;
+        this.anySearch = anySearch;
         this.coordinationLimits = coordinationLimits;
         this.compression = compression;
         this.dataSource = dataSource;
@@ -76,6 +83,22 @@ public class SettingsController {
     @PutMapping("/asr-stream")
     public AsrStreamStatusDto updateAsrStream(@RequestBody XfyunAsrConfigDto req) {
         return asrStream.saveConfig(req);
+    }
+
+    @GetMapping("/anysearch")
+    public AnySearchStatusDto anySearch() {
+        return anySearch.status();
+    }
+
+    @PutMapping("/anysearch")
+    public AnySearchStatusDto updateAnySearch(@RequestBody AnySearchConfigDto req) {
+        return anySearch.save(req);
+    }
+
+    /** 清除 Key 恢复匿名模式：单字段配置「留空=保持不变」，清除需要独立动词 */
+    @DeleteMapping("/anysearch")
+    public AnySearchStatusDto clearAnySearch() {
+        return anySearch.clear();
     }
 
     @GetMapping("/coordination")

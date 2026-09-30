@@ -4,6 +4,7 @@ import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
+import java.util.Map;
 
 /** 消息附件 JSON 与对象互转 */
 public final class Json {
@@ -41,6 +42,19 @@ public final class Json {
             return list == null ? List.of() : list;
         } catch (Exception e) {
             return List.of();
+        }
+    }
+
+    private static final TypeReference<List<Map<String, Object>>> MAP_LIST = new TypeReference<>() {
+    };
+
+    /** 解析联网活动 JSON（Message.webActivity）；空值或格式非法返回 null（前端据此不渲染折叠条） */
+    public static List<Map<String, Object>> readWebActivity(String json) {
+        if (json == null || json.isBlank()) return null;
+        try {
+            return MAPPER.readValue(json, MAP_LIST);
+        } catch (Exception e) {
+            return null;
         }
     }
 }
