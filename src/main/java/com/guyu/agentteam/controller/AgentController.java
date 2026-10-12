@@ -1,9 +1,12 @@
 package com.guyu.agentteam.controller;
 
 import com.guyu.agentteam.common.ApiException;
+import com.guyu.agentteam.dto.AgentAutoFillDto;
+import com.guyu.agentteam.dto.AgentAutoFillRequest;
 import com.guyu.agentteam.dto.AgentDto;
 import com.guyu.agentteam.dto.AgentMemoryDto;
 import com.guyu.agentteam.dto.AgentUpsertRequest;
+import com.guyu.agentteam.service.AgentAutoFillService;
 import com.guyu.agentteam.service.AgentMemoryService;
 import com.guyu.agentteam.service.AgentService;
 import org.springframework.http.HttpStatus;
@@ -25,10 +28,13 @@ public class AgentController {
 
     private final AgentService agentService;
     private final AgentMemoryService memoryService;
+    private final AgentAutoFillService autoFillService;
 
-    public AgentController(AgentService agentService, AgentMemoryService memoryService) {
+    public AgentController(AgentService agentService, AgentMemoryService memoryService,
+                           AgentAutoFillService autoFillService) {
         this.agentService = agentService;
         this.memoryService = memoryService;
+        this.autoFillService = autoFillService;
     }
 
     @GetMapping
@@ -40,6 +46,12 @@ public class AgentController {
     @ResponseStatus(HttpStatus.CREATED)
     public AgentDto create(@RequestBody AgentUpsertRequest req) {
         return agentService.create(req);
+    }
+
+    /** 一句话自动生成智能体基础配置（新建页用），模型预设与技能仍由用户手动选择 */
+    @PostMapping("/auto-fill")
+    public AgentAutoFillDto autoFill(@RequestBody AgentAutoFillRequest req) {
+        return autoFillService.generate(req);
     }
 
     @PutMapping("/{id}")

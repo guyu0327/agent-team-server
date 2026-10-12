@@ -135,7 +135,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 - 用户 / 智能体 / 模型预设 / 会话 / 消息完整 REST API
 - 单聊、群聊、群成员管理、解散、置顶、重命名、已读未读；群聊重置（`POST /{id}/reset`，按原群名/成员/聊天模式重建新群，旧群归档）；删除/解散/重置/开始新会话统一下沉为会话归档（历史会话），可恢复或彻底删除
-- OpenAI 兼容模型接入：每个智能体可关联不同预设、独立温度与角色设定
+- OpenAI 兼容模型接入：每个智能体可关联不同预设、独立温度与角色设定；预设支持一键测试连接与批量应用到多个智能体，新建智能体可由一句话加指定对话模型自动生成基础配置
 - 文生图：预设按协议分类（对话 / DashScope 文生图 / OpenAI Images 文生图），智能体绑定图像预设即获得 `generate_image` 工具，图片落工作区并在气泡中展示
 - 智能体技能：Markdown 技能文档（可带辅助文件）按目录管理，全局或逐智能体启用，三条构建链路注入系统提示；智能体可用 `install_skill`（审批后落库并默认自启用）与 `list_skills` 自助扩展能力
 - 联网工具：`web_search`（AnySearch，匿名即用、Key 可选）与 `fetch_webpage`（jsoup 正文提取）只读免审批，联网记录实时展示并随消息持久化
@@ -223,8 +223,8 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | 前缀 | 说明 |
 | --- | --- |
 | `/api/user` | 当前用户（老板）信息 |
-| `/api/agents` | 智能体 CRUD、长期记忆查看/清空（`/{id}/memories`） |
-| `/api/model-presets` | 模型预设 CRUD |
+| `/api/agents` | 智能体 CRUD、一句话自动生成基础配置（`POST /auto-fill`，`{prompt, presetId}` 结构化输出名称/头像/分组/简介/系统提示词/温度，仅对话预设）、长期记忆查看/清空（`/{id}/memories`） |
+| `/api/model-presets` | 模型预设 CRUD、测试连接（`POST /test`，用表单当前值发一条真实消息验证连通性，仅对话协议，密钥留空回落已存密钥）、批量应用到智能体（`POST /{id}/apply-agents`，对话预设写 `presetId`、文生图预设写 `imagePresetId`） |
 | `/api/conversations` | 会话、消息、SSE 流式回复、会话文件授权（`/{id}/files`）、受控操作审批（`/{id}/op-grant`）、历史会话归档/恢复（`/{id}/archive`、`/{id}/restore`）、群聊重置（`/{id}/reset`） |
 | `/api/tasks` | 定时任务 CRUD（`GET` 按会话分组、`POST` 创建、`PUT /{taskId}` 更新含暂停恢复、`DELETE /{taskId}`）、`/{taskId}/run` 立即执行一次、`/conversation/{id}` 会话任务列表、`/conversations` 任务会话列表（仅还剩任务的）、`/restore/{conversationId}` 从历史归档恢复任务 |
 | `/api/skills` | 技能 CRUD（`GET` 列表 / `GET /{skillId}` 详情含辅助文件 / `POST` 新建 / `PUT /{skillId}` 更新 / `DELETE /{skillId}` 删除）、使用范围（`PUT /{skillId}/scope`：全局或逐智能体勾选） |

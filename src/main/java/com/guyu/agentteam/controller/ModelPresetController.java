@@ -1,7 +1,11 @@
 package com.guyu.agentteam.controller;
 
 import com.guyu.agentteam.dto.ModelPresetDto;
+import com.guyu.agentteam.dto.ModelPresetTestRequest;
+import com.guyu.agentteam.dto.ModelPresetTestResult;
 import com.guyu.agentteam.dto.ModelPresetUpsertRequest;
+import com.guyu.agentteam.dto.PresetApplyAgentsRequest;
+import com.guyu.agentteam.dto.PresetApplyResult;
 import com.guyu.agentteam.service.ModelPresetService;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -40,6 +44,18 @@ public class ModelPresetController {
     @PutMapping("/{id}")
     public ModelPresetDto update(@PathVariable String id, @RequestBody ModelPresetUpsertRequest req) {
         return presetService.update(id, req);
+    }
+
+    /** 测试连接：用表单当前值（可未保存）发一条真实消息，仅支持对话预设 */
+    @PostMapping("/test")
+    public ModelPresetTestResult test(@RequestBody ModelPresetTestRequest req) {
+        return presetService.test(req);
+    }
+
+    /** 批量应用到智能体：对话预设写 presetId，文生图预设写 imagePresetId */
+    @PostMapping("/{id}/apply-agents")
+    public PresetApplyResult applyAgents(@PathVariable String id, @RequestBody PresetApplyAgentsRequest req) {
+        return presetService.applyToAgents(id, req);
     }
 
     @DeleteMapping("/{id}")
