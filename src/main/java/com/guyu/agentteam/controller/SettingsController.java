@@ -5,6 +5,8 @@ import com.guyu.agentteam.common.SqlitePaths;
 import com.guyu.agentteam.dto.AnySearchConfigDto;
 import com.guyu.agentteam.dto.AnySearchStatusDto;
 import com.guyu.agentteam.dto.AsrStreamStatusDto;
+import com.guyu.agentteam.dto.BrowserSettingsDto;
+import com.guyu.agentteam.dto.BrowserSettingsRequest;
 import com.guyu.agentteam.dto.ContextCompressionDto;
 import com.guyu.agentteam.dto.ContextCompressionRequest;
 import com.guyu.agentteam.dto.CoordinationLimitsDto;
@@ -14,6 +16,8 @@ import com.guyu.agentteam.dto.WorkspaceSettingsRequest;
 import com.guyu.agentteam.dto.XfyunAsrConfigDto;
 import com.guyu.agentteam.service.AnySearchService;
 import com.guyu.agentteam.service.AsrStreamService;
+import com.guyu.agentteam.service.BrowserService;
+import com.guyu.agentteam.service.BrowserSettingsService;
 import com.guyu.agentteam.service.ContextCompressionService;
 import com.guyu.agentteam.service.CoordinationLimitsService;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
@@ -47,6 +51,8 @@ public class SettingsController {
     private final AnySearchService anySearch;
     private final CoordinationLimitsService coordinationLimits;
     private final ContextCompressionService compression;
+    private final BrowserSettingsService browserSettings;
+    private final BrowserService browserService;
     private final DataSource dataSource;
     private final Environment env;
 
@@ -54,12 +60,15 @@ public class SettingsController {
                               AnySearchService anySearch,
                               CoordinationLimitsService coordinationLimits,
                               ContextCompressionService compression,
+                              BrowserSettingsService browserSettings, BrowserService browserService,
                               DataSource dataSource, Environment env) {
         this.workspace = workspace;
         this.asrStream = asrStream;
         this.anySearch = anySearch;
         this.coordinationLimits = coordinationLimits;
         this.compression = compression;
+        this.browserSettings = browserSettings;
+        this.browserService = browserService;
         this.dataSource = dataSource;
         this.env = env;
     }
@@ -120,6 +129,22 @@ public class SettingsController {
     @PutMapping("/context-compression")
     public ContextCompressionDto updateContextCompression(@RequestBody ContextCompressionRequest req) {
         return compression.save(req.enabled(), req.budgetChars());
+    }
+
+    /** 无头/围观设置：变更后立即关掉当前浏览器，下一次浏览器操作按新模式重开（白名单变更不影响运行中的浏览器） */
+    @GetMapping("/browser")
+    public BrowserSettingsDto browser() {
+        return BrowserSettingsDto.from(browserSettings.load());
+    }
+
+    @PutMapping("/browser")
+    public BrowserSettingsDto updateBrowser(@RequestBody BrowserSettingsRequest req) {
+        boolean headlessChanged = browserSettings.load().headless() != req.headless();
+        BrowserSettingsDto dto = BrowserSettingsDto.from(browserSettings.save(req.headless(), req.whitelist()));
+        if (headlessChanged) {
+            browserService.onSettingsChanged();
+        }
+        return dto;
     }
 
     /**

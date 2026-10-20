@@ -57,4 +57,14 @@ public final class Json {
             return null;
         }
     }
+
+    /** 解析浏览记录 JSON（Message.browseActivity）；空值或格式非法返回 null（前端据此不渲染折叠条） */
+    public static List<Map<String, Object>> readBrowseActivity(String json) {
+        if (json == null || json.isBlank()) return null;
+        try {
+            return MAPPER.readValue(json, MAP_LIST);
+        } catch (Exception e) {
+            return null;
+        }
+    }
 }

@@ -25,6 +25,7 @@ import com.guyu.agentteam.service.FileGrantService;
 import com.guyu.agentteam.service.MessageService;
 import com.guyu.agentteam.service.OpApprovalService;
 import com.guyu.agentteam.service.SkillSupport;
+import com.guyu.agentteam.service.tool.BrowserTools;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.ScheduledTaskTools;
@@ -90,6 +91,7 @@ public class OrchestrationService {
     private final SkillSupport skillSupport;
     private final com.guyu.agentteam.service.tool.WebTools webTools;
     private final com.guyu.agentteam.service.tool.SkillTools skillTools;
+    private final BrowserTools browserTools;
     /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
     private final Map<String, RunHandle> runs = new ConcurrentHashMap<>();
 
@@ -105,7 +107,8 @@ public class OrchestrationService {
                                 MessageService messageService, MessageRepository messages,
                                 SkillSupport skillSupport,
                                 com.guyu.agentteam.service.tool.WebTools webTools,
-                                com.guyu.agentteam.service.tool.SkillTools skillTools) {
+                                com.guyu.agentteam.service.tool.SkillTools skillTools,
+                                BrowserTools browserTools) {
         this.agents = agents;
         this.members = members;
         this.support = support;
@@ -126,6 +129,7 @@ public class OrchestrationService {
         this.skillSupport = skillSupport;
         this.webTools = webTools;
         this.skillTools = skillTools;
+        this.browserTools = browserTools;
     }
 
     public void run(SseEmitter emitter, Conversation conv, Agent orchestrator, ModelPreset preset,
@@ -226,7 +230,8 @@ public class OrchestrationService {
         boolean fromWechat = taskTag != null && taskTag.taskId() == null;
         OpRequestSink sink = (opType, opTarget, detail) -> {
             boolean allowed = approval.approve(emitter, orchestrator, target.get().getId(), opType, opTarget, detail,
-                    background, taskTag != null && taskTag.autoWrite(), taskTag != null && taskTag.autoShell());
+                    background, taskTag != null && taskTag.autoWrite(), taskTag != null && taskTag.autoShell(),
+                    taskTag != null && taskTag.autoBrowser());
             if (allowed) executed.set(true);
             return allowed;
         };
@@ -235,6 +240,8 @@ public class OrchestrationService {
         imageTools.register(toolkit, orchestrator, support.imageListener(emitter, () -> target.get().getId(), orchestrator));
         viewTools.register(toolkit, () -> target.get().getId());
         webTools.register(toolkit, support.webListener(emitter, () -> target.get().getId(), orchestrator, seg.webLog));
+        browserTools.register(toolkit, () -> target.get().getId(), sink,
+                support.browserListener(emitter, () -> target.get().getId(), orchestrator, seg.browseLog));
         skillTools.register(toolkit, orchestrator, sink);
         toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId, handle, executed, delegated));
         // 定时任务工具：会话跟随协作目标（建群后任务绑定项目群），创建的任务归编排者名下；
@@ -248,7 +255,8 @@ public class OrchestrationService {
 
         ReActAgent.Builder builder = ReActAgent.builder()
                 .name(orchestrator.getName())
-                .sysPrompt(buildSysPrompt(orchestrator, team, conv.getId(), background, fromWechat))
+                .sysPrompt(buildSysPrompt(orchestrator, team, conv.getId(), background, fromWechat,
+                        taskTag != null && taskTag.autoBrowser()))
                 .model(modelFactory.create(orchestrator, preset))
                 .toolkit(toolkit);
         skillSupport.applySkills(builder, orchestrator);
@@ -415,7 +423,7 @@ public class OrchestrationService {
     }
 
     private String buildSysPrompt(Agent orchestrator, List<Agent> team, String conversationId,
-                                  boolean background, boolean fromWechat) {
+                                  boolean background, boolean fromWechat, boolean autoBrowser) {
         StringBuilder sb = new StringBuilder();
         String base = orchestrator.getSystemPrompt();
         if (!Str.isBlank(base)) {
@@ -452,7 +460,8 @@ public class OrchestrationService {
         } else if (!team.isEmpty()) {
             sb.append("当前所有成员均不具备图像生成能力，涉及绘图的任务请自行完成或向用户说明。\n");
         }
-        sb.append(fileTools.promptNote(conversationId, background, fromWechat)).append("\n");
+        sb.append(fileTools.promptNote(conversationId, background, fromWechat)).append("\n\n")
+                .append(browserTools.promptNote(background, fromWechat, autoBrowser)).append("\n");
         String digest = compression.digestOf(conversationId);
         if (!Str.isBlank(digest)) {
             sb.append("\n【会话早期历史摘要】\n更早的完整对话已压缩为以下要点，请以此作为早期上下文：\n")
@@ -687,17 +696,23 @@ public class OrchestrationService {
             boolean memberBackground = tag != null;
             OpRequestSink memberSink = (opType, opTarget, detail) ->
                     approval.approve(emitter, targetAgent, conv.getId(), opType, opTarget, detail,
-                            memberBackground, tag != null && tag.autoWrite(), tag != null && tag.autoShell());
+                            memberBackground, tag != null && tag.autoWrite(), tag != null && tag.autoShell(),
+                            tag != null && tag.autoBrowser());
             Toolkit memberToolkit = new Toolkit();
             memberToolkit.registerTool(fileTools.toolsFor(conv.getId(), memberSink));
             fileTools.registerShellTool(memberToolkit, conv::getId, memberSink);
             imageTools.register(memberToolkit, targetAgent, support.imageListener(emitter, conv::getId, targetAgent));
-            // 成员整轮只有一条消息（placeholder）：联网活动收集到局部 log，落库时一次性附着
+            // 成员整轮只有一条消息（placeholder）：联网活动与浏览记录收集到局部 log，落库时一次性附着
             ConversationStreamSupport.WebActivityLog memberWeb = new ConversationStreamSupport.WebActivityLog();
             webTools.register(memberToolkit, support.webListener(emitter, conv::getId, targetAgent, memberWeb));
+            ConversationStreamSupport.WebActivityLog memberBrowse = new ConversationStreamSupport.WebActivityLog();
+            browserTools.register(memberToolkit, conv::getId, memberSink,
+                    support.browserListener(emitter, conv::getId, targetAgent, memberBrowse));
             skillTools.register(memberToolkit, targetAgent, memberSink);
-            String memberNote = fileTools.promptNote(conv.getId(), memberBackground,
-                    tag != null && tag.taskId() == null);
+            boolean memberFromWechat = tag != null && tag.taskId() == null;
+            String memberNote = fileTools.promptNote(conv.getId(), memberBackground, memberFromWechat)
+                    + "\n\n" + browserTools.promptNote(memberBackground, memberFromWechat,
+                            tag != null && tag.autoBrowser());
             String memberSysPrompt = Str.isBlank(targetAgent.getSystemPrompt())
                     ? memberNote
                     : targetAgent.getSystemPrompt().trim() + "\n\n" + memberNote;
@@ -794,6 +809,7 @@ public class OrchestrationService {
                 } else {
                     placeholder.setContent(acc.getAccumulated());
                     placeholder.setWebActivity(memberWeb.drainToJson());
+                    placeholder.setBrowseActivity(memberBrowse.drainToJson());
                     placeholder.setThinking(ConversationStreamSupport.drainThinking(memberThinking));
                     support.persist(placeholder);
                     support.touchConversation(conv, targetAgent, acc.getAccumulated());
@@ -816,6 +832,7 @@ public class OrchestrationService {
             }
             placeholder.setContent(full);
             placeholder.setWebActivity(memberWeb.drainToJson());
+            placeholder.setBrowseActivity(memberBrowse.drainToJson());
             placeholder.setThinking(ConversationStreamSupport.drainThinking(memberThinking));
             support.persist(placeholder);
             support.touchConversation(conv, targetAgent, full);
@@ -834,6 +851,9 @@ public class OrchestrationService {
             List<Map<String, Object>> webActivity =
                     com.guyu.agentteam.common.Json.readWebActivity(placeholder.getWebActivity());
             if (webActivity != null) payload.put("webActivity", webActivity);
+            List<Map<String, Object>> browseActivity =
+                    com.guyu.agentteam.common.Json.readBrowseActivity(placeholder.getBrowseActivity());
+            if (browseActivity != null) payload.put("browseActivity", browseActivity);
             if (!Str.isBlank(placeholder.getThinking())) payload.put("thinking", placeholder.getThinking());
             support.send(emitter, "reply_end", payload);
         }

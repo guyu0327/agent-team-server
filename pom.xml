@@ -107,6 +107,14 @@
             <artifactId>jsoup</artifactId>
             <version>1.23.2</version>
         </dependency>
+
+        <!-- 浏览器自动化（browser_* 工具）：经 channel 驱动系统已装 Edge/Chrome，不下载浏览器；
+             jar 内嵌 Node driver（增重约 50MB），ariaSnapshot 供模型按 ref 操作页面 -->
+        <dependency>
+            <groupId>com.microsoft.playwright</groupId>
+            <artifactId>playwright</artifactId>
+            <version>1.63.0</version>
+        </dependency>
     </dependencies>
 
     <build>

@@ -93,7 +93,12 @@ public class ScheduledTaskTools {
                 @ToolParam(name = "auto_shell", required = false,
                         description = "Whether background trigger rounds may auto-approve shell command execution. "
                                 + "Default false: without it, shell commands are rejected in background rounds")
-                Boolean autoShell) {
+                Boolean autoShell,
+                @ToolParam(name = "auto_browser", required = false,
+                        description = "Whether background trigger rounds may auto-approve opening web pages with "
+                                + "the browser tools. Default false: without it, browser_open is rejected in "
+                                + "background rounds")
+                Boolean autoBrowser) {
             String trigger = activeTriggerTaskName.get();
             if (trigger != null) {
                 return "当前回合是定时任务「" + trigger + "」到点的自动触发，该任务已存在并正在执行，"
@@ -101,10 +106,11 @@ public class ScheduledTaskTools {
             }
             TaskDto t = scheduledTasks.create(com.guyu.agentteam.common.CurrentUser.ID, new TaskUpsertRequest(
                     agentId.get(), memberIds, name, content, kind, runAt, timeOfDay, daysOfWeek, intervalMinutes,
-                    null, null, null, autoWrite, autoShell));
+                    null, null, null, autoWrite, autoShell, autoBrowser));
             return "定时任务已创建：" + t.name() + "（" + kindLabel(t) + "），下次触发时间戳 " + t.nextRunAt()
                     + "。后台触发回合的受控操作策略：写改文件" + (t.autoWrite() ? "自动放行" : "自动拒绝")
                     + "、终端命令" + (t.autoShell() ? "自动放行" : "自动拒绝")
+                    + "、打开网页" + (t.autoBrowser() ? "自动放行" : "自动拒绝")
                     + "。请向用户确认任务内容、时间和该策略。";
         }
 
@@ -135,7 +141,7 @@ public class ScheduledTaskTools {
                 @ToolParam(name = "status", required = false, description = "'active' or 'paused'") String status) {
             TaskDto t = scheduledTasks.update(taskId, new TaskUpsertRequest(
                     null, null, name, content, null, runAt, timeOfDay, daysOfWeek, intervalMinutes, status,
-                    null, null, null, null));
+                    null, null, null, null, null));
             return "定时任务已更新：" + t.name() + "（" + kindLabel(t) + "），状态 " + t.status() + "。";
         }
 

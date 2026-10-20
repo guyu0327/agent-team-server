@@ -26,6 +26,8 @@ public class Message {
     private String taskName;
     /** 联网活动 JSON：[{"tool":"web_search","query":"…","sites":[…]},{"tool":"fetch_webpage","url":"…","title":"…"}]，无活动为 null */
     private String webActivity;
+    /** 浏览记录 JSON：[{"tool":"browser_open","url":"…","title":"…","ok":true,"screenshot":"…"}]，无浏览为 null */
+    private String browseActivity;
     /** 思考过程全文（推理模型）：仅回看展示，不进对话上下文；超长截断，无思考为 null */
     private String thinking;
     private Long createdAt;

@@ -451,9 +451,10 @@ public class WechatChannelService {
         while (stream.isRunning(conv.getId()) && System.currentTimeMillis() < deadline) {
             sleepQuiet(500);
         }
-        // 后台回合：无人盯审批，按通道配置自动放行或立即拒绝（默认都不放行），决定记运行日志
+        // 后台回合：无人盯审批，按通道配置自动放行或立即拒绝（默认都不放行），决定记运行日志；
+        // 微信轮浏览器操作始终不放行（autoBrowser=false），提示词里已引导改用 web_search/fetch_webpage
         stream.stream(new ConversationStreamSupport.Broadcast(conv.getId()), conv, userMsg,
-                new ConversationStreamSupport.TaskTag(null, null, s.autoWrite(), s.autoShell(), false));
+                new ConversationStreamSupport.TaskTag(null, null, s.autoWrite(), s.autoShell(), false, false));
         // 等回合真正开跑（executor 异步提交，isRunning 置位在任务线程里；超时兜底防卡死）
         long startWait = System.currentTimeMillis();
         while (!stream.isRunning(conv.getId()) && System.currentTimeMillis() - startWait < 10_000) {

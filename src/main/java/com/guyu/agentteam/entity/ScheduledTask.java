@@ -52,5 +52,7 @@ public class ScheduledTask {
     private boolean autoWrite = true;
     /** 后台触发回合自动放行执行终端命令（风险更高，默认关） */
     private boolean autoShell = false;
+    /** 后台触发回合自动放行浏览器操作（打开网页，默认关） */
+    private boolean autoBrowser = false;
     private Long createdAt;
 }

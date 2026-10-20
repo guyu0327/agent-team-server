@@ -334,6 +334,25 @@ public class ConversationStreamSupport {
         };
     }
 
+    /**
+     * 浏览器操作 → SSE（browser_activity，实时提示）+ 收集进 {@link WebActivityLog}（随发言段落落库），
+     * 与联网活动同一套双通道机制。
+     */
+    public WebTools.WebActivityListener browserListener(SseEmitter emitter, Supplier<String> conversationId,
+                                                        Agent agent, WebActivityLog log) {
+        return activity -> {
+            Map<String, Object> payload = new java.util.LinkedHashMap<>(activity);
+            payload.put("agentId", agent.getId());
+            payload.put("agentName", agent.getName());
+            payload.put("conversationId", conversationId.get());
+            send(emitter, "browser_activity", payload);
+            // 落库只留 end 结果（含 title/ok/screenshot），start 半截事件仅用于实时提示
+            if ("end".equals(activity.get("phase"))) {
+                log.add(activity);
+            }
+        };
+    }
+
     /** 一次发言的联网活动收集器：工具执行时逐条 add，段落开启时 drain 成 JSON 附着到消息 */
     public static class WebActivityLog {
 
@@ -353,7 +372,8 @@ public class ConversationStreamSupport {
     }
 
     /** 定时任务回合标注：随消息落库，前端据此显示来源任务徽标并支持按任务筛选；auto* 为该回合的审批放行策略；collab 表示协作任务（编排者必须委派成员，自己包揽不算实际执行） */
-    public record TaskTag(String taskId, String taskName, boolean autoWrite, boolean autoShell, boolean collab) {
+    public record TaskTag(String taskId, String taskName, boolean autoWrite, boolean autoShell,
+                          boolean autoBrowser, boolean collab) {
     }
 
     public Message saveMessage(Conversation conv, Agent agent, String content, String type) {
@@ -671,6 +691,8 @@ public class ConversationStreamSupport {
         public final StringBuilder thinking = new StringBuilder();
         /** 本段开启前的联网活动（工具在段与段之间执行）：开启时 drain 附着到本段消息 */
         public final WebActivityLog webLog = new WebActivityLog();
+        /** 本段开启前的浏览器操作记录（同 webLog 机制）：开启时 drain 附着到本段消息 */
+        public final WebActivityLog browseLog = new WebActivityLog();
         /** 已开启的段数（含进行中），用于判断整次回复是否完全空白；跨线程读写需 volatile */
         public volatile int opened;
     }
@@ -697,7 +719,8 @@ public class ConversationStreamSupport {
         Message m = saveMessage(conv, agent, "", "text", tag);
         // 工具活动发生在上一段关闭之后、本段开启之前，归到本段（模型正要基于这些结果发言）
         m.setWebActivity(seg.webLog.drainToJson());
-        if (m.getWebActivity() != null) {
+        m.setBrowseActivity(seg.browseLog.drainToJson());
+        if (m.getWebActivity() != null || m.getBrowseActivity() != null) {
             persist(m);
         }
         send(emitter, "reply_start", Map.of(
@@ -734,6 +757,8 @@ public class ConversationStreamSupport {
                 "conversationId", conv.getId()));
         List<Map<String, Object>> webActivity = Json.readWebActivity(m.getWebActivity());
         if (webActivity != null) payload.put("webActivity", webActivity);
+        List<Map<String, Object>> browseActivity = Json.readBrowseActivity(m.getBrowseActivity());
+        if (browseActivity != null) payload.put("browseActivity", browseActivity);
         if (m.getThinking() != null) payload.put("thinking", m.getThinking());
         send(emitter, "reply_end", payload);
     }

@@ -14,6 +14,7 @@ import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.repository.ScheduledTaskRepository;
 import com.guyu.agentteam.service.orchestration.AgentModelFactory;
 import com.guyu.agentteam.service.orchestration.OrchestrationService;
+import com.guyu.agentteam.service.tool.BrowserTools;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.ScheduledTaskTools;
@@ -86,6 +87,7 @@ public class ChatStreamService {
     private final SkillSupport skillSupport;
     private final WebTools webTools;
     private final SkillTools skillTools;
+    private final BrowserTools browserTools;
 
     public ChatStreamService(ConversationMemberRepository members,
                              AgentRepository agents, AgentModelFactory modelFactory,
@@ -97,7 +99,7 @@ public class ChatStreamService {
                              ContextCompressionService compression, AgentMemoryService memoryService,
                              ScheduledTaskTools taskTools, ScheduledTaskRepository tasks,
                              SkillSupport skillSupport, WebTools webTools,
-                             SkillTools skillTools) {
+                             SkillTools skillTools, BrowserTools browserTools) {
         this.members = members;
         this.agents = agents;
         this.modelFactory = modelFactory;
@@ -116,6 +118,7 @@ public class ChatStreamService {
         this.skillSupport = skillSupport;
         this.webTools = webTools;
         this.skillTools = skillTools;
+        this.browserTools = browserTools;
     }
 
     public void stream(SseEmitter emitter, Conversation conv, Message userMsg) {
@@ -139,18 +142,20 @@ public class ChatStreamService {
                     handle.taskTag = externalTag;
                 } else if (userMsg.getTaskId() != null) {
                     // 定时任务触发的回合（合成用户消息带 taskId）：本轮全部落库消息继承任务标注，
-                    // 并携带任务的审批放行策略（后台无人盯审批，写改/命令按任务配置自动放行或快速拒绝）
+                    // 并携带任务的审批放行策略（后台无人盯审批，写改/命令/网页按任务配置自动放行或快速拒绝）
                     boolean autoWrite = true;
                     boolean autoShell = false;
+                    boolean autoBrowser = false;
                     boolean collab = false;
                     ScheduledTask task = tasks.findById(userMsg.getTaskId()).orElse(null);
                     if (task != null) {
                         autoWrite = task.isAutoWrite();
                         autoShell = task.isAutoShell();
+                        autoBrowser = task.isAutoBrowser();
                         collab = ScheduledTask.MODE_COLLAB.equals(task.getMode());
                     }
                     handle.taskTag = new ConversationStreamSupport.TaskTag(
-                            userMsg.getTaskId(), userMsg.getTaskName(), autoWrite, autoShell, collab);
+                            userMsg.getTaskId(), userMsg.getTaskName(), autoWrite, autoShell, autoBrowser, collab);
                 }
                 runs.put(conv.getId(), handle);
                 if (freeChain) {
@@ -318,7 +323,8 @@ public class ChatStreamService {
         // 提示词必须据实区分——把微信聊天说成定时任务触发会让模型拿触发模式去套正常消息
         boolean fromWechat = tag != null && tag.taskId() == null;
         String base = Str.isBlank(agent.getSystemPrompt()) ? "" : agent.getSystemPrompt().trim();
-        String note = fileTools.promptNote(conversationId, background, fromWechat);
+        String note = fileTools.promptNote(conversationId, background, fromWechat)
+                + "\n\n" + browserTools.promptNote(background, fromWechat, tag != null && tag.autoBrowser());
         String sys = Str.isBlank(base) ? note : base + "\n\n" + note;
         // 微信聊天轮不注入定时任务机制：任务结果只落应用内任务会话，微信用户永远看不到，
         // 提示与工具只剩误导（曾致模型幻觉「已创建喝水提醒」、拿触发视角误读普通聊天）
@@ -354,13 +360,16 @@ public class ChatStreamService {
         boolean background = tag != null;
         OpRequestSink sink = (opType, target, detail) ->
                 approval.approve(emitter, agent, conv.getId(), opType, target, detail,
-                        background, tag != null && tag.autoWrite(), tag != null && tag.autoShell());
+                        background, tag != null && tag.autoWrite(), tag != null && tag.autoShell(),
+                        tag != null && tag.autoBrowser());
         Toolkit toolkit = new Toolkit();
         toolkit.registerTool(fileTools.toolsFor(conv.getId(), sink));
         fileTools.registerShellTool(toolkit, conv::getId, sink);
         imageTools.register(toolkit, agent, support.imageListener(emitter, conv::getId, agent));
         viewTools.register(toolkit, conv::getId);
         webTools.register(toolkit, support.webListener(emitter, conv::getId, agent, seg.webLog));
+        browserTools.register(toolkit, conv::getId, sink,
+                support.browserListener(emitter, conv::getId, agent, seg.browseLog));
         skillTools.register(toolkit, agent, sink);
         boolean fromWechat = tag != null && tag.taskId() == null;
         if (!fromWechat) {

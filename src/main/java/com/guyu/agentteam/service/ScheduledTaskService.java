@@ -66,7 +66,7 @@ public class ScheduledTaskService {
     record TaskSnapshot(String agentId, List<String> memberIds, String name, String content,
                         String kind, Long runAt, String timeOfDay, String daysOfWeek,
                         Integer intervalMinutes, String mode, Boolean catchUp,
-                        Boolean autoWrite, Boolean autoShell) {
+                        Boolean autoWrite, Boolean autoShell, Boolean autoBrowser) {
     }
 
     private final ScheduledTaskRepository tasks;
@@ -218,9 +218,10 @@ public class ScheduledTaskService {
         t.setIntervalMinutes(req.intervalMinutes());
         t.setMode(mode);
         t.setCatchUp(Boolean.TRUE.equals(req.catchUp()));
-        // 后台无人盯审批：写改文件默认自动放行，执行命令默认不放行
+        // 后台无人盯审批：写改文件默认自动放行，执行命令与网页浏览默认不放行
         t.setAutoWrite(req.autoWrite() == null || req.autoWrite());
         t.setAutoShell(Boolean.TRUE.equals(req.autoShell()));
+        t.setAutoBrowser(Boolean.TRUE.equals(req.autoBrowser()));
         t.setStatus(ScheduledTask.STATUS_ACTIVE);
         t.setCreatedAt(now);
         t.setNextRunAt(computeNext(t, now));
@@ -287,6 +288,9 @@ public class ScheduledTaskService {
         }
         if (req.autoShell() != null) {
             t.setAutoShell(req.autoShell());
+        }
+        if (req.autoBrowser() != null) {
+            t.setAutoBrowser(req.autoBrowser());
         }
 
         if (req.status() != null && (ScheduledTask.STATUS_PAUSED.equals(req.status())
@@ -362,7 +366,8 @@ public class ScheduledTaskService {
                     .filter(id -> !id.equals(t.getAgentId())).toList();
             return MAPPER.writeValueAsString(new TaskSnapshot(t.getAgentId(), memberIds, t.getName(),
                     t.getContent(), t.getKind(), t.getRunAt(), t.getTimeOfDay(), t.getDaysOfWeek(),
-                    t.getIntervalMinutes(), t.getMode(), t.isCatchUp(), t.isAutoWrite(), t.isAutoShell()));
+                    t.getIntervalMinutes(), t.getMode(), t.isCatchUp(), t.isAutoWrite(), t.isAutoShell(),
+                    t.isAutoBrowser()));
         } catch (Exception e) {
             throw new IllegalStateException("任务快照序列化失败", e);
         }
@@ -394,7 +399,7 @@ public class ScheduledTaskService {
                 : s.mode();
         TaskDto dto = create(CurrentUser.ID, new TaskUpsertRequest(s.agentId(), s.memberIds(), s.name(),
                 s.content(), s.kind(), runAt, s.timeOfDay(), s.daysOfWeek(), s.intervalMinutes(), null,
-                mode, s.catchUp() != null && s.catchUp(), s.autoWrite(), s.autoShell()));
+                mode, s.catchUp() != null && s.catchUp(), s.autoWrite(), s.autoShell(), s.autoBrowser()));
         long now = System.currentTimeMillis();
         messages.reassignMessagesToTask(archive.getId(), dto.conversationId(), dto.id(), dto.name());
         members.findByConversationIdOrderByCreatedAtAsc(archive.getId()).forEach(members::delete);
