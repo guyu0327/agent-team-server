@@ -37,6 +37,8 @@ import io.agentscope.core.event.AgentEventType;
 import io.agentscope.core.event.AgentResultEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.ThinkingBlockDeltaEvent;
+import io.agentscope.core.event.ToolCallStartEvent;
+import io.agentscope.core.event.ToolResultEndEvent;
 import io.agentscope.core.memory.LongTermMemoryMode;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
@@ -291,6 +293,21 @@ public class OrchestrationService {
                         } else if (e.getType() == AgentEventType.TOOL_CALL_START) {
                             // 工具调用会把一次发言切成多段：先收口当前文本段
                             support.closeSegment(emitter, target.get(), orchestrator, seg);
+                            String tool = ((ToolCallStartEvent) e).getToolCallName();
+                            if (!ConversationStreamSupport.selfReportedTool(tool)) {
+                                support.toolActivity(emitter, target.get(), orchestrator, seg, tool, true, null, null);
+                            }
+                        } else if (e.getType() == AgentEventType.TOOL_RESULT_END) {
+                            ToolResultEndEvent endEv = (ToolResultEndEvent) e;
+                            String tool = endEv.getToolCallName();
+                            if (!ConversationStreamSupport.selfReportedTool(tool)) {
+                                support.toolActivity(emitter, target.get(), orchestrator, seg, tool, false, endEv.getState(),
+                                        ConversationStreamSupport.takeToolArgs(endEv.getToolCallId(),
+                                                seg.toolArgs, seg.toolArgBuf));
+                            }
+                        } else if (e.getType() == AgentEventType.TOOL_CALL_DELTA
+                                || e.getType() == AgentEventType.TOOL_CALL_END) {
+                            ConversationStreamSupport.accumulateToolArgs(e, seg.toolArgBuf, seg.toolArgs);
                         }
                     })
                     .blockLast(Duration.ofMinutes(limitsService.load().overallMinutes()));
@@ -708,6 +725,9 @@ public class OrchestrationService {
             ConversationStreamSupport.WebActivityLog memberBrowse = new ConversationStreamSupport.WebActivityLog();
             browserTools.register(memberToolkit, conv::getId, memberSink,
                     support.browserListener(emitter, conv::getId, targetAgent, memberBrowse));
+            ConversationStreamSupport.WebActivityLog memberTools = new ConversationStreamSupport.WebActivityLog();
+            Map<String, Map<String, Object>> memberArgs = new java.util.concurrent.ConcurrentHashMap<>();
+            Map<String, StringBuilder> memberArgBuf = new java.util.concurrent.ConcurrentHashMap<>();
             skillTools.register(memberToolkit, targetAgent, memberSink);
             boolean memberFromWechat = tag != null && tag.taskId() == null;
             String memberNote = fileTools.promptNote(conv.getId(), memberBackground, memberFromWechat)
@@ -754,6 +774,22 @@ public class OrchestrationService {
                                         "conversationId", conv.getId(),
                                         "messageId", placeholder.getId(),
                                         "delta", ((ThinkingBlockDeltaEvent) ev).getDelta()));
+                            } else if (ev.getType() == AgentEventType.TOOL_CALL_START) {
+                                String tool = ((ToolCallStartEvent) ev).getToolCallName();
+                                if (!ConversationStreamSupport.selfReportedTool(tool)) {
+                                    support.toolActivity(emitter, conv.getId(), targetAgent, memberTools, tool, true, null, null);
+                                }
+                            } else if (ev.getType() == AgentEventType.TOOL_RESULT_END) {
+                                ToolResultEndEvent end = (ToolResultEndEvent) ev;
+                                String tool = end.getToolCallName();
+                                if (!ConversationStreamSupport.selfReportedTool(tool)) {
+                                    support.toolActivity(emitter, conv.getId(), targetAgent, memberTools, tool, false, end.getState(),
+                                            ConversationStreamSupport.takeToolArgs(end.getToolCallId(),
+                                                    memberArgs, memberArgBuf));
+                                }
+                            } else if (ev.getType() == AgentEventType.TOOL_CALL_DELTA
+                                    || ev.getType() == AgentEventType.TOOL_CALL_END) {
+                                ConversationStreamSupport.accumulateToolArgs(ev, memberArgBuf, memberArgs);
                             } else if (ev.getType() == AgentEventType.AGENT_RESULT) {
                                 result.set(((AgentResultEvent) ev).getResult());
                             }
@@ -810,6 +846,7 @@ public class OrchestrationService {
                     placeholder.setContent(acc.getAccumulated());
                     placeholder.setWebActivity(memberWeb.drainToJson());
                     placeholder.setBrowseActivity(memberBrowse.drainToJson());
+                    placeholder.setToolActivity(memberTools.drainToJson());
                     placeholder.setThinking(ConversationStreamSupport.drainThinking(memberThinking));
                     support.persist(placeholder);
                     support.touchConversation(conv, targetAgent, acc.getAccumulated());
@@ -833,6 +870,7 @@ public class OrchestrationService {
             placeholder.setContent(full);
             placeholder.setWebActivity(memberWeb.drainToJson());
             placeholder.setBrowseActivity(memberBrowse.drainToJson());
+            placeholder.setToolActivity(memberTools.drainToJson());
             placeholder.setThinking(ConversationStreamSupport.drainThinking(memberThinking));
             support.persist(placeholder);
             support.touchConversation(conv, targetAgent, full);
@@ -854,6 +892,9 @@ public class OrchestrationService {
             List<Map<String, Object>> browseActivity =
                     com.guyu.agentteam.common.Json.readBrowseActivity(placeholder.getBrowseActivity());
             if (browseActivity != null) payload.put("browseActivity", browseActivity);
+            List<Map<String, Object>> toolActivity =
+                    com.guyu.agentteam.common.Json.readToolActivity(placeholder.getToolActivity());
+            if (toolActivity != null) payload.put("toolActivity", toolActivity);
             if (!Str.isBlank(placeholder.getThinking())) payload.put("thinking", placeholder.getThinking());
             support.send(emitter, "reply_end", payload);
         }

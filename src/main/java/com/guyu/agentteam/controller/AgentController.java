@@ -5,6 +5,7 @@ import com.guyu.agentteam.dto.AgentAutoFillDto;
 import com.guyu.agentteam.dto.AgentAutoFillRequest;
 import com.guyu.agentteam.dto.AgentDto;
 import com.guyu.agentteam.dto.AgentMemoryDto;
+import com.guyu.agentteam.dto.AgentMemoryUpsertRequest;
 import com.guyu.agentteam.dto.AgentUpsertRequest;
 import com.guyu.agentteam.service.AgentAutoFillService;
 import com.guyu.agentteam.service.AgentMemoryService;
@@ -69,6 +70,25 @@ public class AgentController {
     @GetMapping("/{id}/memories")
     public List<AgentMemoryDto> memories(@PathVariable String id) {
         return memoryService.list(id);
+    }
+
+    /** 手动新增一条记忆（详情页「记忆数据」管理） */
+    @PostMapping("/{id}/memories")
+    @ResponseStatus(HttpStatus.CREATED)
+    public AgentMemoryDto addMemory(@PathVariable String id, @RequestBody AgentMemoryUpsertRequest req) {
+        return memoryService.create(id, req.content());
+    }
+
+    @PutMapping("/{id}/memories/{memoryId}")
+    public AgentMemoryDto updateMemory(@PathVariable String id, @PathVariable String memoryId,
+                                       @RequestBody AgentMemoryUpsertRequest req) {
+        return memoryService.update(id, memoryId, req.content());
+    }
+
+    @DeleteMapping("/{id}/memories/{memoryId}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void deleteMemory(@PathVariable String id, @PathVariable String memoryId) {
+        memoryService.deleteOne(id, memoryId);
     }
 
     @DeleteMapping("/{id}/memories")

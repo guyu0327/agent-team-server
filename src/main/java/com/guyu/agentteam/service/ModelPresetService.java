@@ -36,6 +36,9 @@ public class ModelPresetService {
     public static final List<String> SUPPORTED_PROTOCOLS =
             List.of(PROTOCOL_CHAT, PROTOCOL_DASHSCOPE_IMAGE, PROTOCOL_OPENAI_IMAGE, PROTOCOL_SILICONFLOW_IMAGE);
 
+    /** reasoning_effort 合法取值（OpenAI 规范）；空串表示不发送该参数 */
+    public static final List<String> SUPPORTED_REASONING_EFFORTS = List.of("low", "medium", "high");
+
     private static final Duration TEST_TIMEOUT = Duration.ofSeconds(30);
     private static final int TEST_REPLY_MAX = 200;
 
@@ -112,11 +115,13 @@ public class ModelPresetService {
                 apiKey = stored.getApiKey();
             }
         }
+        String effort = normalizeEffort(req.reasoningEffort());
         ModelPreset probe = new ModelPreset();
         probe.setName(req.name().trim());
         probe.setProtocol(PROTOCOL_CHAT);
         probe.setBaseUrl(req.baseUrl().trim());
         probe.setApiKey(apiKey);
+        probe.setReasoningEffort(effort);
         long start = System.currentTimeMillis();
         try (ReActAgent tester = ReActAgent.builder()
                 .name("preset-tester")
@@ -201,6 +206,15 @@ public class ModelPresetService {
         if (!Str.isBlank(req.protocol()) && !SUPPORTED_PROTOCOLS.contains(req.protocol().trim())) {
             throw ApiException.badRequest("不支持的预设类型：" + req.protocol());
         }
+        if (!Str.isBlank(req.reasoningEffort())
+                && !SUPPORTED_REASONING_EFFORTS.contains(req.reasoningEffort().trim().toLowerCase())) {
+            throw ApiException.badRequest("不支持的推理强度：" + req.reasoningEffort() + "，可选 low/medium/high");
+        }
+    }
+
+    /** reasoning_effort 归一化：null/空白按不发送处理，其余小写 */
+    private static String normalizeEffort(String value) {
+        return Str.isBlank(value) ? "" : value.trim().toLowerCase();
     }
 
 
@@ -209,6 +223,7 @@ public class ModelPresetService {
         p.setProtocol(Str.isBlank(req.protocol()) ? PROTOCOL_CHAT : req.protocol().trim());
         p.setBaseUrl(req.baseUrl().trim());
         p.setRemark(req.remark() == null ? "" : req.remark().trim());
+        p.setReasoningEffort(normalizeEffort(req.reasoningEffort()));
         if (req.apiKey() != null && !req.apiKey().isBlank()) {
             p.setApiKey(req.apiKey().trim());
         } else if (isCreate) {

@@ -131,7 +131,7 @@ public class SettingsController {
         return compression.save(req.enabled(), req.budgetChars());
     }
 
-    /** 无头/围观设置：变更后立即关掉当前浏览器，下一次浏览器操作按新模式重开（白名单变更不影响运行中的浏览器） */
+    /** 无头/围观与登录态设置：无头变更后立即关掉当前浏览器，下一次浏览器操作按新模式重开（白名单/登录态变更不影响运行中的浏览器） */
     @GetMapping("/browser")
     public BrowserSettingsDto browser() {
         return BrowserSettingsDto.from(browserSettings.load());
@@ -139,10 +139,15 @@ public class SettingsController {
 
     @PutMapping("/browser")
     public BrowserSettingsDto updateBrowser(@RequestBody BrowserSettingsRequest req) {
-        boolean headlessChanged = browserSettings.load().headless() != req.headless();
-        BrowserSettingsDto dto = BrowserSettingsDto.from(browserSettings.save(req.headless(), req.whitelist()));
+        BrowserSettingsService.BrowserSettings before = browserSettings.load();
+        boolean headlessChanged = before.headless() != req.headless();
+        BrowserSettingsDto dto = BrowserSettingsDto.from(
+                browserSettings.save(req.headless(), req.persistLogin(), req.whitelist()));
         if (headlessChanged) {
             browserService.onSettingsChanged();
+        }
+        if (before.persistLogin() && !req.persistLogin()) {
+            browserService.clearStoredLoginState();
         }
         return dto;
     }

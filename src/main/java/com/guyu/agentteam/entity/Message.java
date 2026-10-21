@@ -28,6 +28,8 @@ public class Message {
     private String webActivity;
     /** 浏览记录 JSON：[{"tool":"browser_open","url":"…","title":"…","ok":true,"screenshot":"…"}]，无浏览为 null */
     private String browseActivity;
+    /** 通用工具调用 JSON：[{"tool":"read_file","ok":true}]（浏览器/联网工具自带展示，不重复记录），无为 null */
+    private String toolActivity;
     /** 思考过程全文（推理模型）：仅回看展示，不进对话上下文；超长截断，无思考为 null */
     private String thinking;
     private Long createdAt;

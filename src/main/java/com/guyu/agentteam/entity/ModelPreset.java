@@ -23,6 +23,8 @@ public class ModelPreset {
     @Convert(converter = DpapiStringConverter.class)
     private String apiKey;
     private String remark;
+    /** 推理强度（reasoning_effort）：空串不发送该参数；部分供应商默认不返回思考内容，需显式 low/medium/high 开启 */
+    private String reasoningEffort;
     private Long createdAt;
     private Long updatedAt;
 }

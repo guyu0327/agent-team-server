@@ -48,6 +48,19 @@ public final class Json {
     private static final TypeReference<List<Map<String, Object>>> MAP_LIST = new TypeReference<>() {
     };
 
+    private static final TypeReference<Map<String, Object>> MAP = new TypeReference<>() {
+    };
+
+    /** 解析 JSON 对象；空值或格式非法返回 null（工具入参提取用） */
+    public static Map<String, Object> readMap(String json) {
+        if (json == null || json.isBlank()) return null;
+        try {
+            return MAPPER.readValue(json, MAP);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /** 解析联网活动 JSON（Message.webActivity）；空值或格式非法返回 null（前端据此不渲染折叠条） */
     public static List<Map<String, Object>> readWebActivity(String json) {
         if (json == null || json.isBlank()) return null;
@@ -60,6 +73,16 @@ public final class Json {
 
     /** 解析浏览记录 JSON（Message.browseActivity）；空值或格式非法返回 null（前端据此不渲染折叠条） */
     public static List<Map<String, Object>> readBrowseActivity(String json) {
+        if (json == null || json.isBlank()) return null;
+        try {
+            return MAPPER.readValue(json, MAP_LIST);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 解析通用工具调用 JSON（Message.toolActivity）；空值或格式非法返回 null（前端据此不渲染折叠条） */
+    public static List<Map<String, Object>> readToolActivity(String json) {
         if (json == null || json.isBlank()) return null;
         try {
             return MAPPER.readValue(json, MAP_LIST);

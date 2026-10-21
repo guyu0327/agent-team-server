@@ -46,6 +46,10 @@ public class AgentModelFactory {
         if (agent.getTemperature() != null) {
             options.temperature(agent.getTemperature());
         }
+        // 部分供应商默认不返回思考内容（reasoning_content），需显式 reasoning_effort 开启；空值不发送以兼容其他供应商
+        if (preset.getReasoningEffort() != null && !preset.getReasoningEffort().isBlank()) {
+            options.reasoningEffort(preset.getReasoningEffort().trim());
+        }
         return OpenAIChatModel.builder()
                 .apiKey(preset.getApiKey())
                 .baseUrl(preset.getBaseUrl())

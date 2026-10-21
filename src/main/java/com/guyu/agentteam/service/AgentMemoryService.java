@@ -1,5 +1,6 @@
 package com.guyu.agentteam.service;
 
+import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.dto.AgentMemoryDto;
 import com.guyu.agentteam.entity.AgentMemory;
 import com.guyu.agentteam.repository.AgentMemoryRepository;
@@ -154,5 +155,47 @@ public class AgentMemoryService {
     @org.springframework.transaction.annotation.Transactional
     public void clear(String agentId) {
         repo.deleteAllByAgent(agentId);
+    }
+
+    /** 手动新增一条记忆（智能体详情页「记忆数据」管理） */
+    public AgentMemoryDto create(String agentId, String content) {
+        AgentMemory e = new AgentMemory();
+        e.setId(UUID.randomUUID().toString());
+        e.setAgentId(agentId);
+        e.setContent(normalized(agentId, content));
+        e.setCreatedAt(System.currentTimeMillis());
+        repo.save(e);
+        return new AgentMemoryDto(e.getId(), e.getContent(), e.getCreatedAt());
+    }
+
+    /** 手动修改一条记忆内容 */
+    public AgentMemoryDto update(String agentId, String memoryId, String content) {
+        AgentMemory e = owned(agentId, memoryId);
+        e.setContent(normalized(agentId, content));
+        repo.save(e);
+        return new AgentMemoryDto(e.getId(), e.getContent(), e.getCreatedAt());
+    }
+
+    /** 删除单条记忆 */
+    @org.springframework.transaction.annotation.Transactional
+    public void deleteOne(String agentId, String memoryId) {
+        repo.delete(owned(agentId, memoryId));
+    }
+
+    private AgentMemory owned(String agentId, String memoryId) {
+        AgentMemory e = repo.findById(memoryId)
+                .orElseThrow(() -> ApiException.notFound("记忆不存在"));
+        if (!e.getAgentId().equals(agentId)) {
+            throw ApiException.notFound("记忆不存在");
+        }
+        return e;
+    }
+
+    private String normalized(String agentId, String content) {
+        String text = content == null ? "" : content.trim();
+        if (text.isEmpty()) {
+            throw ApiException.badRequest("记忆内容不能为空");
+        }
+        return text.length() > MAX_ENTRY_CHARS ? text.substring(0, MAX_ENTRY_CHARS) : text;
     }
 }

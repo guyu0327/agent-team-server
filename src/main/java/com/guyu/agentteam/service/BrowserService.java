@@ -23,13 +23,16 @@ import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -48,6 +51,9 @@ public class BrowserService {
     private static final int ACTION_TIMEOUT_MS = 15_000;
     /** 单次操作的外层等待上限：内层 Playwright 超时（导航 30s/操作 15s）之外的兜底 */
     private static final int OP_WAIT_SECONDS = 120;
+    /** 连续操作间的随机节流范围（毫秒）：模拟人的节奏，降低触发网站频控/验证码的概率 */
+    private static final long THROTTLE_MIN_MS = 300;
+    private static final long THROTTLE_MAX_MS = 800;
     /** 驱动进程冷启动偶发失败的重试次数 */
     private static final int CREATE_ATTEMPTS = 3;
     private static final int VIEWPORT_WIDTH = 1280;
@@ -75,17 +81,21 @@ public class BrowserService {
 
     private static final class Session {
         final BrowserContext context;
-        final Page page;
+        /** 当前活动标签页：点击触发 target=_blank/JS 弹新页时自动切换到新页 */
+        volatile Page page;
+        /** 本会话已「见过」的页面：新出现的页面即新标签页（用于自动跟随与计数） */
+        final Set<Page> knownPages = java.util.Collections.synchronizedSet(java.util.Collections.newSetFromMap(new IdentityHashMap<>()));
         volatile long lastUsed = System.currentTimeMillis();
 
         Session(BrowserContext context, Page page) {
             this.context = context;
             this.page = page;
+            knownPages.add(page);
         }
     }
 
-    /** 页面打开/操作后的快照结果：模型据此决定下一步（ref 引用元素） */
-    public record PageInfo(String url, String title, String snapshot) {
+    /** 页面打开/操作后的快照结果：模型据此决定下一步（ref 引用元素）；unchanged=请求的页面本已打开，未重新导航 */
+    public record PageInfo(String url, String title, String snapshot, boolean unchanged) {
     }
 
     public BrowserService(BrowserSettingsService settings, WorkspaceFileTools fileTools) {
@@ -139,32 +149,117 @@ public class BrowserService {
         String target = validateUrl(url);
         return supply(conversationId, () -> {
             Page page = pageOf(conversationId);
+            String notice = takeNotice(conversationId);
+            if (sameLocation(page.url(), target)) {
+                return withNotice(infoOf(conversationId, page, true), notice);
+            }
             page.navigate(target);
-            return infoOf(page);
+            return withNotice(infoOf(conversationId, page, false), notice);
         });
     }
 
-    /** 点击元素；页面跳转时 Playwright 自动等待加载完成 */
+    /** 强制重新加载当前页（browser_refresh）：页面假死/交互无响应时的恢复手段；重载后元素 ref 全部失效 */
+    public PageInfo reload(String conversationId) {
+        return supply(conversationId, () -> {
+            Page page = pageOf(conversationId);
+            if (page.isClosed()) {
+                throw new IllegalStateException("页面已关闭，请用 browser_open 重新打开");
+            }
+            page.reload();
+            return infoOf(conversationId, page, false);
+        });
+    }
+
+    /** 同址判断（忽略 #锚点 与末尾斜杠）：已在目标页时 browser_open 不再整页重载（保住表单/滚动状态） */
+    static boolean sameLocation(String current, String target) {
+        return trimForCompare(current).equals(trimForCompare(target));
+    }
+
+    private static String trimForCompare(String u) {
+        if (u == null) {
+            return "";
+        }
+        int hash = u.indexOf('#');
+        String base = hash >= 0 ? u.substring(0, hash) : u;
+        return base.length() > 1 && base.endsWith("/") ? base.substring(0, base.length() - 1) : base;
+    }
+
+    /** 会话因空闲超时/浏览器重启被静默重建时，给下一次入口操作（open/current）附带一条状态提示 */
+    private final Map<String, String> sessionNotices = new ConcurrentHashMap<>();
+
+    private String takeNotice(String conversationId) {
+        return sessionNotices.remove(conversationId);
+    }
+
+    private static PageInfo withNotice(PageInfo info, String notice) {
+        if (notice == null || notice.isBlank()) {
+            return info;
+        }
+        return new PageInfo(info.url(), info.title(), notice + "\n" + info.snapshot(), info.unchanged());
+    }
+
+    /** 点击元素；页面跳转时 Playwright 自动等待加载完成；点开新标签页时自动跟随并提示 */
     public PageInfo click(String conversationId, String ref) {
         return supply(conversationId, () -> {
             Page page = pageOf(conversationId);
             locator(page, ref).click();
-            return infoOf(page);
+            return followNewTabs(conversationId, page);
         });
     }
 
-    /** 当前页面的 url/标题/结构快照（无会话时抛错引导先 open） */
-    public PageInfo current(String conversationId) {
-        return supply(conversationId, () -> {
-            Session s = sessions.get(conversationId);
-            if (s == null) {
-                throw new IllegalStateException("当前没有打开的网页，请先调用 browser_open");
+    /**
+     * 动作后检查是否开出了新标签页（target=_blank 链接、window.open 弹窗）：
+     * 有则把活动页切到最新开的一个，返回其快照并在开头附提示，让模型立刻知道发生了切换；
+     * 没有则按原页面返回。新页常在 click 返回后才真正创建，所以取完原页快照（settle 顺带
+     * 给了新页出现的时间）后再查一次。检查须在 ops 线程内进行（Playwright 非线程安全）。
+     */
+    private PageInfo followNewTabs(String conversationId, Page before) {
+        Session s = sessions.get(conversationId);
+        if (s == null) {
+            return infoOf(before);
+        }
+        Page adopted = adoptNewPage(s);
+        if (adopted == null) {
+            PageInfo beforeInfo = infoOf(conversationId, before);
+            adopted = adoptNewPage(s);
+            if (adopted == null || adopted.isClosed()) {
+                return beforeInfo;
             }
-            return infoOf(s.page);
+        } else if (adopted.isClosed()) {
+            adopted = null;
+        }
+        if (adopted == null) {
+            return infoOf(conversationId, before);
+        }
+        s.page = adopted;
+        PageInfo info = infoOf(adopted);
+        String note = "（注意：刚才的操作在新标签页打开了 " + info.url() + "，已自动切换到新标签页；"
+                + "原标签页仍开着，可用 browser_tabs 查看列表、browser_select_tab 切回。）";
+        return new PageInfo(info.url(), info.title(), note + "\n" + info.snapshot(), false);
+    }
+
+    /** 找出未登记的新页面（最新开的一个），登记进 knownPages 后返回；没有则返回 null */
+    private Page adoptNewPage(Session s) {
+        Page adopted = null;
+        synchronized (s.knownPages) {
+            for (Page p : s.context.pages()) {
+                if (s.knownPages.add(p)) {
+                    adopted = p;
+                }
+            }
+        }
+        return adopted;
+    }
+
+    /** 当前页面的 url/标题/结构快照（无会话时抛错引导先 open）；只读操作不加节流 */
+    public PageInfo current(String conversationId) {
+        return supply(conversationId, true, () -> {
+            Session s = requireSession(conversationId);
+            return withNotice(infoOf(conversationId, s.page, false), takeNotice(conversationId));
         });
     }
 
-    /** 填输入框；submit=true 时回车提交（可能触发跳转） */
+    /** 填输入框；submit=true 时回车提交（可能触发跳转或开新标签页） */
     public PageInfo fill(String conversationId, String ref, String text, boolean submit) {
         return supply(conversationId, () -> {
             Page page = pageOf(conversationId);
@@ -172,7 +267,7 @@ public class BrowserService {
             if (submit) {
                 locator(page, ref).press("Enter");
             }
-            return infoOf(page);
+            return followNewTabs(conversationId, page);
         });
     }
 
@@ -180,18 +275,65 @@ public class BrowserService {
         return supply(conversationId, () -> {
             Page page = pageOf(conversationId);
             locator(page, ref).selectOption(value == null ? "" : value);
-            return infoOf(page);
+            return followNewTabs(conversationId, page);
         });
     }
 
-    /** 返回滚动后的纵向位置（像素） */
-    public long scroll(String conversationId, boolean down) {
+    /** 滚动结果：mode=window/container/none；before/after=滚动前后位置；max=可滚动总高度 */
+    public record ScrollResult(String mode, long before, long after, long max) {
+    }
+
+    /**
+     * 滚动一屏的 9/10。先滚窗口；窗口不可滚（y 不动）时自动找页面上最大的可视内滚容器
+     * （overflow:auto/scroll 的元素，很多页面主内容区自带滚动条，window.scrollBy 对它无效）滚它。
+     * 都不可滚时 mode=none，说明页面内容不足一屏，调用方据此提示模型别反复滚。
+     */
+    public ScrollResult scroll(String conversationId, boolean down) {
         return supply(conversationId, () -> {
             Page page = pageOf(conversationId);
             int delta = (down ? 1 : -1) * VIEWPORT_HEIGHT * 9 / 10;
-            Object y = page.evaluate(
-                    "d => { window.scrollBy(0, d); return Math.round(window.scrollY); }", delta);
-            return y instanceof Number n ? n.longValue() : 0L;
+            Object r = page.evaluate("""
+                    d => {
+                      const before = Math.round(window.scrollY);
+                      window.scrollBy(0, d);
+                      const after = Math.round(window.scrollY);
+                      const winMax = Math.max(0, Math.round(document.documentElement.scrollHeight - window.innerHeight));
+                      if (after !== before) {
+                        return { mode: 'window', before, after, max: winMax };
+                      }
+                      const cands = document.querySelectorAll('div,main,section,aside,article,nav,ul,ol,table,pre,textarea');
+                      let best = null, bestScore = 0;
+                      for (const el of cands) {
+                        const oy = getComputedStyle(el).overflowY;
+                        if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') continue;
+                        if (el.scrollHeight <= el.clientHeight + 4) continue;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 200 || rect.height < 150) continue;
+                        const visible = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
+                        if (visible <= 0) continue;
+                        const score = el.scrollHeight + visible;
+                        if (score > bestScore) { bestScore = score; best = el; }
+                      }
+                      if (!best) {
+                        if (winMax <= 0) return { mode: 'none', before: 0, after: 0, max: 0 };
+                        return { mode: 'window', before, after, max: winMax };
+                      }
+                      const b = best.scrollTop;
+                      best.scrollTop = b + d;
+                      return { mode: 'container', before: Math.round(b), after: Math.round(best.scrollTop),
+                               max: Math.max(0, Math.round(best.scrollHeight - best.clientHeight)) };
+                    }
+                    """, delta);
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> m = (java.util.Map<String, Object>) r;
+            if (m == null) {
+                return new ScrollResult("none", 0, 0, 0);
+            }
+            return new ScrollResult(
+                    String.valueOf(m.get("mode")),
+                    ((Number) m.getOrDefault("before", 0)).longValue(),
+                    ((Number) m.getOrDefault("after", 0)).longValue(),
+                    ((Number) m.getOrDefault("max", 0)).longValue());
         });
     }
 
@@ -202,18 +344,79 @@ public class BrowserService {
         });
     }
 
+    // ---------- 标签页管理 ----------
+
+    /** 标签页列表项（序号 1 基，与 browser_select_tab 的 index 对应） */
+    public record TabInfo(int index, String title, String url, boolean active) {
+    }
+
+    /** 列出当前会话的所有标签页（按打开顺序），顺带把未登记页面收编避免后续误报 */
+    public List<TabInfo> tabs(String conversationId) {
+        return supply(conversationId, true, () -> {
+            Session s = requireSession(conversationId);
+            List<Page> pages = absorbNewPages(s);
+            List<TabInfo> out = new ArrayList<>();
+            for (int i = 0; i < pages.size(); i++) {
+                Page p = pages.get(i);
+                out.add(new TabInfo(i + 1, safeTitle(p), p.url(), p == s.page));
+            }
+            return out;
+        });
+    }
+
+    /** 切换活动标签页（1 基序号），返回该页的 url/标题/结构快照 */
+    public PageInfo selectTab(String conversationId, int index) {
+        return supply(conversationId, () -> {
+            Session s = requireSession(conversationId);
+            List<Page> pages = absorbNewPages(s);
+            if (index < 1 || index > pages.size()) {
+                throw new IllegalArgumentException("标签页编号 " + index + " 不存在，当前共 "
+                        + pages.size() + " 个标签页，请先用 browser_tabs 查看列表");
+            }
+            Page target = pages.get(index - 1);
+            s.page = target;
+            PageInfo info = infoOf(conversationId, target);
+            return new PageInfo(info.url(), info.title(),
+                    "已切换到标签页 " + index + "。\n" + info.snapshot(), false);
+        });
+    }
+
+    private Session requireSession(String conversationId) {
+        Session s = sessions.get(conversationId);
+        if (s == null) {
+            throw new IllegalStateException("当前没有打开的网页，请先调用 browser_open");
+        }
+        return s;
+    }
+
+    /** 按打开顺序返回存活页面，并把未登记页面记入 knownPages（新标签页的判定基线） */
+    private List<Page> absorbNewPages(Session s) {
+        synchronized (s.knownPages) {
+            for (Page p : s.context.pages()) {
+                s.knownPages.add(p);
+            }
+        }
+        return new ArrayList<>(s.context.pages());
+    }
+
     /** 截图结果：字节转 ImageBlock 进模型上下文，文件路径给浏览记录前端展示缩略图 */
     public record Shot(String file, byte[] png) {
     }
 
     /** 截图一次两用（browser_screenshot 工具 + 操作后的浏览记录缩略图）；落盘失败不影响字节返回（file=null） */
     public Shot capture(String conversationId) {
-        return supply(conversationId, () -> {
+        return capture(conversationId, null);
+    }
+
+    /** ref 非空时只截该元素（放大镜视角，细节分辨率远高于整页）；自动滚动到可视区后拍摄 */
+    public Shot capture(String conversationId, String ref) {
+        boolean element = ref != null && !ref.isBlank();
+        return supply(conversationId, true, () -> {
             Session s = sessions.get(conversationId);
             if (s == null) {
                 throw new IllegalStateException("当前没有打开的网页，请先调用 browser_open");
             }
-            byte[] png = shootSettled(s.page);
+            byte[] png = element ? shootElement(s.page, ref.trim()) : shootSettled(s.page);
             String file = null;
             try {
                 Path dir = Paths.get(fileTools.primaryRoot(), "browser");
@@ -227,6 +430,12 @@ public class BrowserService {
             }
             return new Shot(file, png);
         });
+    }
+
+    /** 元素级截图：先等网络静默再拍，ref 失效由 locator 的存在性校验当场报错引导重取快照 */
+    private static byte[] shootElement(Page page, String ref) {
+        settle(page);
+        return locator(page, ref).screenshot(new Locator.ScreenshotOptions().setType(ScreenshotType.PNG));
     }
 
     /** 截图前先等网络静默；疑似没加载出来（整页近乎空白）时等一拍重拍，最多两次 */
@@ -244,7 +453,44 @@ public class BrowserService {
         submit(() -> {
             Session s = sessions.remove(conversationId);
             if (s != null) {
+                saveState(s);
                 s.context.close();
+            }
+        });
+    }
+
+    // ---------- 登录态持久化 ----------
+
+    /** 「记住浏览器登录态」是否开启（browser_close 的返回文案据实描述） */
+    public boolean persistLoginEnabled() {
+        return settings.load().persistLogin();
+    }
+
+    /** 登录态存盘文件（persistLogin 开启时随会话关闭写入，新会话创建时恢复） */
+    private Path stateFile() {
+        return Paths.get(fileTools.primaryRoot(), "browser", "storage-state.json");
+    }
+
+    /** persistLogin 开启时把会话 cookie/storage 存盘：网站视角从「每次全新访客」变成「回头客」 */
+    private void saveState(Session s) {
+        if (!settings.load().persistLogin()) {
+            return;
+        }
+        try {
+            Files.createDirectories(stateFile().getParent());
+            s.context.storageState(new BrowserContext.StorageStateOptions().setPath(stateFile()));
+        } catch (Exception e) {
+            log.warn("浏览器登录态保存失败：{}", e.toString());
+        }
+    }
+
+    /** persistLogin 被关掉时清掉已存登录态（经 ops 线程执行避免与关闭中的保存竞态） */
+    public void clearStoredLoginState() {
+        submit(() -> {
+            try {
+                Files.deleteIfExists(stateFile());
+            } catch (Exception e) {
+                log.warn("清除浏览器登录态失败：{}", e.toString());
             }
         });
     }
@@ -257,7 +503,15 @@ public class BrowserService {
     }
 
     private <T> T supply(String conversationId, java.util.function.Supplier<T> body) {
+        return supply(conversationId, false, body);
+    }
+
+    /** readOnly=true 的纯查看操作（取快照/截图）不做人机节流；活跃时间照常刷新（看过页面就算还在用） */
+    private <T> T supply(String conversationId, boolean readOnly, java.util.function.Supplier<T> body) {
         Future<T> f = ops.submit(() -> {
+            if (!readOnly) {
+                pace();
+            }
             Session s = sessions.get(conversationId);
             if (s != null) {
                 s.lastUsed = System.currentTimeMillis();
@@ -283,6 +537,16 @@ public class BrowserService {
         }
     }
 
+    /** 串行队列里的随机小睡：让机器操作带上人的节奏（被打断即随取消快速退出） */
+    private static void pace() {
+        try {
+            Thread.sleep(ThreadLocalRandom.current().nextLong(THROTTLE_MIN_MS, THROTTLE_MAX_MS));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("浏览器操作已取消");
+        }
+    }
+
     /** 去掉并发包装，暴露真实原因（PlaywrightException 的消息本身就是可读中文场景描述） */
     private static RuntimeException unwrap(Exception e) {
         Throwable t = e;
@@ -296,11 +560,27 @@ public class BrowserService {
     private Page pageOf(String conversationId) {
         Session stale = sessions.get(conversationId);
         if (stale != null && (stale.page.isClosed() || browser == null || !browser.isConnected())) {
-            sessions.remove(conversationId);
-            try {
-                stale.context.close();
-            } catch (Exception ignored) {
-                // 已随浏览器关闭
+            Page fallback = null;
+            if (stale.page.isClosed() && browser != null && browser.isConnected()) {
+                // 活动标签页被网站脚本 window.close() 关掉但还有其他标签页：把活动页切过去，会话整体保留
+                fallback = stale.context.pages().stream().filter(p -> !p.isClosed()).findFirst().orElse(null);
+                if (fallback != null) {
+                    stale.page = fallback;
+                    stale.knownPages.add(fallback);
+                }
+            }
+            if (fallback == null) {
+                sessions.remove(conversationId);
+                try {
+                    saveState(stale);
+                } catch (Exception ignored) {
+                    // 浏览器可能已死，存不了就放弃
+                }
+                try {
+                    stale.context.close();
+                } catch (Exception ignored) {
+                    // 已随浏览器关闭
+                }
             }
         }
         Session s = sessions.get(conversationId);
@@ -312,16 +592,42 @@ public class BrowserService {
         } catch (RuntimeException e) {
             throw new IllegalStateException(launchFailureMessage(e), e);
         }
-        BrowserContext context = browser.newContext(new Browser.NewContextOptions()
+        Browser.NewContextOptions opts = new Browser.NewContextOptions()
                 .setViewportSize(VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
-                .setLocale("zh-CN"));
+                // 高分屏渲染：物理像素翻倍，截图里的文字密度翻番——视觉模型会把图片降采样到
+                // 内部编码分辨率，源图越清晰降采样后越可读，否则整页截图的中文小字直接糊掉
+                .setDeviceScaleFactor(2)
+                .setLocale("zh-CN");
+        if (settings.load().persistLogin()) {
+            Path state = stateFile();
+            if (Files.exists(state)) {
+                try {
+                    opts.setStorageStatePath(state);
+                    log.info("已恢复浏览器登录态：{}", state);
+                } catch (Exception e) {
+                    log.warn("浏览器登录态加载失败（按全新身份继续）：{}", e.toString());
+                }
+            }
+        }
+        BrowserContext context = browser.newContext(opts);
+        // 网站随时可能弹新标签页（target=_blank / window.open）：新页也要配上超时与对话框自动
+        // dismiss，否则新页里的 alert 会把后续工具卡死
+        context.onPage(this::configurePage);
         Page page = context.newPage();
-        page.setDefaultNavigationTimeout(PAGE_LOAD_TIMEOUT_MS);
-        page.setDefaultTimeout(ACTION_TIMEOUT_MS);
-        // alert/confirm/beforeunload 不处理会让工具卡死：一律 dismiss
-        page.onDialog(Dialog::dismiss);
+        configurePage(page);
+        if (stale != null) {
+            sessionNotices.put(conversationId,
+                    "（注意：之前的页面已因空闲超时或浏览器重启被关闭，本次是全新会话，之前页面上的表单内容/滚动位置已丢失）");
+        }
         sessions.put(conversationId, new Session(context, page));
         return page;
+    }
+
+    /** 新页面的统一初始化：导航/操作超时 + alert/confirm/beforeunload 一律 dismiss（不处理会卡死工具） */
+    private void configurePage(Page page) {
+        page.setDefaultNavigationTimeout(PAGE_LOAD_TIMEOUT_MS);
+        page.setDefaultTimeout(ACTION_TIMEOUT_MS);
+        page.onDialog(Dialog::dismiss);
     }
 
     private void ensureBrowser() {
@@ -359,7 +665,9 @@ public class BrowserService {
             try {
                 browser = chromium.launch(new BrowserType.LaunchOptions()
                         .setChannel(channel)
-                        .setHeadless(headless));
+                        .setHeadless(headless)
+                        // 去掉 navigator.webdriver=true 标记：网站风控据此把访问直接判成机器人
+                        .setArgs(List.of("--disable-blink-features=AutomationControlled")));
                 log.info("浏览器自动化已启动：channel={} headless={}", channel, headless);
                 return;
             } catch (RuntimeException e) {
@@ -379,9 +687,14 @@ public class BrowserService {
             Session s = sessions.remove(id);
             if (s != null) {
                 try {
-                    s.context.close();
+                    saveState(s);
                 } catch (Exception ignored) {
                     // 浏览器可能已被用户手关
+                }
+                try {
+                    s.context.close();
+                } catch (Exception ignored) {
+                    // 同上
                 }
             }
         }
@@ -415,6 +728,7 @@ public class BrowserService {
             ops.submit(() -> {
                 Session s = sessions.remove(id);
                 if (s != null) {
+                    saveState(s);
                     try {
                         s.context.close();
                     } catch (Exception ignored) {
@@ -456,6 +770,28 @@ public class BrowserService {
             + "可用 browser_screenshot 查看当前画面，或稍后用 browser_current 重取结构）";
 
     private PageInfo infoOf(Page page) {
+        return infoOf(page, false);
+    }
+
+    /** infoOf + 标签页计数后缀：多于 1 个标签页时在快照尾部提示，模型不再对多标签页毫无感知 */
+    private PageInfo infoOf(String conversationId, Page page, boolean unchanged) {
+        PageInfo info = infoOf(page, unchanged);
+        Session s = sessions.get(conversationId);
+        int n = s == null ? 1 : s.context.pages().size();
+        if (n <= 1) {
+            return info;
+        }
+        return new PageInfo(info.url(), info.title(),
+                info.snapshot() + "\n（浏览器当前共 " + n
+                        + " 个标签页，可用 browser_tabs 查看列表、browser_select_tab 切换）",
+                info.unchanged());
+    }
+
+    private PageInfo infoOf(String conversationId, Page page) {
+        return infoOf(conversationId, page, false);
+    }
+
+    private PageInfo infoOf(Page page, boolean unchanged) {
         try {
             // 动作可能触发跳转：等主导航落定再取快照，避免抓到正在销毁的旧文档
             page.waitForLoadState(LoadState.LOAD, new Page.WaitForLoadStateOptions().setTimeout(10_000));
@@ -465,7 +801,7 @@ public class BrowserService {
         settle(page);
         String url = page.url();
         String title = safeTitle(page);
-        return new PageInfo(url, title, snapshotWithRetry(page));
+        return new PageInfo(url, title, snapshotWithRetry(page), unchanged);
     }
 
     /**

@@ -14,6 +14,7 @@ import java.util.Locale;
 /**
  * 浏览器自动化设置：持久化于 app_settings（key=browser.automation）。
  * headless：默认 false=弹出真实浏览器窗口，操作过程可见（避免误以为卡住）；开启后后台静默运行。
+ * persistLogin：默认 false=每次会话全新身份；开启后会话关闭时把 cookie/storage 存盘、新会话恢复（网站视角是回头客）。
  * whitelist：域名白名单（如 example.com），命中（含子域名）的 browser_open 不再弹审批卡片。
  */
 @Service
@@ -28,31 +29,31 @@ public class BrowserSettingsService {
         this.store = store;
     }
 
-    public record BrowserSettings(boolean headless, List<String> whitelist) {
+    public record BrowserSettings(boolean headless, boolean persistLogin, List<String> whitelist) {
     }
 
     public BrowserSettings load() {
         String json = store.read(KEY);
         if (json == null) {
-            return new BrowserSettings(false, List.of());
+            return new BrowserSettings(false, false, List.of());
         }
         try {
             BrowserSettings raw = mapper.readValue(json, BrowserSettings.class);
-            return new BrowserSettings(raw.headless(), normalize(raw.whitelist()));
+            return new BrowserSettings(raw.headless(), raw.persistLogin(), normalize(raw.whitelist()));
         } catch (Exception e) {
-            return new BrowserSettings(false, List.of());
+            return new BrowserSettings(false, false, List.of());
         }
     }
 
-    public BrowserSettings save(boolean headless, List<String> whitelist) {
+    public BrowserSettings save(boolean headless, boolean persistLogin, List<String> whitelist) {
         String json;
         try {
-            json = mapper.writeValueAsString(new BrowserSettings(headless, normalize(whitelist)));
+            json = mapper.writeValueAsString(new BrowserSettings(headless, persistLogin, normalize(whitelist)));
         } catch (Exception e) {
             throw new ApiException(500, "保存浏览器设置失败");
         }
         store.write(KEY, json);
-        return new BrowserSettings(headless, normalize(whitelist));
+        return new BrowserSettings(headless, persistLogin, normalize(whitelist));
     }
 
     /** 从 URL 提取小写主机名；解析失败返回 null */
@@ -88,9 +89,10 @@ public class BrowserSettingsService {
         if (host == null || host.isBlank()) {
             return load().whitelist();
         }
-        List<String> next = new ArrayList<>(load().whitelist());
+        BrowserSettings cur = load();
+        List<String> next = new ArrayList<>(cur.whitelist());
         next.add(host.toLowerCase(Locale.ROOT));
-        return save(load().headless(), next).whitelist();
+        return save(cur.headless(), cur.persistLogin(), next).whitelist();
     }
 
     private static List<String> normalize(List<String> raw) {

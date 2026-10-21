@@ -15,6 +15,7 @@ import com.guyu.agentteam.repository.MessageRepository;
 import com.guyu.agentteam.repository.ModelPresetRepository;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.WebTools;
+import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.agent.accumulator.TextAccumulator;
 import io.agentscope.core.message.AssistantMessage;
 import io.agentscope.core.model.ExecutionConfig;
@@ -54,6 +55,7 @@ public class ConversationStreamSupport {
     private final ModelPresetRepository presets;
     private final AppLogService appLogs;
     private final ContextCompressionService compression;
+    private final WorkspaceFileTools fileTools;
 
     /** 漏斗里需要落库的运行事件 → 日志类型（op_request 由 OpApprovalService 单独记录，content 类事件不记） */
     private static final Map<String, String> LOGGED_EVENTS = Map.of(
@@ -66,12 +68,13 @@ public class ConversationStreamSupport {
 
     public ConversationStreamSupport(ConversationRepository conversations, MessageRepository messages,
                                      ModelPresetRepository presets, AppLogService appLogs,
-                                     ContextCompressionService compression) {
+                                     ContextCompressionService compression, WorkspaceFileTools fileTools) {
         this.conversations = conversations;
         this.messages = messages;
         this.presets = presets;
         this.appLogs = appLogs;
         this.compression = compression;
+        this.fileTools = fileTools;
     }
 
     public void send(SseEmitter emitter, String event, Object data) {
@@ -693,6 +696,12 @@ public class ConversationStreamSupport {
         public final WebActivityLog webLog = new WebActivityLog();
         /** 本段开启前的浏览器操作记录（同 webLog 机制）：开启时 drain 附着到本段消息 */
         public final WebActivityLog browseLog = new WebActivityLog();
+        /** 本段开启前的其他工具调用记录（文件/图片/技能/任务等，经事件流统一上报）：同 webLog 机制 */
+        public final WebActivityLog toolLog = new WebActivityLog();
+        /** 本轮工具调用入参暂存（callId → 入参）：TOOL_CALL_END 解析写入，end 上报取出带出目标详情 */
+        public final Map<String, Map<String, Object>> toolArgs = new ConcurrentHashMap<>();
+        /** 工具入参 JSON 增量缓冲（callId → 累积的参数片段）：TOOL_CALL_DELTA 追加，END 时解析入 toolArgs */
+        public final Map<String, StringBuilder> toolArgBuf = new ConcurrentHashMap<>();
         /** 已开启的段数（含进行中），用于判断整次回复是否完全空白；跨线程读写需 volatile */
         public volatile int opened;
     }
@@ -720,7 +729,8 @@ public class ConversationStreamSupport {
         // 工具活动发生在上一段关闭之后、本段开启之前，归到本段（模型正要基于这些结果发言）
         m.setWebActivity(seg.webLog.drainToJson());
         m.setBrowseActivity(seg.browseLog.drainToJson());
-        if (m.getWebActivity() != null || m.getBrowseActivity() != null) {
+        m.setToolActivity(seg.toolLog.drainToJson());
+        if (m.getWebActivity() != null || m.getBrowseActivity() != null || m.getToolActivity() != null) {
             persist(m);
         }
         send(emitter, "reply_start", Map.of(
@@ -759,7 +769,187 @@ public class ConversationStreamSupport {
         if (webActivity != null) payload.put("webActivity", webActivity);
         List<Map<String, Object>> browseActivity = Json.readBrowseActivity(m.getBrowseActivity());
         if (browseActivity != null) payload.put("browseActivity", browseActivity);
+        List<Map<String, Object>> toolActivity = Json.readToolActivity(m.getToolActivity());
+        if (toolActivity != null) payload.put("toolActivity", toolActivity);
         if (m.getThinking() != null) payload.put("thinking", m.getThinking());
         send(emitter, "reply_end", payload);
+    }
+
+    /**
+     * 自带展示渠道的工具不走通用上报（避免重复）：web_search/fetch_webpage 有「联网记录」折叠条，
+     * browser_* 有「浏览记录」折叠条；其余工具（文件/图片/技能/任务/记忆等）统一由
+     * TOOL_CALL_START / TOOL_RESULT_END 事件流上报并在气泡下展示。
+     */
+    public static boolean selfReportedTool(String tool) {
+        return tool.startsWith("browser_") || tool.equals("web_search") || tool.equals("fetch_webpage");
+    }
+
+    /**
+     * 工具入参累积（TOOL_CALL_DELTA / TOOL_CALL_END 事件驱动）：参数 JSON 增量按 callId 拼接，
+     * END 时解析进 out，供 TOOL_RESULT_END 上报带出目标详情。非自展示工具才记录。
+     */
+    public static void accumulateToolArgs(io.agentscope.core.event.AgentEvent ev,
+                                          Map<String, StringBuilder> buf,
+                                          Map<String, Map<String, Object>> out) {
+        if (ev instanceof io.agentscope.core.event.ToolCallDeltaEvent d) {
+            if (selfReportedTool(d.getToolCallName()) || d.getDelta() == null) return;
+            buf.computeIfAbsent(d.getToolCallId(), k -> new StringBuilder()).append(d.getDelta());
+        } else if (ev instanceof io.agentscope.core.event.ToolCallEndEvent ce) {
+            StringBuilder sb = buf.remove(ce.getToolCallId());
+            if (sb != null && !selfReportedTool(ce.getToolCallName())) {
+                out.put(ce.getToolCallId(), Json.readMap(sb.toString()));
+            }
+        }
+    }
+
+    /** 取出并移除某次调用的入参：优先已解析结果，兜底解析残留缓冲（TOOL_CALL_END 缺失时仍可用） */
+    public static Map<String, Object> takeToolArgs(String callId,
+                                                   Map<String, Map<String, Object>> parsed,
+                                                   Map<String, StringBuilder> buf) {
+        Map<String, Object> input = parsed.remove(callId);
+        if (input == null) {
+            StringBuilder sb = buf.remove(callId);
+            if (sb != null) input = Json.readMap(sb.toString());
+        }
+        return input;
+    }
+
+    /**
+     * 通用工具调用上报（ReAct 事件流统一驱动，覆盖文件/图片/技能/任务等所有非自展示工具）：
+     * start/end 各发一条 SSE 实时提示；end 落进给定日志随发言段落持久化。
+     * 浏览器与联网工具自带更丰富的展示，由调用方排除避免重复。
+     * input 为工具入参（来自 Toolkit 回调，按 callId 对应），end 上报据此带出目标详情。
+     */
+    public void toolActivity(SseEmitter emitter, Conversation conv, Agent agent, SegState seg,
+                             String tool, boolean start, io.agentscope.core.message.ToolResultState state,
+                             Map<String, Object> input) {
+        toolActivity(emitter, conv.getId(), agent, seg.toolLog, tool, start, state, input);
+    }
+
+    /** 同上，日志由调用方持有（被委派成员整轮单消息，收尾一次性附着到占位消息） */
+    public void toolActivity(SseEmitter emitter, String conversationId, Agent agent, WebActivityLog log,
+                             String tool, boolean start, io.agentscope.core.message.ToolResultState state,
+                             Map<String, Object> input) {
+        Map<String, Object> target = start ? null : toolTarget(tool, input);
+        Map<String, Object> payload = new java.util.LinkedHashMap<>();
+        payload.put("tool", tool);
+        payload.put("phase", start ? "start" : "end");
+        payload.put("agentId", agent.getId());
+        payload.put("agentName", agent.getName());
+        payload.put("conversationId", conversationId);
+        if (!start && state != null) {
+            payload.put("ok", state == io.agentscope.core.message.ToolResultState.SUCCESS);
+            if (state != io.agentscope.core.message.ToolResultState.SUCCESS) {
+                payload.put("state", state.getValue());
+            }
+        }
+        if (target != null) {
+            payload.put("target", target.get("target"));
+            if (target.get("openPath") != null) payload.put("openPath", target.get("openPath"));
+        }
+        send(emitter, "tool_activity", payload);
+        // 落库只留 end 结果；start 半截事件仅用于实时提示
+        if (!start) {
+            Map<String, Object> item = new java.util.LinkedHashMap<>();
+            item.put("tool", tool);
+            item.put("phase", "end");
+            if (state != null) {
+                item.put("ok", state == io.agentscope.core.message.ToolResultState.SUCCESS);
+                if (state != io.agentscope.core.message.ToolResultState.SUCCESS) {
+                    item.put("state", state.getValue());
+                }
+            }
+            if (target != null) {
+                item.put("target", target.get("target"));
+                if (target.get("openPath") != null) item.put("openPath", target.get("openPath"));
+            }
+            log.add(item);
+        }
+    }
+
+    /**
+     * 工具入参 → 折叠条/提示条的目标详情：文件与目录类取路径（target 显示模型传入的原始形态，
+     * openPath 为解析后的绝对路径，相对路径按主工作区根目录解析，前端点击用系统默认方式打开）；
+     * 命令/提示词/名称类取原文摘要（截断 120 字符）。无可辨识目标返回 null。
+     */
+    private Map<String, Object> toolTarget(String tool, Map<String, Object> input) {
+        if (input == null || input.isEmpty()) return null;
+        String target = null;
+        String openPath = null;
+        switch (tool) {
+            case "read_file", "write_file", "edit_file", "view_image" ->
+                    openPath = pathArg(input, "path");
+            case "list_files" -> openPath = pathArg(input, "path", "dir", "directory");
+            case "grep_files", "glob_files" -> {
+                openPath = pathArg(input, "path", "dir", "directory");
+                if (openPath == null) target = textArg(input, "pattern");
+            }
+            case "execute" -> target = textArg(input, "command");
+            case "generate_image" -> target = textArg(input, "prompt");
+            case "schedule_task" -> target = textArg(input, "name");
+            case "update_scheduled_task", "cancel_scheduled_task" ->
+                    target = firstNonBlank(textArg(input, "name"), textArg(input, "task_id"));
+            case "install_skill" -> target = firstNonBlank(textArg(input, "name"), textArg(input, "skill_id"));
+            case "delegate" -> {
+                String member = textArg(input, "member");
+                String task = textArg(input, "task");
+                if (member != null && !member.isBlank()) {
+                    target = task == null || task.isBlank() ? member : member + "：" + task;
+                }
+            }
+            case "create_team" -> target = firstNonBlank(textArg(input, "name"), textArg(input, "members"));
+            case "add_member" -> target = textArg(input, "member");
+            case "recordToMemory" -> target = firstNonBlank(listFirst(input.get("content")), textArg(input, "thinking"));
+            case "retrieveFromMemory" -> target = listFirst(input.get("keywords"));
+            default -> {
+                return null;
+            }
+        }
+        if (openPath != null) {
+            Map<String, Object> r = new java.util.LinkedHashMap<>();
+            r.put("target", openPath);
+            r.put("openPath", openPath);
+            return r;
+        }
+        if (target == null || target.isBlank()) return null;
+        if (target.length() > 120) target = target.substring(0, 120) + "…";
+        Map<String, Object> r = new java.util.LinkedHashMap<>();
+        r.put("target", target);
+        return r;
+    }
+
+    /** 取第一个存在的路径参数；相对路径按主工作区解析为绝对路径（打开用），返回 null 表示没有路径参数 */
+    private String pathArg(Map<String, Object> input, String... keys) {
+        for (String key : keys) {
+            Object v = input.get(key);
+            if (v instanceof String s && !s.isBlank()) {
+                String raw = s.trim();
+                try {
+                    Path p = Paths.get(raw);
+                    Path abs = p.isAbsolute() ? p : Paths.get(fileTools.primaryRoot()).resolve(p);
+                    return abs.normalize().toString();
+                } catch (Exception ignored) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String textArg(Map<String, Object> input, String key) {
+        Object v = input.get(key);
+        return v instanceof String s ? s.trim() : null;
+    }
+
+    private String firstNonBlank(String a, String b) {
+        return a != null && !a.isBlank() ? a : b;
+    }
+
+    /** 取 JSON 数组参数的首个字符串（recordToMemory.contents / retrieveFromMemory.queries 等列表参数） */
+    private String listFirst(Object v) {
+        if (v instanceof List<?> list && !list.isEmpty() && list.get(0) != null) {
+            return list.get(0).toString().trim();
+        }
+        return null;
     }
 }

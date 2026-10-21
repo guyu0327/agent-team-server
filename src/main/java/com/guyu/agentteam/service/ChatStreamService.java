@@ -24,12 +24,15 @@ import com.guyu.agentteam.service.tool.WebTools;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import io.agentscope.core.ReActAgent;
 import io.agentscope.core.event.AgentEventType;
+import io.agentscope.core.event.ToolCallStartEvent;
+import io.agentscope.core.event.ToolResultEndEvent;
 import io.agentscope.core.memory.LongTermMemoryMode;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.ThinkingBlockDeltaEvent;
 import io.agentscope.core.message.MessageMetadataKeys;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.message.UserMessage;
 import io.agentscope.core.tool.Toolkit;
 import jakarta.annotation.PreDestroy;
@@ -48,6 +51,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -63,6 +67,24 @@ public class ChatStreamService {
     /** ReAct 迭代不设上限（int 最大值等效于关闭），单条回复时长由「协作限制」设置兜底 */
     private static final int MAX_ITERS = Integer.MAX_VALUE;
     private static final Duration SELECT_TIMEOUT = Duration.ofMinutes(2);
+
+    /**
+     * 「只说不做」意图句式：行动引导词 +（0–24 字内）动作词。整轮零工具调用且回复命中此句式时
+     * 判定为「声称要动手却没动手」，触发一次纠正重试；动作词后跟「了/过/完/好」按完成时汇报处理
+     * （「我去看过了」不纠正）；纯闲聊（「我去看电影」误判）代价仅为多一轮澄清。
+     */
+    private static final Pattern ACTION_PROMISE = Pattern.compile(
+            "(我去|我来|这就|现在|马上|先去|再去|接着去|让我|我先|我会|接下来)"
+                    + "[^。！？!?\\n]{0,24}?"
+                    + "(打开|浏览|访问|看看|看一下|瞧瞧|瞅瞅|查一下|查查|查|确认|核实|检查|删|清除|清空|撤回"
+                    + "|编辑|修改|发布|发表|回复|评论|发帖|转发|点赞|上传|下载|登录|搜索|搜一下|截图|点击"
+                    + "|填入|填写|写|保存|执行|运行|安装|部署|提交|抓取|刷新|翻|看|处理|关(?!注)|搞定)"
+                    + "(?![了过完着])");
+
+    /** 纠正指令：只进模型上下文，不落库不进聊天记录 */
+    private static final String PROMISE_CORRECTION =
+            "（系统提示）你上一条回复里说要去执行操作，但没有实际调用任何工具就结束了——说「去做」不等于「做了」。"
+                    + "请立即真正调用工具完成刚才承诺的操作；如果确实无法或无需执行，就明确说明原因，不要再只回复「我去做」。";
 
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -246,74 +268,117 @@ public class ChatStreamService {
                 "conversationId", conv.getId()));
 
         ConversationStreamSupport.SegState seg = new ConversationStreamSupport.SegState();
-        ReActAgent.Builder builder = ReActAgent.builder()
-                .name(agent.getName())
-                .sysPrompt(sysPromptOf(agent, conv.getId(), handle != null ? handle.taskTag : null))
-                .model(modelFactory.create(agent, preset, multiAgent))
-                .toolkit(toolkitOf(conv, emitter, agent, handle, seg));
-        skillSupport.applySkills(builder, agent);
-        ReActAgent react = builder
-                .maxIters(MAX_ITERS)
-                .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
-                .toolExecutionConfig(ConversationStreamSupport.toolCallExecutionConfig())
-                .longTermMemory(memoryService.store(agent.getId()))
-                .longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
-                .build();
-        if (handle != null) handle.running.add(react);
-        try {
-            react.streamEvents(input)
-                    .takeUntilOther(handle != null ? handle.cancelSignal() : Mono.never())
-                    .doOnNext(ev -> {
-                        if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
-                            String delta = ((TextBlockDeltaEvent) ev).getDelta();
-                            if (seg.msg.get() == null && delta.isBlank()) return;
-                            if (seg.msg.get() == null) {
-                                support.openSegment(emitter, conv, agent, seg, handle != null ? handle.taskTag : null);
-                            }
-                            seg.text.add(TextBlock.builder().text(delta).build());
-                            support.send(emitter, "delta", Map.of(
-                                    "messageId", seg.msg.get().getId(),
-                                    "delta", delta,
-                                    "conversationId", conv.getId()));
-                        } else if (ev.getType() == AgentEventType.THINKING_BLOCK_DELTA) {
-                            String think = ((ThinkingBlockDeltaEvent) ev).getDelta();
-                            seg.thinking.append(think);
-                            // 推理模型的思考过程流式透出：气泡未打开时前端显示在思考条，打开后显示在气泡内
-                            support.send(emitter, "thinking_delta", ConversationStreamSupport.thinkingPayload(
-                                    agent.getId(), conv.getId(), seg, think));
-                        } else if (ev.getType() == AgentEventType.TOOL_CALL_START) {
-                            support.closeSegment(emitter, conv, agent, seg);
-                        }
-                    })
-                    .blockLast(Duration.ofMinutes(limitsService.load().memberMinutes()));
-            support.closeSegment(emitter, conv, agent, seg);
-            if (seg.opened == 0 && (handle == null || !handle.stopRequested.get())) {
-                support.persistError(conv, agent, "「" + agent.getName() + "」（模型未返回内容）");
-                support.send(emitter, "reply_error", Map.of("agentId", agent.getId(), "error", "（模型未返回内容）"));
-            }
-        } catch (UncheckedIOException e) {
-            // 客户端断开，SSE 已不可用
-            throw e;
-        } catch (Exception e) {
-            support.closeSegment(emitter, conv, agent, seg);
-            boolean timeout = ConversationStreamSupport.isBlockingTimeout(e);
-            // 只有 stopRequested 才按用户终止处理：异常链里的 InterruptedException 未必来自用户
-            // （框架/传输层超时都可能夹带），凭它判定会吞掉真实的回复失败
+        // 整轮是否调过工具：判定「只说不做」只看整轮——真干过活就不再纠正。曾试过「看收尾」
+        // （最后一段文本后无工具即算空话），实际把「改完文件后收尾总结」误判成光说不做，
+        // 模型被冤枉后花好几轮反复自证，代价远大于漏掉一句官腔收尾
+        AtomicBoolean toolCalled = new AtomicBoolean(false);
+        List<Msg> roundInput = input;
+        // 最多两轮（首次 + 一次纠正）：整轮零工具调用、且回复文本带行动意图句式（「我去确认」「这就改」）时，
+        // 追加一条不落库的纠正指令让同一智能体立即重跑；纠正只喂给模型不进聊天记录，命中与重试记运行日志
+        for (int attempt = 0; attempt < 2; attempt++) {
+            // 轮与轮的间隙点停止也能立即退出，不等新一轮流订阅时才生效
             if (handle != null && handle.stopRequested.get()) {
-                // 终止：已保留部分内容，由外层循环按 stopRequested 收尾
-                return;
+                break;
             }
-            String err = timeout ? "回复超时，已中止"
-                    : (e.getMessage() == null ? e.toString() : e.getMessage());
-            // 消息给用户简短提示，日志补全异常链（超时另记轮次上限，便于核对配置）
-            support.persistError(conv, agent, "「" + agent.getName() + "」回复失败：" + err,
-                    timeout ? "回复上限 " + limitsService.load().memberMinutes() + " 分钟；"
-                            + ConversationStreamSupport.errorDetail(e)
-                            : ConversationStreamSupport.errorDetail(e));
-            support.send(emitter, "reply_error", Map.of("agentId", agent.getId(), "error", err));
-        } finally {
-            if (handle != null) handle.running.remove(react);
-            react.close();
+            ReActAgent.Builder builder = ReActAgent.builder()
+                    .name(agent.getName())
+                    .sysPrompt(sysPromptOf(agent, conv.getId(), handle != null ? handle.taskTag : null))
+                    .model(modelFactory.create(agent, preset, multiAgent))
+                    .toolkit(toolkitOf(conv, emitter, agent, handle, seg));
+            skillSupport.applySkills(builder, agent);
+            ReActAgent react = builder
+                    .maxIters(MAX_ITERS)
+                    .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
+                    .toolExecutionConfig(ConversationStreamSupport.toolCallExecutionConfig())
+                    .longTermMemory(memoryService.store(agent.getId()))
+                    .longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
+                    .build();
+            if (handle != null) handle.running.add(react);
+            try {
+                react.streamEvents(roundInput)
+                        .takeUntilOther(handle != null ? handle.cancelSignal() : Mono.never())
+                        .doOnNext(ev -> {
+                            if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
+                                String delta = ((TextBlockDeltaEvent) ev).getDelta();
+                                if (seg.msg.get() == null && delta.isBlank()) return;
+                                if (seg.msg.get() == null) {
+                                    support.openSegment(emitter, conv, agent, seg, handle != null ? handle.taskTag : null);
+                                }
+                                seg.text.add(TextBlock.builder().text(delta).build());
+                                support.send(emitter, "delta", Map.of(
+                                        "messageId", seg.msg.get().getId(),
+                                        "delta", delta,
+                                        "conversationId", conv.getId()));
+                            } else if (ev.getType() == AgentEventType.THINKING_BLOCK_DELTA) {
+                                String think = ((ThinkingBlockDeltaEvent) ev).getDelta();
+                                seg.thinking.append(think);
+                                // 推理模型的思考过程流式透出：气泡未打开时前端显示在思考条，打开后显示在气泡内
+                                support.send(emitter, "thinking_delta", ConversationStreamSupport.thinkingPayload(
+                                        agent.getId(), conv.getId(), seg, think));
+                            } else if (ev.getType() == AgentEventType.TOOL_CALL_START) {
+                                toolCalled.set(true);
+                                support.closeSegment(emitter, conv, agent, seg);
+                                String tool = ((ToolCallStartEvent) ev).getToolCallName();
+                                if (!ConversationStreamSupport.selfReportedTool(tool)) {
+                                    support.toolActivity(emitter, conv, agent, seg, tool, true, null, null);
+                                }
+                            } else if (ev.getType() == AgentEventType.TOOL_RESULT_END) {
+                                ToolResultEndEvent end = (ToolResultEndEvent) ev;
+                                String tool = end.getToolCallName();
+                                if (!ConversationStreamSupport.selfReportedTool(tool)) {
+                                    support.toolActivity(emitter, conv, agent, seg, tool, false, end.getState(),
+                                            ConversationStreamSupport.takeToolArgs(end.getToolCallId(),
+                                                    seg.toolArgs, seg.toolArgBuf));
+                                }
+                            } else if (ev.getType() == AgentEventType.TOOL_CALL_DELTA
+                                    || ev.getType() == AgentEventType.TOOL_CALL_END) {
+                                ConversationStreamSupport.accumulateToolArgs(ev, seg.toolArgBuf, seg.toolArgs);
+                            }
+                        })
+                        .blockLast(Duration.ofMinutes(limitsService.load().memberMinutes()));
+                // closeSegment 会 drain 文本缓冲，意图判定要赶在它之前取走全文
+                String said = seg.text.getAccumulated();
+                support.closeSegment(emitter, conv, agent, seg);
+                boolean stopped = handle != null && handle.stopRequested.get();
+                if (seg.opened == 0 && !stopped) {
+                    support.persistError(conv, agent, "「" + agent.getName() + "」（模型未返回内容）");
+                    support.send(emitter, "reply_error", Map.of("agentId", agent.getId(), "error", "（模型未返回内容）"));
+                    break;
+                }
+                if (attempt > 0 || stopped || toolCalled.get() || !ACTION_PROMISE.matcher(said).find()) {
+                    break;
+                }
+                appLogs.record(AppLog.TYPE_REPLY, conv.getId(), agent.getId(),
+                        "「" + agent.getName() + "」声称要执行操作但整轮未调用任何工具，已追加纠正指令重试");
+                roundInput = new ArrayList<>(input);
+                roundInput.add(new UserMessage(List.of(TextBlock.builder().text(PROMISE_CORRECTION).build())));
+            } catch (UncheckedIOException e) {
+                // 客户端断开，SSE 已不可用
+                throw e;
+            } catch (Exception e) {
+                support.closeSegment(emitter, conv, agent, seg);
+                boolean timeout = ConversationStreamSupport.isBlockingTimeout(e);
+                // 只有 stopRequested 才按用户终止处理：异常链里的 InterruptedException 未必来自用户
+                // （框架/传输层超时都可能夹带），凭它判定会吞掉真实的回复失败
+                if (handle != null && handle.stopRequested.get()) {
+                    // 终止：已保留部分内容，由外层循环按 stopRequested 收尾
+                    return;
+                }
+                String err = timeout ? "回复超时，已中止"
+                        : (e.getMessage() == null ? e.toString() : e.getMessage());
+                // 消息给用户简短提示，日志补全异常链（超时另记轮次上限，便于核对配置）
+                support.persistError(conv, agent, "「" + agent.getName() + "」回复失败：" + err,
+                        timeout ? "回复上限 " + limitsService.load().memberMinutes() + " 分钟；"
+                                + ConversationStreamSupport.errorDetail(e)
+                                : ConversationStreamSupport.errorDetail(e));
+                support.send(emitter, "reply_error", Map.of("agentId", agent.getId(), "error", err));
+                // 失败轮绝不重试：重试只留给「只说不做」纠正这一条路，否则 API 断流后会
+                // 静默再跑一轮——用户看到报错了动画却还在，体感就是「失败了但停不下来」
+                break;
+            } finally {
+                if (handle != null) handle.running.remove(react);
+                react.close();
+            }
         }
     }
 
