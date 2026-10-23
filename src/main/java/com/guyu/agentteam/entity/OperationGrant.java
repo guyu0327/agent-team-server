@@ -24,6 +24,7 @@ public class OperationGrant {
     public static final String OP_SHELL = "shell";
     /** browser_open 的会话级授权：允许后该会话打开任意网页不再询问（后续点击/输入等跟进操作本就不再弹卡） */
     public static final String OP_BROWSER = "browser";
+    public static final String OP_COMPUTER = "computer";
 
     public static final String DECISION_ONCE = "once";
     public static final String DECISION_CONVERSATION = "conversation";

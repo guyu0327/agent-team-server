@@ -3,6 +3,7 @@ package com.guyu.agentteam.controller;
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.common.CurrentUser;
 import com.guyu.agentteam.dto.AddMembersRequest;
+import com.guyu.agentteam.dto.AskAnswerRequest;
 import com.guyu.agentteam.dto.ConversationDto;
 import com.guyu.agentteam.dto.FileGrantDto;
 import com.guyu.agentteam.dto.GroupChatRequest;
@@ -16,6 +17,7 @@ import com.guyu.agentteam.dto.SingleChatRequest;
 import com.guyu.agentteam.entity.Conversation;
 import com.guyu.agentteam.entity.ConversationFileGrant;
 import com.guyu.agentteam.entity.Message;
+import com.guyu.agentteam.service.AskUserService;
 import com.guyu.agentteam.service.ChatStreamService;
 import com.guyu.agentteam.service.ConversationService;
 import com.guyu.agentteam.service.ConversationStreamSupport;
@@ -50,18 +52,20 @@ public class ConversationController {
     private final OrchestrationService orchestrationService;
     private final FileGrantService fileGrantService;
     private final OpApprovalService opApproval;
+    private final AskUserService askUsers;
     private final ConversationStreamSupport streamSupport;
 
     public ConversationController(ConversationService conversationService, MessageService messageService,
                                   ChatStreamService chatStreamService, OrchestrationService orchestrationService,
                                   FileGrantService fileGrantService, OpApprovalService opApproval,
-                                  ConversationStreamSupport streamSupport) {
+                                  AskUserService askUsers, ConversationStreamSupport streamSupport) {
         this.conversationService = conversationService;
         this.messageService = messageService;
         this.chatStreamService = chatStreamService;
         this.orchestrationService = orchestrationService;
         this.fileGrantService = fileGrantService;
         this.opApproval = opApproval;
+        this.askUsers = askUsers;
         this.streamSupport = streamSupport;
     }
 
@@ -235,5 +239,12 @@ public class ConversationController {
     public Map<String, Object> opGrant(@PathVariable String id, @RequestBody OpGrantRequest req) {
         req.validate();
         return Map.of("applied", opApproval.decide(req.requestId(), req.decision()));
+    }
+
+    /** 提问卡片回答：answer 为所选项文本或「其他」自由输入；applied=false 表示问题已超时失效 */
+    @PostMapping("/{id}/ask-answer")
+    public Map<String, Object> askAnswer(@PathVariable String id, @RequestBody AskAnswerRequest req) {
+        req.validate();
+        return Map.of("applied", askUsers.answer(req.requestId(), req.answer()));
     }
 }

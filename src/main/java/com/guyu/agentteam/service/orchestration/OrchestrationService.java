@@ -25,7 +25,9 @@ import com.guyu.agentteam.service.FileGrantService;
 import com.guyu.agentteam.service.MessageService;
 import com.guyu.agentteam.service.OpApprovalService;
 import com.guyu.agentteam.service.SkillSupport;
+import com.guyu.agentteam.service.ComputerSettingsService;
 import com.guyu.agentteam.service.tool.BrowserTools;
+import com.guyu.agentteam.service.tool.ComputerTools;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.ScheduledTaskTools;
@@ -94,6 +96,10 @@ public class OrchestrationService {
     private final com.guyu.agentteam.service.tool.WebTools webTools;
     private final com.guyu.agentteam.service.tool.SkillTools skillTools;
     private final BrowserTools browserTools;
+    private final ComputerTools computerTools;
+    private final ComputerSettingsService computerSettings;
+    private final com.guyu.agentteam.service.tool.AskUserTools askUserTools;
+    private final com.guyu.agentteam.service.AskUserService askUsers;
     /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
     private final Map<String, RunHandle> runs = new ConcurrentHashMap<>();
 
@@ -110,7 +116,10 @@ public class OrchestrationService {
                                 SkillSupport skillSupport,
                                 com.guyu.agentteam.service.tool.WebTools webTools,
                                 com.guyu.agentteam.service.tool.SkillTools skillTools,
-                                BrowserTools browserTools) {
+                                BrowserTools browserTools,
+                                com.guyu.agentteam.service.tool.AskUserTools askUserTools,
+                                com.guyu.agentteam.service.AskUserService askUsers,
+                                ComputerTools computerTools, ComputerSettingsService computerSettings) {
         this.agents = agents;
         this.members = members;
         this.support = support;
@@ -132,6 +141,10 @@ public class OrchestrationService {
         this.webTools = webTools;
         this.skillTools = skillTools;
         this.browserTools = browserTools;
+        this.askUserTools = askUserTools;
+        this.askUsers = askUsers;
+        this.computerTools = computerTools;
+        this.computerSettings = computerSettings;
     }
 
     public void run(SseEmitter emitter, Conversation conv, Agent orchestrator, ModelPreset preset,
@@ -242,8 +255,15 @@ public class OrchestrationService {
         imageTools.register(toolkit, orchestrator, support.imageListener(emitter, () -> target.get().getId(), orchestrator));
         viewTools.register(toolkit, () -> target.get().getId());
         webTools.register(toolkit, support.webListener(emitter, () -> target.get().getId(), orchestrator, seg.webLog));
-        browserTools.register(toolkit, () -> target.get().getId(), sink,
-                support.browserListener(emitter, () -> target.get().getId(), orchestrator, seg.browseLog));
+        // 微信轮无法弹审批卡片，浏览器操作必然被拒：说了「请勿调用」不如直接不挂工具
+        if (!fromWechat) {
+            browserTools.register(toolkit, () -> target.get().getId(), sink,
+                    support.browserListener(emitter, () -> target.get().getId(), orchestrator, seg.browseLog));
+        }
+        // 本机键鼠操控：默认关闭；后台轮（定时任务/微信）无人审批，一律不挂
+        if (!background && computerSettings.load().enabled()) {
+            computerTools.register(toolkit, () -> target.get().getId(), sink);
+        }
         skillTools.register(toolkit, orchestrator, sink);
         toolkit.registerTool(new TeamTools(emitter, conv, target, orchestrator, team, seg, finished, createdGroupId, handle, executed, delegated));
         // 定时任务工具：会话跟随协作目标（建群后任务绑定项目群），创建的任务归编排者名下；
@@ -251,6 +271,10 @@ public class OrchestrationService {
         if (!fromWechat) {
             taskTools.register(toolkit, () -> target.get().getId(), orchestrator::getId,
                     () -> taskTag != null ? taskTag.taskName() : null);
+        }
+        // 提问工具：编排者直接问用户（卡片在当前协作会话弹出）；后台轮没人在卡片前，不挂
+        if (taskTag == null) {
+            askUserTools.register(toolkit, emitter, orchestrator, () -> target.get().getId(), null, null, null);
         }
 
         compression.compactIfNeeded(conv, orchestrator);
@@ -354,8 +378,11 @@ public class OrchestrationService {
         // 直接掐断在途的模型请求/审批等待：框架 interrupt 只在迭代间生效，长调用会拖住终止
         handle.requestCancel();
         handle.running.forEach(ReActAgent::interrupt);
-        // 卡在审批等待的请求按拒绝唤醒，前端同步关闭卡片
-        handle.keys.forEach(key -> approval.cancelAllForConversation(key));
+        // 卡在审批等待的请求按拒绝唤醒，前端同步关闭卡片；提问卡片的等待一并按终止唤醒
+        handle.keys.forEach(key -> {
+            approval.cancelAllForConversation(key);
+            askUsers.cancelAllForConversation(key);
+        });
         appLogs.record(AppLog.TYPE_COORDINATION, conversationId, null,
                 "用户手动终止协作（编排者「" + handle.orchestratorName + "」）");
         return true;
@@ -477,12 +504,20 @@ public class OrchestrationService {
         } else if (!team.isEmpty()) {
             sb.append("当前所有成员均不具备图像生成能力，涉及绘图的任务请自行完成或向用户说明。\n");
         }
-        sb.append(fileTools.promptNote(conversationId, background, fromWechat)).append("\n\n")
-                .append(browserTools.promptNote(background, fromWechat, autoBrowser)).append("\n");
-        String digest = compression.digestOf(conversationId);
-        if (!Str.isBlank(digest)) {
-            sb.append("\n【会话早期历史摘要】\n更早的完整对话已压缩为以下要点，请以此作为早期上下文：\n")
-                    .append(digest.trim()).append("\n");
+        sb.append(fileTools.promptNote(conversationId, background, fromWechat));
+        // 微信轮浏览器工具不注册（见 runAgentRound），使用说明一并省略
+        if (!fromWechat) {
+            sb.append("\n\n").append(browserTools.promptNote(background, autoBrowser));
+        }
+        if (!background && computerSettings.load().enabled()) {
+            sb.append("\n\n").append(computerTools.promptNote());
+        }
+        sb.append("\n");
+        // 行动纪律同样约束编排者本人：亲自执行的简单请求不许用「我去安排」空承诺收尾
+        sb.append('\n').append(support.ACTION_DISCIPLINE).append('\n');
+        String digestBlock = compression.promptBlock(conversationId);
+        if (digestBlock != null) {
+            sb.append('\n').append(digestBlock).append('\n');
         }
         String memory = memoryService.promptBlock(orchestrator.getId());
         if (!Str.isBlank(memory)) {
@@ -711,6 +746,7 @@ public class OrchestrationService {
             // 任务触发回合里成员与编排者同策略：按任务配置自动放行/拒绝，不走无人响应的人工审批
             ConversationStreamSupport.TaskTag tag = handle.taskTag;
             boolean memberBackground = tag != null;
+            boolean memberFromWechat = tag != null && tag.taskId() == null;
             OpRequestSink memberSink = (opType, opTarget, detail) ->
                     approval.approve(emitter, targetAgent, conv.getId(), opType, opTarget, detail,
                             memberBackground, tag != null && tag.autoWrite(), tag != null && tag.autoShell(),
@@ -723,19 +759,39 @@ public class OrchestrationService {
             ConversationStreamSupport.WebActivityLog memberWeb = new ConversationStreamSupport.WebActivityLog();
             webTools.register(memberToolkit, support.webListener(emitter, conv::getId, targetAgent, memberWeb));
             ConversationStreamSupport.WebActivityLog memberBrowse = new ConversationStreamSupport.WebActivityLog();
-            browserTools.register(memberToolkit, conv::getId, memberSink,
-                    support.browserListener(emitter, conv::getId, targetAgent, memberBrowse));
+            // 微信轮无法弹审批卡片，浏览器操作必然被拒：说了「请勿调用」不如直接不挂工具
+            if (!memberFromWechat) {
+                browserTools.register(memberToolkit, conv::getId, memberSink,
+                        support.browserListener(emitter, conv::getId, targetAgent, memberBrowse));
+            }
+            // 本机键鼠操控：默认关闭；后台轮无人审批，不挂
+            if (!memberBackground && computerSettings.load().enabled()) {
+                computerTools.register(memberToolkit, conv::getId, memberSink);
+            }
             ConversationStreamSupport.WebActivityLog memberTools = new ConversationStreamSupport.WebActivityLog();
             Map<String, Map<String, Object>> memberArgs = new java.util.concurrent.ConcurrentHashMap<>();
             Map<String, StringBuilder> memberArgBuf = new java.util.concurrent.ConcurrentHashMap<>();
             skillTools.register(memberToolkit, targetAgent, memberSink);
-            boolean memberFromWechat = tag != null && tag.taskId() == null;
-            String memberNote = fileTools.promptNote(conv.getId(), memberBackground, memberFromWechat)
-                    + "\n\n" + browserTools.promptNote(memberBackground, memberFromWechat,
-                            tag != null && tag.autoBrowser());
+            // 成员的提问不直达用户：先经编排者代答（独立轻量调用），编排者也判断不了再升级弹用户卡片；
+            // 后台轮（定时任务/微信）没人在卡片前，不挂
+            if (!memberBackground) {
+                askUserTools.register(memberToolkit, emitter, targetAgent, conv::getId,
+                        q -> askUsers.proxyAnswer(orchestrator, p.get(), conv.getId(), task, q),
+                        orchestrator::getName,
+                        text -> saveSystemNote(conv, text));
+            }
+            String memberNote = fileTools.promptNote(conv.getId(), memberBackground, memberFromWechat);
+            // 微信轮浏览器工具未挂，使用说明一并省略
+            if (!memberFromWechat) {
+                memberNote += "\n\n" + browserTools.promptNote(memberBackground, tag != null && tag.autoBrowser());
+            }
+            if (!memberBackground && computerSettings.load().enabled()) {
+                memberNote += "\n\n" + computerTools.promptNote();
+            }
             String memberSysPrompt = Str.isBlank(targetAgent.getSystemPrompt())
                     ? memberNote
                     : targetAgent.getSystemPrompt().trim() + "\n\n" + memberNote;
+            memberSysPrompt += "\n\n" + support.ACTION_DISCIPLINE;
             String memberMemory = memoryService.promptBlock(targetAgent.getId());
             if (!Str.isBlank(memberMemory)) {
                 memberSysPrompt += "\n\n" + memberMemory;

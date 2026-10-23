@@ -166,26 +166,22 @@ public class ScheduledTaskTools {
 
     /**
      * 拼进系统提示的「创建定时任务」指令（成员与编排者两个入口同源，改文案只改这里）。
-     * 任务项目群在创建任务时即建好，到点直接在群里执行——不要写成「到点再建群」。
+     * 只讲何时必须建任务与 member_ids 纪律；建群时机等机制细节由 schedule_task 的工具描述与创建返回文案承担。
      */
     public static String scheduleHint(boolean orchestrator) {
         if (orchestrator) {
             return "当用户要求定时、定期、每天/每周固定时间、每隔一段时间或到点执行/提醒某事时，这是要创建定时任务："
                     + "必须调用 schedule_task 创建并向用户确认时间；只要该工作需要成员参与（由谁做、让谁做、谁来完成等），"
-                    + "就必须把相关成员传给 member_ids（支持成员 id 或成员名字，可先 list_team 查成员）——"
-                    + "创建任务时会同时建好任务项目群，到点直接在该群中执行，无需到点再建。"
-                    + "漏传 member_ids 会导致只有你一人执行，成员不会参与。"
-                    + "此场景下禁止调用 create_team 建普通项目群、也不要立即 delegate 委派成员：普通群聊本身不会让工作定时发生。"
+                    + "就必须把相关成员传给 member_ids（支持成员 id 或名字，可先 list_team 查成员），"
+                    + "漏传会导致只有你一人执行。"
+                    + "此场景下禁止调用 create_team 建普通项目群、也不要立即 delegate 委派成员：普通群聊本身不会让工作定时发生，"
                     + "create_team 仅用于「现在就执行」的即时协作请求。"
-                    + "已创建的任务可用 list_scheduled_tasks 查询、update_scheduled_task 修改、cancel_scheduled_task 取消，"
-                    + "任务的执行结果会出现在「定时任务」页对应的任务会话中。";
+                    + "已创建的任务可用 list_scheduled_tasks 查询、update_scheduled_task 修改、cancel_scheduled_task 取消。";
         }
         return "当用户要求定时、定期、每天/每周固定时间、每隔一段时间或到点执行/提醒某事时，必须调用 schedule_task "
                 + "创建定时任务并向用户确认时间，不要只在对话里口头答应；"
-                + "若该工作需要其他成员一起完成，把成员 id 传给 member_ids——"
-                + "创建任务时会同时建好任务项目群，到点直接在该群中执行，无需到点再建。"
-                + "不要用建普通群聊代替定时任务（群聊本身不会让工作定时发生）。"
-                + "任务的执行结果会出现在「定时任务」页对应的任务会话中。";
+                + "若该工作需要其他成员一起完成，把成员 id 传给 member_ids。"
+                + "不要用建普通群聊代替定时任务（群聊本身不会让工作定时发生）。";
     }
 
     /** 拼进系统提示的「定时任务触发识别」指令（与 scheduleHint 同源配套） */

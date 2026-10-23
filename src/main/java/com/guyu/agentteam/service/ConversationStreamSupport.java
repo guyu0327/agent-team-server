@@ -637,6 +637,19 @@ public class ConversationStreamSupport {
     public static final Duration MODEL_CALL_TIMEOUT = Duration.ofMinutes(3);
 
     /**
+     * 行动纪律：注入所有智能体（单聊/群聊成员、编排者、被委派成员）的系统提示，
+     * 压低第一轮「只说不做」的发生概率——纠错重试只是兜底，不该成为常驻流程。
+     * 点名承诺句式与剧情旁白这两个高频替身（角色扮演人设尤其容易把旁白当行动）。
+     */
+    public static final String ACTION_DISCIPLINE = "【行动纪律】用户的请求需要实际执行操作时（浏览/操作网页、发帖回帖、"
+            + "读写文件、执行命令、搜索、生成图片、发消息等），当轮立即调用对应工具完成，完成后再向用户汇报结果。"
+            + "不要用「这就去」「我去看看」「马上处理」等承诺文字收尾，也不要用括号旁白、剧情描写代替真实调用——"
+            + "旁白里写「打开了」「回好了」不算做了，本轮没有任何工具调用就是没做；"
+            + "空承诺的回复会被系统判定为敷衍并强制重做一轮。"
+            + "指令有歧义时不要反复重读原文揣测——先基于最近上下文取最合理解读，能先查看目标（看一眼相关页面/记录/数据）就直接看，"
+            + "看完再动；确实无法自查且做错代价高时，调用 ask_user 把疑问集中一次问清（附上你的候选选项），不要在原地纠结多个回合。";
+
+    /**
      * 模型调用的超时与重试策略（框架 ExecutionConfig）：
      * 不设置时框架对模型调用既无超时也无重试；设置后对可重试错误（传输故障、可重试 HTTP 状态、超时、IO）
      * 自动指数退避重试，空闲超时以 ModelException 表达。整体运行上限仍由各服务的 blockLast 兜底。
@@ -901,6 +914,7 @@ public class ConversationStreamSupport {
             case "add_member" -> target = textArg(input, "member");
             case "recordToMemory" -> target = firstNonBlank(listFirst(input.get("content")), textArg(input, "thinking"));
             case "retrieveFromMemory" -> target = listFirst(input.get("keywords"));
+            case "ask_user" -> target = listFirst(input.get("questions"));
             default -> {
                 return null;
             }

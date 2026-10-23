@@ -255,7 +255,45 @@ public class BrowserService {
     public PageInfo current(String conversationId) {
         return supply(conversationId, true, () -> {
             Session s = requireSession(conversationId);
-            return withNotice(infoOf(conversationId, s.page, false), takeNotice(conversationId));
+            PageInfo info = withNotice(infoOf(conversationId, s.page, false), takeNotice(conversationId));
+            String prev = lastCurrentSnapshots.put(conversationId, info.snapshot());
+            if (info.snapshot().equals(prev)) {
+                return new PageInfo(info.url(), info.title(),
+                        info.snapshot() + "\n（页面结构与你上次调用 browser_current 时完全相同——"
+                                + "重复调用不会看到新内容；要拿截断部分元素的编号，用 browser_snapshot 传附近容器编号。）",
+                        info.unchanged());
+            }
+            return info;
+        });
+    }
+
+    /** 各会话上一次 browser_current 取到的整页快照：连续相同则告知模型，避免反复重取撞运气 */
+    private final Map<String, String> lastCurrentSnapshots = new ConcurrentHashMap<>();
+
+    /**
+     * 局部快照（browser_snapshot）：对 ref 指向的元素子树取可访问性结构。整页快照超长被截断时，
+     * 截断点之外的元素拿不到编号——对目标附近的容器取局部结构即可获得完整子树编号，不受整页截断影响。
+     * 子树本身仍超长时同样截断，提示模型换更小的容器。
+     */
+    public String snapshotElement(String conversationId, String ref) {
+        return supply(conversationId, true, () -> {
+            Page page = requireSession(conversationId).page;
+            Locator loc = locator(page, ref);
+            settle(page);
+            tagContentImages(page);
+            for (int attempt = 1; attempt <= 2; attempt++) {
+                try {
+                    return truncateSnapshot(loc.ariaSnapshot(
+                            new Locator.AriaSnapshotOptions().setMode(AriaSnapshotMode.AI)));
+                } catch (Exception e) {
+                    if (attempt == 1) {
+                        page.waitForTimeout(400);
+                    } else {
+                        throw new IllegalStateException("获取局部结构失败：" + brief(e));
+                    }
+                }
+            }
+            throw new IllegalStateException("获取局部结构失败");
         });
     }
 
@@ -284,14 +322,14 @@ public class BrowserService {
     }
 
     /**
-     * 滚动一屏的 9/10。先滚窗口；窗口不可滚（y 不动）时自动找页面上最大的可视内滚容器
-     * （overflow:auto/scroll 的元素，很多页面主内容区自带滚动条，window.scrollBy 对它无效）滚它。
-     * 都不可滚时 mode=none，说明页面内容不足一屏，调用方据此提示模型别反复滚。
+     * 滚动 amount 个视口高（调用方已钳制 0.1~5，不传时为 0.9 屏）。先滚窗口；窗口不可滚（y 不动）
+     * 时自动找页面上最大的可视内滚容器（overflow:auto/scroll 的元素，很多页面主内容区自带滚动条，
+     * window.scrollBy 对它无效）滚它。都不可滚时 mode=none，说明页面内容不足一屏，调用方据此提示模型别反复滚。
      */
-    public ScrollResult scroll(String conversationId, boolean down) {
+    public ScrollResult scroll(String conversationId, boolean down, double amount) {
         return supply(conversationId, () -> {
             Page page = pageOf(conversationId);
-            int delta = (down ? 1 : -1) * VIEWPORT_HEIGHT * 9 / 10;
+            int delta = (down ? 1 : -1) * (int) Math.round(VIEWPORT_HEIGHT * amount);
             Object r = page.evaluate("""
                     d => {
                       const before = Math.round(window.scrollY);
@@ -432,21 +470,45 @@ public class BrowserService {
         });
     }
 
-    /** 元素级截图：先等网络静默再拍，ref 失效由 locator 的存在性校验当场报错引导重取快照 */
+    /** 元素级截图：先等网络静默，滚入视口（顺带触发懒加载）后等图下载解码完再拍——
+     *  图片没下完就拍是白块/半截，模型会误判「编号失效/图片不存在」；ref 失效由
+     *  locator 的存在性校验当场报错引导重取快照 */
     private static byte[] shootElement(Page page, String ref) {
         settle(page);
-        return locator(page, ref).screenshot(new Locator.ScreenshotOptions().setType(ScreenshotType.PNG));
+        Locator loc = locator(page, ref);
+        try {
+            loc.scrollIntoViewIfNeeded(new Locator.ScrollIntoViewIfNeededOptions().setTimeout(3_000));
+        } catch (Exception ignored) {
+            // 已在视口/滚动交给截图自身处理
+        }
+        try {
+            loc.evaluate("(el) => new Promise(res => {"
+                    + " if (el.tagName !== 'IMG' || (el.complete && el.naturalWidth > 0)) return res(true);"
+                    + " const started = Date.now();"
+                    + " const timer = setInterval(() => {"
+                    + "   const ready = el.complete && el.naturalWidth > 0;"
+                    + "   if (ready || Date.now() - started > 8000) { clearInterval(timer); res(ready); } }, 300); })");
+        } catch (Exception ignored) {
+            // 元素中途消失等异常交给截图当场报错
+        }
+        // JPEG q80 而非 PNG：截图以 ImageBlock/base64 进模型上下文，PNG 一张 1-3MB，
+        // 几张就把 prompt 滚爆（400 prompt too long）；清晰度由 2 倍像素密度保底
+        return loc.screenshot(new Locator.ScreenshotOptions().setType(ScreenshotType.JPEG).setQuality(80));
     }
 
-    /** 截图前先等网络静默；疑似没加载出来（整页近乎空白）时等一拍重拍，最多两次 */
+    /** 截图前先等网络静默；疑似没加载出来（整页近乎空白/视口内的图全没下完）时
+     *  重新等静默再重拍，最多两次——慢请求没完成就拍会得到白图，模型误判操作无效 */
     private static byte[] shootSettled(Page page) {
-        settle(page);
-        byte[] png = page.screenshot(new Page.ScreenshotOptions().setType(ScreenshotType.PNG));
+        byte[] png = shootOnceAfterSettle(page);
         for (int attempt = 0; attempt < 2 && looksUnloaded(page); attempt++) {
-            page.waitForTimeout(1_500);
-            png = page.screenshot(new Page.ScreenshotOptions().setType(ScreenshotType.PNG));
+            png = shootOnceAfterSettle(page);
         }
         return png;
+    }
+
+    private static byte[] shootOnceAfterSettle(Page page) {
+        settle(page);
+        return page.screenshot(new Page.ScreenshotOptions().setType(ScreenshotType.JPEG).setQuality(80));
     }
 
     public void closeSession(String conversationId) {
@@ -818,14 +880,19 @@ public class BrowserService {
         }
     }
 
-    /** 疑似还没渲染出来（正文可见文本过短且可交互元素过少），用于触发截图重拍 */
+    /** 疑似还没渲染出来，用于触发截图重拍：正文可见文本过短且可交互元素过少（页面壳都
+     *  没有），或视口内所有的图都没下载解码完（壳已渲染但内容请求没回来，拍到半白页） */
     private static boolean looksUnloaded(Page page) {
         try {
             Object r = page.evaluate(
                     "() => { const b = document.body; if (!b) return true;"
                             + " const text = (b.innerText || '').trim().length;"
                             + " const vis = b.querySelectorAll('a,button,input,[role=button],img').length;"
-                            + " return text < 30 && vis < 5; }");
+                            + " if (text < 30 && vis < 5) return true;"
+                            + " const inView = Array.from(document.images).filter(i => {"
+                            + "   const r = i.getBoundingClientRect();"
+                            + "   return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight; });"
+                            + " return inView.length > 0 && inView.every(i => !i.complete || i.naturalWidth === 0); }");
             return Boolean.TRUE.equals(r);
         } catch (Exception e) {
             return false;
@@ -842,11 +909,14 @@ public class BrowserService {
 
     /** 快照兜底：导航竞态下 body 可能瞬间不存在，等一拍重试一次，仍失败则降级为软提示 */
     private String snapshotWithRetry(Page page) {
+        tagContentImages(page);
         for (int attempt = 1; attempt <= 2; attempt++) {
             try {
-                // AI 模式才会在快照里输出 [ref=eN] 元素编号，click/fill/select 全靠它引用元素
-                return page.locator("body")
-                        .ariaSnapshot(new Locator.AriaSnapshotOptions().setMode(AriaSnapshotMode.AI));
+                // AI 模式才会在快照里输出 [ref=eN] 元素编号，click/fill/select 全靠它引用元素；
+                // 超 2 万字符截断——长帖/图片海页面单页快照可达十几万字符，每步工具结果都留在
+                // 当轮 ReAct 记忆里无上限累积，几步就把 prompt 滚到百万 token 直接 400
+                return truncateSnapshot(page.locator("body")
+                        .ariaSnapshot(new Locator.AriaSnapshotOptions().setMode(AriaSnapshotMode.AI)));
             } catch (Exception e) {
                 if (attempt == 1) {
                     page.waitForTimeout(600);
@@ -859,6 +929,31 @@ public class BrowserService {
         return SNAPSHOT_UNAVAILABLE;
     }
 
+    /**
+     * 给页面图片挂无障碍标记，使其进入快照并获得 [ref=]，模型可 browser_screenshot(ref=) 定点看图。
+     * 不筛尺寸：正文图、头像、小表情都标记（标签里带宽高，模型可自行判断类型），
+     * 只跳过尚未加载/不可见的（宽高 <2）；最多 {@value #MAX_TAGGED_IMAGES} 张，失败静默降级。
+     */
+    private static final int MAX_TAGGED_IMAGES = 40;
+
+    private void tagContentImages(Page page) {
+        try {
+            page.evaluate(""
+                    + "() => { let n = 0;"
+                    + " for (const im of document.querySelectorAll('img')) {"
+                    + " if (n >= " + MAX_TAGGED_IMAGES + ") break;"
+                    + " const w = im.clientWidth || im.naturalWidth, h = im.clientHeight || im.naturalHeight;"
+                    + " if (w < 2 || h < 2) continue;"
+                    + " const alt = ((im.getAttribute('alt') || '') + '').trim();"
+                    + " im.setAttribute('role', 'img');"
+                    + " im.setAttribute('aria-label', '图片' + (++n) + ' ' + w + 'x' + h"
+                    + " + (alt ? '：' + alt.slice(0, 30) : ''));"
+                    + " } return n; }");
+        } catch (Exception e) {
+            log.debug("内容图标记失败（不影响快照）：{}", e.toString());
+        }
+    }
+
     private static String truncateSnapshot(String snapshot) {
         if (snapshot == null) {
             return "（页面无可访问性结构）";
@@ -867,7 +962,8 @@ public class BrowserService {
             return snapshot;
         }
         return snapshot.substring(0, 20000)
-                + "\n…[页面结构过长已截断，可用 browser_scroll 配合 browser_screenshot 查看局部]";
+                + "\n…[页面结构过长已截断，可用 browser_snapshot 传目标附近元素的编号取局部结构"
+                + "（选尽量小的容器），或 browser_scroll 配合 browser_screenshot 查看]";
     }
 
     private static String launchFailureMessage(RuntimeException e) {

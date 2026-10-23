@@ -135,6 +135,16 @@ public class ContextCompressionService {
                 .orElse(null);
     }
 
+    /** 会话摘要的完整提示词块（含标题与 view_image 重看提示），无摘要返回 null；单聊/群聊与编排者拼装共用同一文案 */
+    public String promptBlock(String conversationId) {
+        String digest = digestOf(conversationId);
+        if (digest == null || digest.isBlank()) {
+            return null;
+        }
+        return "【会话早期历史摘要】\n更早的完整对话已压缩为以下要点，请以此作为早期上下文"
+                + "（更早已阅的图片不再重复附上，需要重看可调用 view_image 工具）：\n" + digest.trim();
+    }
+
     /**
      * 回合开始前调用：超过预算则把较旧的一段消息滚入摘要（同步一次模型调用）。
      * modelOwner 提供压缩用的模型预设；失败只记日志并降级为截断，绝不阻塞回复。

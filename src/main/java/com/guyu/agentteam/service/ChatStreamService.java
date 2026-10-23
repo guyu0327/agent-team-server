@@ -14,7 +14,9 @@ import com.guyu.agentteam.repository.ConversationMemberRepository;
 import com.guyu.agentteam.repository.ScheduledTaskRepository;
 import com.guyu.agentteam.service.orchestration.AgentModelFactory;
 import com.guyu.agentteam.service.orchestration.OrchestrationService;
+import com.guyu.agentteam.service.tool.AskUserTools;
 import com.guyu.agentteam.service.tool.BrowserTools;
+import com.guyu.agentteam.service.tool.ComputerTools;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
 import com.guyu.agentteam.service.tool.OpRequestSink;
 import com.guyu.agentteam.service.tool.ScheduledTaskTools;
@@ -51,7 +53,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -68,23 +69,25 @@ public class ChatStreamService {
     private static final int MAX_ITERS = Integer.MAX_VALUE;
     private static final Duration SELECT_TIMEOUT = Duration.ofMinutes(2);
 
+    /** 「只说不做」反思判定的超时：判定是短任务，超时按「无法判定」放行，不让审查拖死正常回复 */
+    private static final Duration PROMISE_REVIEW_TIMEOUT = Duration.ofSeconds(60);
+
     /**
-     * 「只说不做」意图句式：行动引导词 +（0–24 字内）动作词。整轮零工具调用且回复命中此句式时
-     * 判定为「声称要动手却没动手」，触发一次纠正重试；动作词后跟「了/过/完/好」按完成时汇报处理
-     * （「我去看过了」不纠正）；纯闲聊（「我去看电影」误判）代价仅为多一轮澄清。
+     * 「只说不做」反思判定提示词：交给同一模型做一次结构化判断（替代旧正则句式匹配——表述变体
+     * 追不完，角色扮演的叙述式旁白「百度开了」尤其盖不住）。判定失败按放行处理，宁漏勿冤。
      */
-    private static final Pattern ACTION_PROMISE = Pattern.compile(
-            "(我去|我来|这就|现在|马上|先去|再去|接着去|让我|我先|我会|接下来)"
-                    + "[^。！？!?\\n]{0,24}?"
-                    + "(打开|浏览|访问|看看|看一下|瞧瞧|瞅瞅|查一下|查查|查|确认|核实|检查|删|清除|清空|撤回"
-                    + "|编辑|修改|发布|发表|回复|评论|发帖|转发|点赞|上传|下载|登录|搜索|搜一下|截图|点击"
-                    + "|填入|填写|写|保存|执行|运行|安装|部署|提交|抓取|刷新|翻|看|处理|关(?!注)|搞定)"
-                    + "(?![了过完着])");
+    private static final String PROMISE_REVIEW_PROMPT =
+            "你是回复审查器，判断一段AI回复是否属于「只说不做」：回复明确表示要去做某个需要动手的操作"
+                    + "（浏览网页、读写文件、执行命令、搜索、生成图片、发消息等），或叙述自己已经做了这类操作，"
+                    + "但按上下文本应实际调用工具完成，而它一条工具都没调就结束了。"
+                    + "以下情况不算：直接回答了用户的问题、纯闲聊寒暄、说明自己无法或无需执行的原因、"
+                    + "角色扮演的剧情旁白且剧情里没有声称执行现实操作。";
 
     /** 纠正指令：只进模型上下文，不落库不进聊天记录 */
     private static final String PROMISE_CORRECTION =
-            "（系统提示）你上一条回复里说要去执行操作，但没有实际调用任何工具就结束了——说「去做」不等于「做了」。"
-                    + "请立即真正调用工具完成刚才承诺的操作；如果确实无法或无需执行，就明确说明原因，不要再只回复「我去做」。";
+            "（系统提示）你上一条回复里说要去执行操作，但没有实际调用任何工具就结束了——说「去做」不等于「做了」，"
+                    + "叙述「做了」也不等于真做了。请立即真正调用工具完成刚才承诺的操作；"
+                    + "如果确实无法或无需执行，就明确说明原因，不要再只用文字描述操作过程。";
 
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -110,6 +113,10 @@ public class ChatStreamService {
     private final WebTools webTools;
     private final SkillTools skillTools;
     private final BrowserTools browserTools;
+    private final AskUserTools askUserTools;
+    private final ComputerTools computerTools;
+    private final ComputerSettingsService computerSettings;
+    private final AskUserService askUsers;
 
     public ChatStreamService(ConversationMemberRepository members,
                              AgentRepository agents, AgentModelFactory modelFactory,
@@ -121,7 +128,9 @@ public class ChatStreamService {
                              ContextCompressionService compression, AgentMemoryService memoryService,
                              ScheduledTaskTools taskTools, ScheduledTaskRepository tasks,
                              SkillSupport skillSupport, WebTools webTools,
-                             SkillTools skillTools, BrowserTools browserTools) {
+                             SkillTools skillTools, BrowserTools browserTools,
+                             AskUserTools askUserTools, AskUserService askUsers,
+                             ComputerTools computerTools, ComputerSettingsService computerSettings) {
         this.members = members;
         this.agents = agents;
         this.modelFactory = modelFactory;
@@ -141,6 +150,10 @@ public class ChatStreamService {
         this.webTools = webTools;
         this.skillTools = skillTools;
         this.browserTools = browserTools;
+        this.askUserTools = askUserTools;
+        this.askUsers = askUsers;
+        this.computerTools = computerTools;
+        this.computerSettings = computerSettings;
     }
 
     public void stream(SseEmitter emitter, Conversation conv, Message userMsg) {
@@ -231,8 +244,9 @@ public class ChatStreamService {
         // 直接掐断在途的模型请求/审批等待：框架 interrupt 只在迭代间生效，长调用会拖住终止
         handle.requestCancel();
         handle.running.forEach(ReActAgent::interrupt);
-        // 卡在审批等待的请求按拒绝唤醒，前端同步关闭卡片
+        // 卡在审批等待的请求按拒绝唤醒，前端同步关闭卡片；提问卡片的等待一并按终止唤醒
         approval.cancelAllForConversation(conversationId);
+        askUsers.cancelAllForConversation(conversationId);
         if (handle.discussion) {
             appLogs.record(AppLog.TYPE_DISCUSSION, conversationId, null, "用户手动终止自由讨论");
         }
@@ -338,18 +352,31 @@ public class ChatStreamService {
                         .blockLast(Duration.ofMinutes(limitsService.load().memberMinutes()));
                 // closeSegment 会 drain 文本缓冲，意图判定要赶在它之前取走全文
                 String said = seg.text.getAccumulated();
-                support.closeSegment(emitter, conv, agent, seg);
                 boolean stopped = handle != null && handle.stopRequested.get();
                 if (seg.opened == 0 && !stopped) {
+                    support.closeSegment(emitter, conv, agent, seg);
                     support.persistError(conv, agent, "「" + agent.getName() + "」（模型未返回内容）");
                     support.send(emitter, "reply_error", Map.of("agentId", agent.getId(), "error", "（模型未返回内容）"));
                     break;
                 }
-                if (attempt > 0 || stopped || toolCalled.get() || !ACTION_PROMISE.matcher(said).find()) {
+                boolean violated = false;
+                if (attempt == 0 && !stopped && !toolCalled.get()) {
+                    // 整轮零工具调用：交同一模型反思判定是否「只说不做」（正则句式追不完表述变体）。
+                    // 判定必须赶在 closeSegment 之前：它是一次 1-2 秒的模型调用，若放在段关闭后，
+                    // 前端进入「段已结束、流未结束」的间隙态会亮思考条——体感是她说完话又凭空
+                    // 思考一两秒。提前期间气泡保持流式态（打字点接管），与模型出字停顿无异
+                    PromiseReview verdict = promiseReview(conv, agent, preset, input, said);
+                    violated = verdict != null && verdict.isViolated();
+                    if (violated) {
+                        appLogs.record(AppLog.TYPE_REPLY, conv.getId(), agent.getId(),
+                                "「" + agent.getName() + "」自查判定只说不做（" + ellipsis(verdict.getReason(), 120)
+                                        + "），已追加纠正指令重试");
+                    }
+                }
+                support.closeSegment(emitter, conv, agent, seg);
+                if (attempt > 0 || stopped || toolCalled.get() || !violated) {
                     break;
                 }
-                appLogs.record(AppLog.TYPE_REPLY, conv.getId(), agent.getId(),
-                        "「" + agent.getName() + "」声称要执行操作但整轮未调用任何工具，已追加纠正指令重试");
                 roundInput = new ArrayList<>(input);
                 roundInput.add(new UserMessage(List.of(TextBlock.builder().text(PROMISE_CORRECTION).build())));
             } catch (UncheckedIOException e) {
@@ -388,18 +415,29 @@ public class ChatStreamService {
         // 提示词必须据实区分——把微信聊天说成定时任务触发会让模型拿触发模式去套正常消息
         boolean fromWechat = tag != null && tag.taskId() == null;
         String base = Str.isBlank(agent.getSystemPrompt()) ? "" : agent.getSystemPrompt().trim();
-        String note = fileTools.promptNote(conversationId, background, fromWechat)
-                + "\n\n" + browserTools.promptNote(background, fromWechat, tag != null && tag.autoBrowser());
+        String note = fileTools.promptNote(conversationId, background, fromWechat);
+        // 微信轮浏览器工具不注册（见 toolkitOf），使用说明一并省略
+        if (!fromWechat) {
+            note += "\n\n" + browserTools.promptNote(background, tag != null && tag.autoBrowser());
+        }
+        if (!background && computerSettings.load().enabled()) {
+            note += "\n\n" + computerTools.promptNote();
+        }
         String sys = Str.isBlank(base) ? note : base + "\n\n" + note;
+        // 行动纪律：压第一轮「只说不做」的第一发生概率，纠错重试只是兜底
+        sys += "\n\n" + support.ACTION_DISCIPLINE;
         // 微信聊天轮不注入定时任务机制：任务结果只落应用内任务会话，微信用户永远看不到，
         // 提示与工具只剩误导（曾致模型幻觉「已创建喝水提醒」、拿触发视角误读普通聊天）
         if (!fromWechat) {
-            sys += "\n\n" + ScheduledTaskTools.scheduleHint(false) + "\n" + ScheduledTaskTools.triggerHint(false);
+            sys += "\n\n" + ScheduledTaskTools.scheduleHint(false);
+            // triggerHint 讲的是「收到到点触发消息如何执行」，普通聊天轮收不到这类消息，只在任务轮注入
+            if (tag != null) {
+                sys += "\n" + ScheduledTaskTools.triggerHint(false);
+            }
         }
-        String digest = compression.digestOf(conversationId);
-        if (!Str.isBlank(digest)) {
-            sys += "\n\n【会话早期历史摘要】\n更早的完整对话已压缩为以下要点，请以此作为早期上下文"
-                    + "（更早已阅的图片不再重复附上，需要重看可调用 view_image 工具）：\n" + digest.trim();
+        String digestBlock = compression.promptBlock(conversationId);
+        if (digestBlock != null) {
+            sys += "\n\n" + digestBlock;
         }
         String memory = memoryService.promptBlock(agent.getId());
         if (!Str.isBlank(memory)) {
@@ -423,6 +461,7 @@ public class ChatStreamService {
         // 任务触发回合为后台执行（无人响应审批卡片）：按任务配置自动放行或立即拒绝，
         // 不走 120 秒等待；普通聊天回合维持人工审批
         boolean background = tag != null;
+        boolean fromWechat = tag != null && tag.taskId() == null;
         OpRequestSink sink = (opType, target, detail) ->
                 approval.approve(emitter, agent, conv.getId(), opType, target, detail,
                         background, tag != null && tag.autoWrite(), tag != null && tag.autoShell(),
@@ -433,13 +472,23 @@ public class ChatStreamService {
         imageTools.register(toolkit, agent, support.imageListener(emitter, conv::getId, agent));
         viewTools.register(toolkit, conv::getId);
         webTools.register(toolkit, support.webListener(emitter, conv::getId, agent, seg.webLog));
-        browserTools.register(toolkit, conv::getId, sink,
-                support.browserListener(emitter, conv::getId, agent, seg.browseLog));
+        // 微信轮无法弹审批卡片，浏览器操作必然被拒：说了「请勿调用」不如直接不挂工具
+        if (!fromWechat) {
+            browserTools.register(toolkit, conv::getId, sink,
+                    support.browserListener(emitter, conv::getId, agent, seg.browseLog));
+        }
+        // 本机键鼠操控：默认关闭；后台轮（定时任务/微信）无人审批，一律不挂
+        if (!background && computerSettings.load().enabled()) {
+            computerTools.register(toolkit, conv::getId, sink);
+        }
         skillTools.register(toolkit, agent, sink);
-        boolean fromWechat = tag != null && tag.taskId() == null;
         if (!fromWechat) {
             taskTools.register(toolkit, conv::getId, agent::getId,
                     () -> tag != null ? tag.taskName() : null);
+        }
+        // 提问工具：定时任务后台轮不挂（没人在卡片前，挂了只会白等 5 分钟）
+        if (!background) {
+            askUserTools.register(toolkit, emitter, agent, conv::getId, null, null, null);
         }
         return toolkit;
     }
@@ -625,6 +674,68 @@ public class ChatStreamService {
         appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), null,
                 "主持人未给出有效发言人选" + hint + "，讨论结束");
         return null;
+    }
+
+    /**
+     * 「只说不做」反思判定：把本轮用户消息与模型回复交给同一模型做结构化判断。
+     * 返回 null 表示判定失败（调用异常/超时/用户终止）——按放行处理，宁漏勿冤，不让审查拖死正常回复。
+     */
+    private PromiseReview promiseReview(Conversation conv, Agent agent, ModelPreset preset,
+                                        List<Msg> input, String replyText) {
+        String userText = "";
+        for (int i = input.size() - 1; i >= 0; i--) {
+            String t = input.get(i).getTextContent();
+            if (!Str.isBlank(t)) {
+                userText = t;
+                break;
+            }
+        }
+        // 判定规则已在 sysPrompt（PROMISE_REVIEW_PROMPT），ask 只带待判材料与输出要求，不重复规则全文
+        String ask = "【用户消息】" + ellipsis(userText, 2000)
+                + "\n\n【模型回复】" + ellipsis(replyText, 4000)
+                + "\n\n本轮模型一条工具都没有调用。请按判定规则判断这段回复是否「只说不做」，"
+                + "在 violated 字段填 true/false，reason 用一句话说明理由。";
+        try (ReActAgent judge = ReActAgent.builder()
+                .name("reply-reviewer")
+                .sysPrompt(PROMISE_REVIEW_PROMPT)
+                .model(modelFactory.create(agent, preset, false))
+                .build()) {
+            Msg decision = judge.call(List.of(new UserMessage(List.of(TextBlock.builder().text(ask).build()))),
+                    PromiseReview.class)
+                    .block(PROMISE_REVIEW_TIMEOUT);
+            if (decision == null) {
+                return null;
+            }
+            PromiseReview v = decision.getStructuredData(PromiseReview.class);
+            return v == null ? null : v;
+        } catch (Exception e) {
+            appLogs.record(AppLog.TYPE_REPLY, conv.getId(), agent.getId(),
+                    "「" + agent.getName() + "」只说不做自查失败（" + ellipsis(
+                            e.getMessage() == null ? e.toString() : e.getMessage(), 200) + "），按正常回复放行");
+            return null;
+        }
+    }
+
+    /** 反思判定的结构化输出：violated=只说不做应纠正，reason=判定理由 */
+    public static class PromiseReview {
+        private boolean violated;
+        private String reason;
+
+        public boolean isViolated() {
+            return violated;
+        }
+
+        public void setViolated(boolean violated) {
+            this.violated = violated;
+        }
+
+        public String getReason() {
+            return reason;
+        }
+
+        public void setReason(String reason) {
+            this.reason = reason;
+        }
     }
 
     /** 主持人一次决策调用；返回 null 表示用户终止或调用异常（日志均已处理）；strict=重试时强调必须按字段作答 */

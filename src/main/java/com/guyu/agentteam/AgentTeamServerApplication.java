@@ -7,6 +7,8 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 public class AgentTeamServerApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(AgentTeamServerApplication.class, args);
+        SpringApplication app = new SpringApplication(AgentTeamServerApplication.class);
+        app.setHeadless(false);
+        app.run(args);
     }
 }

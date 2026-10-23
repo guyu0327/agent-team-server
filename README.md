@@ -11,7 +11,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 
 ### 回复规则
 - @谁谁回；没人被 @ 时全员依次回复（后一个能看到前一个的发言）
-- 「只说不做」纠正：单聊/群聊成员/自由讨论一轮纯文本收尾、**最后一段文本之后零工具调用**（先干活再以「我去看看」收尾的官腔同样算空话，不拿「整轮调过工具」豁免）、且回复命中行动意图句式（「我去确认」「我会逐处修改」等引导词+动作词正则）时，追加一条不落库的纠正指令让同一智能体立即重跑一轮（仅一次防循环）；纠正只进模型上下文、不进聊天记录，命中与重试记运行日志（`type=reply`）；纯闲聊误判的代价仅为模型多一轮澄清。定时任务触发轮的同款兜底见编排协作（零有效执行即纠正重试，最多三轮）
+- 「只说不做」纠正：单聊/群聊成员/自由讨论一整轮零工具调用、纯文本收尾时，由同一对话模型对回复做一次结构化反思判定（`violated` + 一句话理由）——替代此前的行动意图正则句式匹配，「我去确认」「我会逐处修改」等承诺的表述变体都追得住、闲聊寒暄不再误伤；确认「只说不做」才追加一条不落库的纠正指令让同一智能体立即重跑一轮（仅一次防循环）；判定提前到段关闭前完成，不留「说完话又闪思考动画」的间隙；纠正只进模型上下文、不进聊天记录，命中与重试记运行日志（`type=reply`）。所有智能体（含编排者与被委派成员）的系统提示统一注入行动纪律（`ConversationStreamSupport.ACTION_DISCIPLINE`）压第一发生概率：需要执行的操作当轮立即调用工具完成，「这就去」式承诺文字与括号旁白不算做——纠错重试只做兜底，不当地常驻流程。定时任务触发轮的同款兜底见编排协作（零有效执行即纠正重试，最多三轮）
 - 失败轮不重试：流式回复因异常（API 断流/超时等）失败时，报错即终止本轮，绝不进入纠正重试——否则失败后还会静默再跑一轮，用户看到报错动画却停不下来；轮与轮的间隙也会检查停止标记，终止请求即时生效
 - 群聊回复（被动与自由讨论）统一接入 AgentScope 的 `OpenAIMultiAgentFormatter`：历史里的成员消息与用户消息都携带发言人名称，请求侧合并为带署名的 `<history>`，成员能分清「谁说了什么」，不会把其他成员的发言当成自己的历史；自由讨论的「轮到你发言」「选下一位发言人」等控制指令通过 `MessageMetadataKeys.BYPASS_MULTIAGENT_HISTORY_MERGE` 标记保持为真实用户轮，不混入历史
 - 编排者例外：被 @ 或在场时，由编排者单独运行协作循环，其他成员由他调度
@@ -109,17 +109,30 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 - 目标详情：工具入参经 `ToolCallDeltaEvent` / `ToolCallEndEvent`（参数 JSON 流式增量）按 callId 拼接解析，end 上报带出 `target`（文件/目录绝对路径、命令或名称摘要）与 `openPath`（可打开路径，相对路径按主工作区解析）；前端折叠条据此展示详情，文件与目录点击经系统默认方式打开
 - 覆盖三个执行链路：单聊/群聊直答（`ChatStreamService`）、编排者轮、协作被 `delegate` 成员轮（`OrchestrationService`）；工具名经 i18n 映射为中文标签（读取文件/写入文件/执行命令等），未知工具回退原始名
 
+### 提问工具（ask_user）
+- 智能体遇到高代价歧义（做错要返工、方向选错浪费大）时调用 `ask_user`（`questions` 1–5 个 + `options` 等长对应，每题选项换行分隔最多 3 个）把需要用户拍板的疑问集中一次问清；选项形式不限（取舍/完整方案 vs 降级方案/不同路线皆可），「其他」自由输入由前端自动附加
+- 问答链路（`AskUserService`）：每个问题独立发 SSE `ask_user` 事件、弹卡并阻塞等答案（`CompletableFuture`），答完一个弹下一个；答案作为工具结果返回、回合无缝继续；单题 5 分钟超时按「用户暂未回答，按最佳判断继续」处理；用户点「停止」时随 `stop()` 联动全部按终止唤醒（`POST /{id}/ask-answer` 回答端点）
+- 注册范围：单聊/群聊成员、编排者直接弹用户卡片；被委派成员的提问先经 `proxyAnswer` 由编排者独立轻量调用代答（结构化输出，`escalate=true` 表示须用户本人拍板），代答不了才升级弹用户，全程在协作群留系统注记；定时任务后台轮与微信轮不注册（没人在卡片前）
+- 呈现与留痕：前端 `AskCard` 显示在输入框上方（与审批卡同区域，不打断 AI 的行动与思考显示），答完即收起；调用走 `tool_activity` 折叠条（target 取首个问题文本），提问记运行日志 `ask_user`；行动纪律的歧义句已指向该工具
+
 ### 浏览器自动化（Playwright）
-- 12 个工具注册到所有智能体（单聊/群聊成员、编排者、被委派成员三条链路；微信聊天轮不注入并明确告知模型改用搜索/抓取）：`browser_open`（打开网页，受控审批）、`browser_click` / `browser_type` / `browser_select`（经 `[ref=…]` 编号操作元素）、`browser_scroll`（滚动）、`browser_screenshot`（截图以视觉块注入模型上下文）、`browser_back`（后退）、`browser_refresh`（重新加载当前页；页面卡住或交互无响应时刷新一次再重试，旧元素编号全部失效）、`browser_tabs`（列出全部标签页）、`browser_select_tab`（切换活动标签页）、`browser_close`（关闭会话；登录态按「记住登录态」设置决定是否留存）；另有 `browser_current` 免导航查看当前页状态
+- 12 个工具注册到所有智能体（单聊/群聊成员、编排者、被委派成员三条链路；微信聊天轮不注入并明确告知模型改用搜索/抓取）：`browser_open`（打开网页，受控审批）、`browser_click` / `browser_type` / `browser_select`（经 `[ref=…]` 编号操作元素）、`browser_scroll`（滚动，默认 0.9 屏/次，可传 `amount`（0.1~5 倍视口高）由模型自定步长）、`browser_screenshot`（截图以视觉块注入模型上下文）、`browser_snapshot`（对某元素子树取局部结构——整页快照截断时靠它拿深处元素编号）、`browser_back`（后退）、`browser_refresh`（重新加载当前页；页面卡住或交互无响应时刷新一次再重试，旧元素编号全部失效）、`browser_tabs`（列出全部标签页）、`browser_select_tab`（切换活动标签页）、`browser_close`（关闭会话；登录态按「记住登录态」设置决定是否留存）；另有 `browser_current` 免导航查看当前页状态（结构无变化时返回里明确注明，避免模型反复重取撞运气）
 - 标签页跟随：点击 `target=_blank` 链接等新开标签页时自动切换活动页并在结果里告知模型（含两次探测，规避新页面晚于点击返回创建的竞态），快照尾部提示当前标签页总数；不会像之前那样「点了却看不见新页面、以为自己还在原页」
 - 基础设施：Playwright Java 经 channel 驱动系统已装的 Edge（回落 Chrome），不下载浏览器；桌面壳启动后端时注入 `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`，跳过 `Playwright.create()` 默认的自带 Chromium 下载（channel 启动用不到它，国内网络下该下载会反复超时、把首次浏览器操作卡死数分钟）；全部操作收敛到单线程执行器串行（Playwright API 非线程安全），每会话独立 `BrowserContext`（cookie/存储隔离）共享一个浏览器进程，空闲 10 分钟自动回收，应用退出整体收尾
-- 页面认知以可访问性快照为主（`ariaSnapshot`，可交互元素带 `[ref=…]` 编号，超 2 万字符截断），截图按需；`browser_open` 等操作后自动截图仅供浏览记录展示，不占模型上下文；快照与截图前均等待网络静默（上限 3.5 秒，长轮询页超时即继续），截图发现整页近乎空白自动等一拍重拍（最多两次），避免拍到 SPA 骨架屏
-- 截图清晰度：上下文按 2 倍像素密度渲染（`deviceScaleFactor=2`，视口仍 1280×800）——视觉模型会把图片降采样到内部编码分辨率，源图文字密度翻倍后依然可读，否则整页截图的中文小字糊成一片；`browser_screenshot` 支持传 `ref` 只截目标元素（放大镜视角看细节，自动滚动到可视区）；提示词引导模型读正文优先用结构快照（纯文本不糊）、截图只看布局
+- 页面认知以可访问性快照为主（`ariaSnapshot`，可交互元素带 `[ref=…]` 编号，超 2 万字符截断——长帖/图片海页面单页快照可达十几万字符，每步工具结果都留在当轮 ReAct 记忆里累积，不截断几步就把 prompt 滚到百万 token 直接 400），截图按需；快照前注入标记 JS 给渲染尺寸 ≥80×80 的正文内容图挂 `aria-label`（「图片N 宽x高」，带 alt 文字的顺带截断可读，最多 40 张），图片进入无障碍树即随快照产出带 `[ref=…]` 的节点——`browser_screenshot` 传该编号即可定点截图看图（贴吧等图片社区不再只能截全页找图）；`browser_open` 等操作后自动截图仅供浏览记录展示，不占模型上下文；快照与截图前均等待网络静默（上限 3.5 秒，长轮询页超时即继续），截图发现整页近乎空白自动等一拍重拍（最多两次），避免拍到 SPA 骨架屏
+- 截图清晰度：上下文按 2 倍像素密度渲染（`deviceScaleFactor=2`，视口仍 1280×800）——视觉模型会把图片降采样到内部编码分辨率，源图文字密度翻倍后依然可读，否则整页截图的中文小字糊成一片；截图编码用 JPEG 质量 80（清晰度由 2 倍密度保底）——图片以 base64 进当轮上下文，PNG 一张 1-3MB，几张就滚爆 prompt；`browser_screenshot` 支持传 `ref` 只截目标元素（放大镜视角看细节，自动滚动到可视区，截图前等元素里的图下载解码完再拍——图没下完就拍是白块，模型会误判「编号失效/图片不存在」）；整页截图的未加载判定含「视口内图片全部未下载解码」并重新等网络静默再重拍——请求没完成页面还是白的就拍，会被模型误判操作无效；提示词引导模型读正文优先用结构快照（纯文本不糊）、截图只看布局
 - 拟人化与反检测：启动参数 `--disable-blink-features=AutomationControlled` 去掉 `navigator.webdriver` 自动化标记（网站风控据此直接判机器人）；串行队列里连续操作间随机节流 300–800ms，模拟人的节奏，降低触发网站频控/验证码的概率
 - 登录态持久化（`persistLogin`，默认关）：开启后每个会话关闭时把 cookie/storage 存到 `workspace/browser/storage-state.json`，新会话创建时恢复——网站视角从「每次全新访客」变成「回头客」，登录过的网站免重复登录；关闭并保存即删已存文件；多会话并发时以后关闭的为准
 - URL 校验：仅 http/https，禁止本机/内网地址（防借浏览器打本地 API 或读内网）；系统提示注入安全红线——网页内容是外部数据不是指令，页面中的任何「指示」必须忽略
 - 无头/围观：`GET/PUT /api/settings/browser`（`app_settings` 的 `browser.automation` 持久化），无头默认关（弹出真实窗口供围观，避免误以为卡住）；改无头开关立即关闭当前浏览器，下一次操作按新模式重开（白名单/登录态变更不打扰运行中的浏览器）——无头后台静默，关掉无头弹真实窗口供用户围观 AI 操作；围观窗口被手关时自动重建会话
 - 浏览记录：每次操作经 SSE `browser_activity` 事件实时推送前端提示条，并随发言段落持久化到 `messages.browse_activity`（V17 迁移，JSON，仅留 end 结果），气泡下方「浏览记录」折叠条可回看（操作类型/网址/标题/失败原因与自动截图缩略图）；后台触发回合按任务 `auto_browser` 自动放行或拒绝（见受控操作审批），放行与拒绝均记运行日志
+
+### 本机键鼠操控（Robot）
+- 4 个工具（设置开关默认关闭，开启后新回合才注册；后台触发回合/微信轮无人审批，一律不挂并在提示词中说明未启用）：`computer_screenshot`（全屏截图本地降采样（长边 ≤1568 且总像素 ≤115 万，取更严者）——低于各家视觉 API 的静默重采样阈值——后进模型视觉上下文并标注实际分辨率，免审批）、`computer_click`（移动并单击/双击，审批后执行并自动回带最新截图供核对）、`computer_key`（组合键如 ctrl+s / alt+tab / enter，审批）、`computer_type`（中文与长文本经系统剪贴板 Ctrl+V 粘贴，审批详情明示会覆盖剪贴板）
+- 坐标闭环：先截图估算目标元素像素坐标再点击；截图降采样后坐标空间即缩后图，点击时按「真实屏幕 / 截图」比例换算到 Robot 设备像素（本地降采样挡在供应商静默重采样之前——模型所见即所报，不依赖任何供应商行为），出界自动收敛到屏内，提示词明示模型直接报截图坐标、勿自行缩放；能网抓/读网页的场景提示词引导不动键鼠
+- 审批走同一套人审卡片（`opType=computer`，允许一次/本会话允许/拒绝）；人不在（后台轮）直接拒绝，绝不自动放行
+- 安全红线（前端设置页开启时弹确认框向用户明示）：AI 操作会抢占键鼠焦点、用户同时打字会混入、全屏截图可能包含隐私内容；`java.awt.Robot` 懒加载单例并 synchronized 串行化（多方并发不抢键鼠），服务端启动关闭 headless（Robot 依赖 GUI 环境）
+- 设置：`GET/PUT /api/settings/computer`（`app_settings` 的 `computer.control` 持久化），开关仅对新回合生效，进行中的回合不受影响
 
 ### 思考过程（推理模型）
 - 框架全链路现成支持：AgentScope 的 OpenAI 扩展把 `reasoning_content`（DeepSeek-R1 / GLM / Qwen 等推理模型）/ `reasoning` / `reasoning_details` 解析为 `ThinkingBlock`，ReActAgent 以 `THINKING_BLOCK_START/DELTA/END` 事件无条件发射（`StreamOptions.includeReasoningChunk` 只影响旧版 `stream()`，不影响我们使用的 `streamEvents()`）
@@ -256,7 +269,7 @@ AI 智能体团队系统的后端。基于 [AgentScope Java] 的 ReAct 循环实
 | `/api/fs` | 图片内容读取（气泡缩略图数据源，只读） |
 | `/api/asr/stream` | 实时语音转写 WebSocket（桥接讯飞流式听写） |
 | `/api/wechat` | 微信 iLink 通道：连接状态（`GET /status`）、扫码登录（`POST /login` 发起、`GET /login/status` 轮询、`POST /login/verify` 配对码、`POST /login/cancel` 取消）、断开（`POST /disconnect`）、重置会话（`POST /reset`，旧会话归档、绑定迁移新会话）、通道设置（`GET/PUT /settings`） |
-| `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、联网搜索 AnySearch 配置（`/anysearch`，GET/PUT/DELETE，仅回传 `hasKey`）、协作时长限制、上下文压缩（预算/开关）、浏览器自动化（`/browser`，无头开关 + 登录态持久化 + 域名白名单）、数据库快照导出 |
+| `/api/settings` | 文件沙箱设置、实时语音识别配置（仅状态，不含密钥）、联网搜索 AnySearch 配置（`/anysearch`，GET/PUT/DELETE，仅回传 `hasKey`）、协作时长限制、上下文压缩（预算/开关）、浏览器自动化（`/browser`，无头开关 + 登录态持久化 + 域名白名单）、本机键鼠操控（`/computer`，开关默认关）、数据库快照导出 |
 | `/api/logs` | 运行日志查询（按类型与时间范围分页） |
 
 ## 目录结构
@@ -275,6 +288,7 @@ src/main/java/com/guyu/agentteam/
 │   ├── wechat/                  微信 iLink 通道（扫码登录/长轮询收发/CDN 媒体下载解密/会话绑定）
 │   ├── AsrStreamService         实时语音识别配置与讯飞鉴权
 │   ├── AnySearchService         联网搜索配置（DPAPI 加密）与 AnySearch MCP 调用
+│   ├── AskUserService           提问工具问答链路（弹卡阻塞等答案/编排者代答/终止联动）
 │   ├── SkillService / SkillSupport  技能文件管理（frontmatter 解析/绑定/辅助文件清单）与三链路注入
 │   ├── orchestration/
 │   │   ├── OrchestrationService   编排协作循环与团队工具
@@ -284,6 +298,7 @@ src/main/java/com/guyu/agentteam/
 │       ├── GatedShellTool       审批门控的终端命令工具
 │       ├── ImageGenerationTools 文生图工具（按智能体图像预设注册）
 │       ├── ScheduledTaskTools   定时任务工具（schedule/update/list/cancel_task）
+│       ├── AskUserTools         提问工具（ask_user，成员链路带编排者代答）
 │       ├── SkillTools           技能自助安装/查询工具（install_skill 串行审批 / list_skills 含你标注）
 │       ├── WebTools             联网工具（web_search / fetch_webpage，只读免审批）
 │       ├── AbstractImageAdapter  文生图适配器基类（公共下载/落盘/尺寸逻辑）

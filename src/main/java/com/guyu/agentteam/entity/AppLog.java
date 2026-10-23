@@ -16,6 +16,7 @@ public class AppLog {
     public static final String TYPE_ERROR = "error";
     public static final String TYPE_OP_REQUEST = "op_request";
     public static final String TYPE_OP_DECISION = "op_decision";
+    public static final String TYPE_ASK_USER = "ask_user";
     public static final String TYPE_COORDINATION = "coordination";
     public static final String TYPE_DISCUSSION = "discussion";
     public static final String TYPE_IMAGE = "image";
