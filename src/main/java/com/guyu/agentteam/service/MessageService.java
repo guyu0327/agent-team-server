@@ -25,12 +25,34 @@ public class MessageService {
 
     @Transactional
     public Message createUserMessage(Conversation conv, String content, List<ConversationFileGrant> grants) {
+        return createUserMessage(conv, content, grants, null);
+    }
+
+    /** senderId 非空时按外部通道真实发送者落库（如 QQ 群成员 openid），供前端区分消息归属 */
+    @Transactional
+    public Message createUserMessage(Conversation conv, String content, List<ConversationFileGrant> grants,
+                                     String senderId) {
+        return createUserMessage(conv, content, grants, senderId, null);
+    }
+
+    /** senderName/senderRole 为外部通道随事件下发的发送者昵称与群角色（如 QQ author.username/member_role），气泡与历史展示用 */
+    @Transactional
+    public Message createUserMessage(Conversation conv, String content, List<ConversationFileGrant> grants,
+                                     String senderId, String senderName) {
+        return createUserMessage(conv, content, grants, senderId, senderName, null);
+    }
+
+    @Transactional
+    public Message createUserMessage(Conversation conv, String content, List<ConversationFileGrant> grants,
+                                     String senderId, String senderName, String senderRole) {
         long now = System.currentTimeMillis();
         Message m = new Message();
         m.setId(Ids.next());
         m.setConversationId(conv.getId());
         m.setSenderType("user");
-        m.setSenderId(conv.getUserId());
+        m.setSenderId(senderId == null || senderId.isBlank() ? conv.getUserId() : senderId);
+        m.setSenderName(senderName == null || senderName.isBlank() ? null : senderName);
+        m.setSenderRole(senderRole == null || senderRole.isBlank() ? null : senderRole);
         m.setContent(content);
         if (grants != null && !grants.isEmpty()) {
             m.setAttachments(Json.writeAttachments(grants.stream()

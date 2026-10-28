@@ -260,9 +260,11 @@ public class ContextCompressionService {
             1. 每条要点必须保留发言人（如「用户」「张三」），群聊里成员的发言绝不能混淆归属。
             2. 必须保留：用户的目标与偏好、已做出的决定、承诺要做的事、提到的文件路径与关键数据、
                未完成的任务和待决问题、与图片相关的关键结论。
-            3. 舍弃：寒暄、重复表述、与任务无关的闲聊。
-            4. 按主题或时间顺序组织，输出纯文本（可用短行/短列表），不要添加评论或解释。
-            5. 把结果填在 digest 字段返回。
+            3. 区分「说过」与「做过」：发言可能附带「（实际执行：…）」标注，这是系统核实的执行凭证，\
+               摘要必须如实保留（谁执行了什么）；没有标注的完成式表述只是口头自述，摘要里不得写成已完成。
+            4. 舍弃：寒暄、重复表述、与任务无关的闲聊。
+            5. 按主题或时间顺序组织，输出纯文本（可用短行/短列表），不要添加评论或解释。
+            6. 把结果填在 digest 字段返回。
             """;
 
     /** 消息列表转纯文本记录（署名 + 附件注记），供压缩模型阅读 */
@@ -280,6 +282,8 @@ public class ContextCompressionService {
                         : ConversationFileGrant.TYPE_IMAGE.equals(a.type()) ? "图片" : "文件";
                 sb.append(content.isBlank() ? "" : " ").append("（附件·").append(label).append("：").append(a.path()).append("）");
             }
+            // 执行凭证随转写进摘要输入：摘要据此保留「哪些操作真实执行过」，说过没做的不会被写成已做
+            sb.append(ConversationStreamSupport.execNoteOf(m));
             sb.append("\n");
         }
         return sb.toString();

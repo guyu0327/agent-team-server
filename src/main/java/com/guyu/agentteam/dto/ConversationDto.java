@@ -5,5 +5,6 @@ import java.util.List;
 public record ConversationDto(String id, String type, String category, String name, String agentId,
                               List<String> memberIds, String chatMode, boolean pinned,
                               String lastMessage, Long lastMessageTime, long unreadCount,
-                              Long archivedTime, String channel, String wechatPeer) {
+                              Long archivedTime, String channel, String wechatPeer, String qqPeer,
+                              String qqKind) {
 }

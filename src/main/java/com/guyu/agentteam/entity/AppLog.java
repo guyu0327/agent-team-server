@@ -24,6 +24,7 @@ public class AppLog {
     public static final String TYPE_TASK = "task";
     public static final String TYPE_REPLY = "reply";
     public static final String TYPE_WECHAT = "wechat";
+    public static final String TYPE_QQ = "qq";
     public static final String TYPE_API_ERROR = "api_error";
 
     @Id

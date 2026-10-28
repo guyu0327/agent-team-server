@@ -562,7 +562,7 @@ public class WechatChannelService {
                 bindings.delete(b);
             }
             Conversation nc = conversationService.getObject().newConversation(
-                    CurrentUser.ID, "single", ConversationService.CATEGORY_CHAT, "微信ClawBot", "wechat");
+                    CurrentUser.ID, "single", ConversationService.CATEGORY_CHAT, "微信", "wechat");
             nc.setWechatPeer(shortId(senderId));
             conversations.save(nc);
             members.save(new ConversationMember(nc.getId(), resolveAgent().getId(), System.currentTimeMillis()));
@@ -579,7 +579,7 @@ public class WechatChannelService {
 
     /**
      * 重置微信会话：旧会话归档进历史会话（微信归档不可恢复聊天），新建会话并迁移绑定，
-     * 手机消息无缝流入新会话——列表里 ClawBot 不消失，旧聊天记录进历史留档。
+     * 手机消息无缝流入新会话——列表里会话不消失，旧聊天记录进历史留档。
      */
     public Conversation resetConversation(String conversationId) {
         Conversation old = conversations.findById(conversationId)
@@ -590,7 +590,7 @@ public class WechatChannelService {
         return tx.execute(status -> {
             conversationService.getObject().archive(conversationId);
             Conversation fresh = conversationService.getObject().newConversation(
-                    CurrentUser.ID, "single", ConversationService.CATEGORY_CHAT, "微信ClawBot", "wechat");
+                    CurrentUser.ID, "single", ConversationService.CATEGORY_CHAT, "微信", "wechat");
             members.save(new ConversationMember(fresh.getId(), resolveAgent().getId(), System.currentTimeMillis()));
             for (WechatBinding b : bindings.findByConversationId(conversationId)) {
                 b.setConversationId(fresh.getId());

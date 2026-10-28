@@ -1,6 +1,7 @@
 package com.guyu.agentteam.service;
 
 import com.guyu.agentteam.common.Ids;
+import com.guyu.agentteam.dto.OpGrantDto;
 import com.guyu.agentteam.entity.Agent;
 import com.guyu.agentteam.entity.AppLog;
 import com.guyu.agentteam.entity.OperationGrant;
@@ -198,6 +199,37 @@ public class OpApprovalService {
             }
         }
         return cancelled;
+    }
+
+    /** 该会话已授予的工具授权清单（供前端「会话授权」弹层展示） */
+    public List<OpGrantDto> listGrants(String conversationId) {
+        return grants.findByConversationIdOrderByGrantedAtAsc(conversationId).stream()
+                .map(OpGrantDto::from)
+                .toList();
+    }
+
+    /** 撤销该会话某一类工具授权（审批判定每次调用实时查库，撤销即时生效）；返回是否确有此授权 */
+    @org.springframework.transaction.annotation.Transactional
+    public boolean revokeGrant(String conversationId, String opType) {
+        if (!grants.existsById(new OperationGrantId(conversationId, opType))) {
+            return false;
+        }
+        grants.deleteByConversationIdAndOpType(conversationId, opType);
+        appLogs.record(AppLog.TYPE_OP_DECISION, conversationId, null,
+                "「撤销会话授权」" + opTypeName(opType) + "，此后同类操作恢复弹卡询问");
+        return true;
+    }
+
+    /** opType 中文名（运行日志用；前端展示文案由 i18n 负责） */
+    private static String opTypeName(String opType) {
+        return switch (opType) {
+            case OperationGrant.OP_WRITE -> "写入文件";
+            case OperationGrant.OP_EDIT -> "修改文件";
+            case OperationGrant.OP_SHELL -> "执行终端命令";
+            case OperationGrant.OP_BROWSER -> "打开网页";
+            case OperationGrant.OP_COMPUTER -> "键鼠操控";
+            default -> opType;
+        };
     }
 
     private static String labelOf(String decision) {

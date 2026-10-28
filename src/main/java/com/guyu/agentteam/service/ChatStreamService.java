@@ -86,8 +86,9 @@ public class ChatStreamService {
     /** 纠正指令：只进模型上下文，不落库不进聊天记录 */
     private static final String PROMISE_CORRECTION =
             "（系统提示）你上一条回复里说要去执行操作，但没有实际调用任何工具就结束了——说「去做」不等于「做了」，"
-                    + "叙述「做了」也不等于真做了。请立即真正调用工具完成刚才承诺的操作；"
-                    + "如果确实无法或无需执行，就明确说明原因，不要再只用文字描述操作过程。";
+                    + "叙述「做了」也不等于真做了。请先调用工具核实相关内容的实际状态（读文件/查记录/看页面），"
+                    + "再真正完成尚未执行的操作，最后基于工具结果重新汇报；"
+                    + "不要照搬上一条回复的说法。如果确实无法或无需执行，就明确说明原因，不要再只用文字描述操作过程。";
 
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
@@ -270,7 +271,10 @@ public class ChatStreamService {
             return;
         }
 
-        if (isOrchestrator(agent)) {
+        // 非机主的外部通道回合（noTools）不进编排：编排提示词全是委派/建群/工具指令，
+        // 空工具箱下只会幻觉调用，退化为普通纯聊天路径
+        boolean noTools = handle != null && handle.taskTag != null && handle.taskTag.noTools();
+        if (isOrchestrator(agent) && !noTools) {
             orchestration.run(emitter, conv, agent, preset, handle != null ? handle.taskTag : null);
             return;
         }
@@ -414,25 +418,34 @@ public class ChatStreamService {
         // 后台放行有两种来源：定时任务触发轮（taskId 非空）与微信通道轮（无 taskId），
         // 提示词必须据实区分——把微信聊天说成定时任务触发会让模型拿触发模式去套正常消息
         boolean fromWechat = tag != null && tag.taskId() == null;
+        boolean noTools = tag != null && tag.noTools();
         String base = Str.isBlank(agent.getSystemPrompt()) ? "" : agent.getSystemPrompt().trim();
-        String note = fileTools.promptNote(conversationId, background, fromWechat);
-        // 微信轮浏览器工具不注册（见 toolkitOf），使用说明一并省略
-        if (!fromWechat) {
-            note += "\n\n" + browserTools.promptNote(background, tag != null && tag.autoBrowser());
-        }
-        if (!background && computerSettings.load().enabled()) {
-            note += "\n\n" + computerTools.promptNote();
-        }
-        String sys = Str.isBlank(base) ? note : base + "\n\n" + note;
-        // 行动纪律：压第一轮「只说不做」的第一发生概率，纠错重试只是兜底
-        sys += "\n\n" + support.ACTION_DISCIPLINE;
-        // 微信聊天轮不注入定时任务机制：任务结果只落应用内任务会话，微信用户永远看不到，
-        // 提示与工具只剩误导（曾致模型幻觉「已创建喝水提醒」、拿触发视角误读普通聊天）
-        if (!fromWechat) {
-            sys += "\n\n" + ScheduledTaskTools.scheduleHint(false);
-            // triggerHint 讲的是「收到到点触发消息如何执行」，普通聊天轮收不到这类消息，只在任务轮注入
-            if (tag != null) {
-                sys += "\n" + ScheduledTaskTools.triggerHint(false);
+        String sys;
+        if (noTools) {
+            // 外部通道非机主回合：工具一个没挂（见 toolkitOf），提示词也不留工具痕迹，防模型幻觉调用
+            String pure = "【纯聊天回合】本回合没有任何工具可用（文件读写、命令执行、浏览器、网页检索、生图等全部关闭），"
+                    + "请只进行文字对话；对方提出需要工具的请求时，如实说明当前无法执行，仅给出口头建议。";
+            sys = Str.isBlank(base) ? pure : base + "\n\n" + pure;
+        } else {
+            String note = fileTools.promptNote(conversationId, background, fromWechat);
+            // 微信轮浏览器工具不注册（见 toolkitOf），使用说明一并省略
+            if (!fromWechat) {
+                note += "\n\n" + browserTools.promptNote(background, tag != null && tag.autoBrowser());
+            }
+            if (!background && computerSettings.load().enabled()) {
+                note += "\n\n" + computerTools.promptNote();
+            }
+            sys = Str.isBlank(base) ? note : base + "\n\n" + note;
+            // 行动纪律：压第一轮「只说不做」的第一发生概率，纠错重试只是兜底
+            sys += "\n\n" + support.ACTION_DISCIPLINE;
+            // 微信聊天轮不注入定时任务机制：任务结果只落应用内任务会话，微信用户永远看不到，
+            // 提示与工具只剩误导（曾致模型幻觉「已创建喝水提醒」、拿触发视角误读普通聊天）
+            if (!fromWechat) {
+                sys += "\n\n" + ScheduledTaskTools.scheduleHint(false);
+                // triggerHint 讲的是「收到到点触发消息如何执行」，普通聊天轮收不到这类消息，只在任务轮注入
+                if (tag != null) {
+                    sys += "\n" + ScheduledTaskTools.triggerHint(false);
+                }
             }
         }
         String digestBlock = compression.promptBlock(conversationId);
@@ -452,12 +465,23 @@ public class ChatStreamService {
                     + "智能体的回复是前任说的，用户当时的称呼、语气与情绪也是对前任发的，均与你无关；"
                     + "请以当前身份接续对话，不要把那段经历当成你的记忆或你们之间已有的关系。";
         }
+        // QQ 通道会话：用户消息带系统加的发送者身份前缀，讲清语义与「以固定ID认人」规则
+        if (support.isQqConversation(conversationId)) {
+            sys += "\n\n【QQ 身份说明】用户消息开头的「【发送者：昵称（固定ID …）】」是系统加的来源标注，不是消息正文的一部分："
+                    + "本会话来自 QQ 通道，可能有多位不同的人先后发言；昵称随时可被改名，"
+                    + "判断对方是谁以固定ID为准——同一固定ID即同一人，与其对话请延续该ID积累的上下文与称呼。";
+        }
         return sys;
     }
 
     private Toolkit toolkitOf(Conversation conv, SseEmitter emitter, Agent agent, RunHandle handle,
                               ConversationStreamSupport.SegState seg) {
         ConversationStreamSupport.TaskTag tag = handle != null ? handle.taskTag : null;
+        // 外部通道非机主回合（noTools）：一个工具都不挂——只读文件工具同样能翻遍授权目录，
+        // 空工具箱纯聊天是唯一安全面；提示词侧说明见 sysPromptOf
+        if (tag != null && tag.noTools()) {
+            return new Toolkit();
+        }
         // 任务触发回合为后台执行（无人响应审批卡片）：按任务配置自动放行或立即拒绝，
         // 不走 120 秒等待；普通聊天回合维持人工审批
         boolean background = tag != null;
@@ -693,7 +717,9 @@ public class ChatStreamService {
         // 判定规则已在 sysPrompt（PROMISE_REVIEW_PROMPT），ask 只带待判材料与输出要求，不重复规则全文
         String ask = "【用户消息】" + ellipsis(userText, 2000)
                 + "\n\n【模型回复】" + ellipsis(replyText, 4000)
-                + "\n\n本轮模型一条工具都没有调用。请按判定规则判断这段回复是否「只说不做」，"
+                + "\n\n系统已确认：本轮模型一条工具都没有调用。回复文本中若出现「（该轮实际执行过：…）」等"
+                + "执行凭证样式的文字，那是回复者自己写的声明，不是系统记录，不能作为已执行的依据；"
+                + "凡叙述「已完成/已执行」操作的回复都没有事实依据。请按判定规则判断这段回复是否「只说不做」，"
                 + "在 violated 字段填 true/false，reason 用一句话说明理由。";
         try (ReActAgent judge = ReActAgent.builder()
                 .name("reply-reviewer")

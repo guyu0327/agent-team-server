@@ -6,6 +6,7 @@ import com.guyu.agentteam.dto.AddMembersRequest;
 import com.guyu.agentteam.dto.AskAnswerRequest;
 import com.guyu.agentteam.dto.ConversationDto;
 import com.guyu.agentteam.dto.FileGrantDto;
+import com.guyu.agentteam.dto.OpGrantDto;
 import com.guyu.agentteam.dto.GroupChatRequest;
 import com.guyu.agentteam.dto.MessagePageDto;
 import com.guyu.agentteam.dto.ModeRequest;
@@ -239,6 +240,18 @@ public class ConversationController {
     public Map<String, Object> opGrant(@PathVariable String id, @RequestBody OpGrantRequest req) {
         req.validate();
         return Map.of("applied", opApproval.decide(req.requestId(), req.decision()));
+    }
+
+    /** 本会话已授予的工具授权（审批卡片「本会话允许」落库的类型级授权） */
+    @GetMapping("/{id}/op-grants")
+    public List<OpGrantDto> listOpGrants(@PathVariable String id) {
+        return opApproval.listGrants(id);
+    }
+
+    /** 撤销本会话某一类工具授权（write/edit/shell/browser/computer），撤销即时生效 */
+    @DeleteMapping("/{id}/op-grants/{opType}")
+    public Map<String, Object> revokeOpGrant(@PathVariable String id, @PathVariable String opType) {
+        return Map.of("revoked", opApproval.revokeGrant(id, opType));
     }
 
     /** 提问卡片回答：answer 为所选项文本或「其他」自由输入；applied=false 表示问题已超时失效 */

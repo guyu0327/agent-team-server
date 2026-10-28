@@ -20,6 +20,7 @@ import io.agentscope.core.agent.accumulator.TextAccumulator;
 import io.agentscope.core.message.AssistantMessage;
 import io.agentscope.core.model.ExecutionConfig;
 import io.agentscope.core.message.ContentBlock;
+import io.agentscope.core.message.MessageMetadataKeys;
 import io.agentscope.core.message.ImageBlock;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
@@ -374,9 +375,13 @@ public class ConversationStreamSupport {
         }
     }
 
-    /** 定时任务回合标注：随消息落库，前端据此显示来源任务徽标并支持按任务筛选；auto* 为该回合的审批放行策略；collab 表示协作任务（编排者必须委派成员，自己包揽不算实际执行） */
+    /** 定时任务回合标注：随消息落库，前端据此显示来源任务徽标并支持按任务筛选；auto* 为该回合的审批放行策略；collab 表示协作任务（编排者必须委派成员，自己包揽不算实际执行）；noTools 表示本回合禁用一切工具（外部通道非机主发言，只允许纯聊天） */
     public record TaskTag(String taskId, String taskName, boolean autoWrite, boolean autoShell,
-                          boolean autoBrowser, boolean collab) {
+                          boolean autoBrowser, boolean collab, boolean noTools) {
+        public TaskTag(String taskId, String taskName, boolean autoWrite, boolean autoShell,
+                       boolean autoBrowser, boolean collab) {
+            this(taskId, taskName, autoWrite, autoShell, autoBrowser, collab, false);
+        }
     }
 
     public Message saveMessage(Conversation conv, Agent agent, String content, String type) {
@@ -477,6 +482,13 @@ public class ConversationStreamSupport {
                 .orElse("");
     }
 
+    /** 会话是否为 QQ 通道会话（决定系统提示是否注入发送者身份说明） */
+    public boolean isQqConversation(String conversationId) {
+        return conversations.findById(conversationId)
+                .map(c -> "qq".equals(c.getChannel()))
+                .orElse(false);
+    }
+
     /** 会话文本历史转成 AgentScope 消息（新用户消息已包含在内）；用户消息中的图片附件转成 ImageBlock 供视觉模型查看 */
     public List<Msg> historyMsgs(String conversationId) {
         return historyMsgs(conversationId, null);
@@ -507,6 +519,10 @@ public class ConversationStreamSupport {
             }
             out.add(toHistoryMsg(m, false, null));
         }
+        Msg record = actionRecordMsg(scoped);
+        if (record != null) {
+            out.add(record);
+        }
         return out;
     }
 
@@ -530,9 +546,15 @@ public class ConversationStreamSupport {
      */
     public List<Msg> historyMsgs(String conversationId, Map<String, String> agentNames) {
         boolean named = agentNames != null;
-        return scopedByBudget(conversationId, textMessages(conversationId)).stream()
+        List<Message> scoped = scopedByBudget(conversationId, textMessages(conversationId));
+        List<Msg> out = new ArrayList<>(scoped.stream()
                 .<Msg>map(m -> toHistoryMsg(m, named, agentNames))
-                .toList();
+                .toList());
+        Msg record = actionRecordMsg(scoped);
+        if (record != null) {
+            out.add(record);
+        }
+        return out;
     }
 
     /** 会话内可进模型历史的消息：仅文本类型，且正文或用户附件非空 */
@@ -553,6 +575,84 @@ public class ConversationStreamSupport {
                         .textContent(m.getContent())
                         .build()
                 : new AssistantMessage(m.getContent());
+    }
+
+    /** 行动记录条数与单项目标摘要长度上限 */
+    private static final int NOTE_MAX_ITEMS = 6;
+    private static final int NOTE_TARGET_MAX = 40;
+    /** 行动记录清单最多列出的轮次（更早的轮次由上下文压缩摘要按提示词要求保留） */
+    private static final int RECORD_MAX_ROUNDS = 20;
+
+    /**
+     * 行动记录合成消息：系统核实的「上文哪些轮实际执行过工具」清单，追加在历史末尾交给模型。
+     * 绝不能把凭证以自然语言括注附在 assistant 消息文本里——那样模型会学着自己伪造
+     * 「（该轮实际执行过：…）」给虚假断言背书，连「只说不做」反思判定都被这行假凭证骗过；
+     * 所以记录走 user 角色 + 旁路标记的独立消息（MultiAgentFormatter 不把它并进 &lt;history&gt;），
+     * 模型只能读、无法把自己的话伪装成它。全程零执行时同样出消息——这正是最需要点破的情形。
+     */
+    public Msg actionRecordMsg(List<Message> scoped) {
+        List<String> lines = new ArrayList<>();
+        for (Message m : scoped) {
+            if ("user".equals(m.getSenderType())) {
+                continue;
+            }
+            List<String> parts = new ArrayList<>();
+            appendExec(parts, Json.readToolActivity(m.getToolActivity()));
+            appendExec(parts, Json.readToolActivity(m.getWebActivity()));
+            if (parts.isEmpty()) {
+                continue;
+            }
+            String said = m.getContent() == null ? "" : m.getContent().strip();
+            if (said.length() > 30) {
+                said = said.substring(0, 30) + "…";
+            }
+            if (said.isEmpty()) {
+                said = "（无正文）";
+            }
+            lines.add("· 「" + said + "」→ 实际执行：" + String.join("、", parts));
+        }
+        StringBuilder sb = new StringBuilder("【系统行动记录】以下是系统核实的上文各轮真实执行情况，不是任何人的发言，"
+                + "你的回复中也不要出现这种记录格式。对照各轮的口头陈述与本记录判断事情是否真的做过：\n");
+        if (lines.isEmpty()) {
+            sb.append("· 上文所有轮次均未执行过任何工具——凡叙述「已完成/已执行」的地方都没有事实依据。\n");
+        } else {
+            int from = Math.max(0, lines.size() - RECORD_MAX_ROUNDS);
+            for (int i = from; i < lines.size(); i++) {
+                sb.append(lines.get(i)).append('\n');
+            }
+            sb.append("· 未列出的轮次均未执行任何工具（只说了没做）。\n");
+        }
+        return UserMessage.builder()
+                .textContent(sb.toString())
+                .metadata(Map.of(MessageMetadataKeys.BYPASS_MULTIAGENT_HISTORY_MERGE, true))
+                .build();
+    }
+
+    /** 单条消息成功执行项的汇总行（「实际执行：a、b」）；无成功记录返回空串（压缩摘要转写共用） */
+    public static String execNoteOf(Message m) {
+        List<String> parts = new ArrayList<>();
+        appendExec(parts, Json.readToolActivity(m.getToolActivity()));
+        appendExec(parts, Json.readToolActivity(m.getWebActivity()));
+        return parts.isEmpty() ? "" : "（实际执行：" + String.join("、", parts) + "）";
+    }
+
+    private static void appendExec(List<String> parts, List<Map<String, Object>> items) {
+        if (items == null) {
+            return;
+        }
+        for (Map<String, Object> e : items) {
+            if (!Boolean.TRUE.equals(e.get("ok"))) {
+                continue;
+            }
+            Object target = e.get("target");
+            if (target == null) target = e.get("query");
+            if (target == null) target = e.get("url");
+            String t = target == null ? "" : String.valueOf(target).strip();
+            if (t.length() > NOTE_TARGET_MAX) {
+                t = t.substring(0, NOTE_TARGET_MAX) + "…";
+            }
+            parts.add((e.get("tool") == null ? "工具" : e.get("tool")) + (t.isEmpty() ? "" : "「" + t + "」"));
+        }
     }
 
     /** 应用摘要水位线与字符预算：水位线之前的历史已滚入摘要；装不进预算的旧消息本轮截断 */
@@ -605,10 +705,12 @@ public class ConversationStreamSupport {
         return Images.toImageBlock(p, Images.MAX_IMAGE_BYTES);
     }
 
-    /** 用户消息带上附件说明，模型才知道该条消息在指哪些文件/文件夹/图片 */
+    /** 用户消息带上附件说明，模型才知道该条消息在指哪些文件/文件夹/图片；外部通道消息再带上发送者身份 */
     private String effectiveUserText(Message m) {
         List<Json.Attachment> atts = Json.readAttachments(m.getAttachments());
         String content = m.getContent() == null ? "" : m.getContent();
+        String identity = senderIdentity(m);
+        if (!identity.isEmpty()) content = identity + content;
         if (atts.isEmpty()) return content;
         StringBuilder sb = new StringBuilder(content);
         if (!content.isBlank()) sb.append("\n\n");
@@ -622,6 +724,23 @@ public class ConversationStreamSupport {
         }
         sb.append("）");
         return sb.toString();
+    }
+
+    /**
+     * 外部通道发送者身份前缀：只有 QQ 通道入站消息落了 senderName，本地/微信消息为空不注入。
+     * 昵称与固定 ID 一起给，群主/管理员额外标注角色；认人以固定 ID 为准（昵称可被任意改名）。
+     */
+    private static String senderIdentity(Message m) {
+        if (Str.isBlank(m.getSenderName())) {
+            return "";
+        }
+        String role = switch (m.getSenderRole() == null ? "" : m.getSenderRole()) {
+            case "owner" -> "，群主";
+            case "admin" -> "，管理员";
+            default -> "";
+        };
+        return "【发送者：" + m.getSenderName().strip() + "（固定ID " + m.getSenderId() + role
+                + "。昵称可被改名，认人以固定ID为准）】";
     }
 
     private boolean hasContent(Message m) {
@@ -646,6 +765,11 @@ public class ConversationStreamSupport {
             + "不要用「这就去」「我去看看」「马上处理」等承诺文字收尾，也不要用括号旁白、剧情描写代替真实调用——"
             + "旁白里写「打开了」「回好了」不算做了，本轮没有任何工具调用就是没做；"
             + "空承诺的回复会被系统判定为敷衍并强制重做一轮。"
+            + "断言「已完成」前先对证据：历史里的文字（包括你自己说过的「删了」「做好了」）不是行动凭证，"
+            + "声明任何已完成的状态变化（已删除/已写入/已发出/页面已打开）必须以工具成功结果为依据，"
+            + "拿不准实际状态就先调工具看一眼（读一下文件、查一下记录），基于结果汇报，不要凭上下文印象下结论。"
+            + "历史末尾的【系统行动记录】是系统附加的真实执行清单，只供你对照，"
+            + "你的回复中绝不要出现这类记录格式的文字——伪造执行记录比不执行更严重。"
             + "指令有歧义时不要反复重读原文揣测——先基于最近上下文取最合理解读，能先查看目标（看一眼相关页面/记录/数据）就直接看，"
             + "看完再动；确实无法自查且做错代价高时，调用 ask_user 把疑问集中一次问清（附上你的候选选项），不要在原地纠结多个回合。";
 

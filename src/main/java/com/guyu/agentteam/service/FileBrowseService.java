@@ -2,6 +2,7 @@ package com.guyu.agentteam.service;
 
 import com.guyu.agentteam.common.ApiException;
 import com.guyu.agentteam.common.Images;
+import com.guyu.agentteam.service.tool.WorkspaceFileTools;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -15,14 +16,24 @@ public class FileBrowseService {
     /** 可返回给前端的单图上限 */
     private static final long MAX_IMAGE_BYTES = 20L * 1024 * 1024;
 
-    /** 读取图片文件内容，供前端气泡直接展示（仅限图片，超大图拒绝） */
+    private final WorkspaceFileTools workspace;
+
+    public FileBrowseService(WorkspaceFileTools workspace) {
+        this.workspace = workspace;
+    }
+
+    /** 读取图片文件内容，供前端气泡直接展示（仅限图片，超大图拒绝）；相对路径按主工作区根目录解析 */
     public ImageContent imageContent(String raw) {
         if (raw == null || raw.isBlank()) {
             throw ApiException.badRequest("路径不能为空");
         }
         Path p;
         try {
-            p = Paths.get(raw.trim()).toAbsolutePath().normalize();
+            Path rawPath = Paths.get(raw.trim());
+            if (!rawPath.isAbsolute()) {
+                rawPath = Paths.get(workspace.primaryRoot()).resolve(rawPath);
+            }
+            p = rawPath.toAbsolutePath().normalize();
         } catch (Exception e) {
             throw ApiException.badRequest("路径无效：" + raw);
         }

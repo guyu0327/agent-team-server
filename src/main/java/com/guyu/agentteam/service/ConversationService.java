@@ -321,7 +321,8 @@ public class ConversationService {
                 c.getName() == null ? "" : c.getName(), agentId,
                 ids, c.getChatMode() == null ? "passive" : c.getChatMode(), c.isPinned(),
                 c.getLastMessage() == null ? "" : c.getLastMessage(),
-                c.getLastMessageAt(), unread, c.getArchivedAt(), c.getChannel(), c.getWechatPeer());
+                c.getLastMessageAt(), unread, c.getArchivedAt(), c.getChannel(), c.getWechatPeer(), c.getQqPeer(),
+                c.getQqKind());
     }
 
     private Conversation baseConversation(String userId, long now, String type, String category, String name) {

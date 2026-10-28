@@ -34,9 +34,12 @@ import javax.imageio.ImageIO;
 
 /**
  * 本机键鼠操控工具（java.awt.Robot，零外部依赖）：截屏给模型视觉定位坐标，再移动/点击/按键/打字。
- * 截图在本地统一降采样（长边≤1568 且总像素≤115 万，取更严者）后回传并如实报告分辨率——低于各家视觉 API
- * 的静默重采样阈值，任何模型所见即所报；点击坐标按「真实屏幕/截图」比例自动换算，与供应商无关。
- * computer_screenshot 只读不审批；点击/按键/打字均受控操作（审批卡，人不在即拒绝）。
+ * 两段式定位治「点歪」：全屏截图统一降采样（长边≤1568 且总像素≤115 万，取更严者）后回传并如实报告分辨率
+ * ——低于各家视觉 API 的静默重采样阈值，任何模型所见即所报；computer_zoom 按粗坐标从缓存的原始分辨率
+ * 截图裁局部放大回传（不降采样），小按钮/密集文字看清后再精调坐标；点击自动回带落点周围原始分辨率
+ * 局部核对图（光标在图中心附近）。坐标一律基于「最近一次回传的图」，后端按参照系（全屏缩略图乘比例 /
+ * 局部放大图加偏移）自动换算到真实屏幕。点击前 mouseMove 后停顿一拍，给 hover 展开型 UI 留反应时间。
+ * computer_screenshot / computer_zoom 只读不审批；点击/按键/打字均受控操作（审批卡，人不在即拒绝）。
  * 打字走系统剪贴板 + Ctrl+V（Robot keycode 无法输入中文），会覆盖用户剪贴板——审批详情里明示。
  * 错误一律以中文可读文本返回（不抛出），让智能体能读到并向用户转述。
  */
@@ -52,6 +55,16 @@ public class ComputerTools {
     private static final int SHOT_MAX_EDGE = 1568;
     private static final double SHOT_MAX_PIXELS = 1_150_000;
 
+    /** 局部放大图边长上限（原始分辨率像素）：1000×1000 = 100 万像素，仍在回传预算内、不触发二次降采样 */
+    private static final int ZOOM_MAX_SIDE = 1000;
+    private static final int ZOOM_MIN_SIDE = 64;
+
+    /** 点击后核对图边长（原始分辨率像素）：光标就在图中心附近，小按钮偏没偏一眼可见 */
+    private static final int VERIFY_CROP_SIDE = 400;
+
+    /** 点击前 mouseMove 后的停顿：给 hover 展开型 UI（菜单、下拉）留出反应时间，避免点到展开前的界面 */
+    private static final long HOVER_PAUSE_MS = 300;
+
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 
     private final WorkspaceFileTools fileTools;
@@ -59,8 +72,19 @@ public class ComputerTools {
     /** 懒加载单例：Robot 依赖非 headless 环境；synchronize 串行化避免多方同时抢键鼠 */
     private volatile Robot robot;
 
-    /** 最近一次回传给模型的截图尺寸 {w, h}；点击坐标据此换算到真实屏幕 */
-    private volatile int[] lastShot;
+    /**
+     * 模型坐标参照系：所有 computer_* 坐标基于「最近一次回传的图」。
+     * zoom=false：全屏降采样图，尺寸 {w,h}，点击坐标乘 屏幕尺寸/图尺寸 换算；
+     * zoom=true：局部放大图（原始分辨率 1:1），左上角对应屏幕 (ox,oy)，点击坐标加偏移即屏幕坐标。
+     */
+    private record RefFrame(boolean zoom, int w, int h, int ox, int oy) {
+    }
+
+    /** 最近一次回传图的参照系 */
+    private volatile RefFrame ref;
+
+    /** 最近一次全屏截图的原始分辨率版本（zoom 裁剪与点击核对图的数据源） */
+    private volatile BufferedImage lastOriginal;
 
     public ComputerTools(WorkspaceFileTools fileTools) {
         this.fileTools = fileTools;
@@ -70,14 +94,17 @@ public class ComputerTools {
     public String promptNote() {
         StringBuilder sb = new StringBuilder("本机键鼠工具说明：computer_* 系列直接操控这台电脑的键盘鼠标，")
                 .append("用于浏览器工具覆盖不到的场景（桌面应用、浏览器网页里点不动的按钮、系统弹窗等）。")
-                .append("流程：先 computer_screenshot 看当前屏幕、在图上估算目标元素的像素坐标，再 computer_click；")
-                .append("点击后会自动回带新截图，据其核对结果或取下一步坐标。")
-                .append("坐标一律按「最近一次截图」上的像素直接给出（截图可能被降采样，返回里标注了实际分辨率），")
-                .append("后端会自动换算到真实屏幕，切勿自行放大换算坐标。")
+                .append("推荐流程：① computer_screenshot 看全屏，锁定目标的大致位置；")
+                .append("② 目标是小按钮/图标/密集文字等看不清的元素时，先 computer_zoom 放大该区域看清再定坐标")
+                .append("（大按钮等清晰目标可跳过）；③ computer_click 点击，坐标一律基于「最近一次回传的图」上的像素")
+                .append("直接给出（后端自动换算到真实屏幕，切勿自行缩放）；点击后自动回带落点周围的放大核对图")
+                .append("（光标就在图中心附近），偏了就按全屏图坐标小步修正，不明确就再 zoom；")
+                .append("④ 需要全局视角、或点击后画面已变化（弹窗/跳转），先 computer_screenshot 再操作。")
+                .append("点击瞄准元素的几何中心（文字按钮对准文字中央，图标按钮对准图标中央）。")
                 .append("computer_key 传组合键（如 ctrl+s、alt+tab、enter）；computer_type 输入中文/长文本")
                 .append("（走剪贴板粘贴，会覆盖系统剪贴板）。注意：你的操作会抢占用户的键盘鼠标焦点，")
                 .append("用户此刻可能正在打字——每次点击/按键/打字都要先经用户审批，一次只做一小步，")
-                .append("做一步看一张截图确认效果，不要盲操作连点。能网抓/读网页就不动键鼠。");
+                .append("做一步核对一次，不要盲操作连点。能网抓/读网页就不动键鼠。");
         return sb.toString();
     }
 
@@ -98,16 +125,17 @@ public class ComputerTools {
 
         @Tool(name = "computer_screenshot", description = "Take a screenshot of the whole physical screen so "
                 + "you can actually see the user's desktop. ALWAYS call this first before any mouse/keyboard "
-                + "action: estimate the pixel coordinates of your target element on this image. The image may "
-                + "be downscaled; its exact resolution is stated in the reply and click coordinates are "
-                + "rescaled automatically.")
+                + "action. The image may be downscaled; its exact resolution is stated in the reply and click "
+                + "coordinates are rescaled automatically. Also call this again when you need a full-screen "
+                + "view again after computer_zoom, or when the screen has changed after a click (dialog, "
+                + "navigation).")
         public ToolResultBlock computerScreenshot() {
             try {
                 Shot shot = shotPng();
                 Path file = saveShot(shot.png());
                 TextBlock note = TextBlock.builder()
                         .text("当前屏幕截图（分辨率 " + shot.width() + "×" + shot.height()
-                                + "，点击坐标按此图上的像素估算即可，后端自动换算到真实屏幕）"
+                                + "，坐标参照系已切换到本图：点击/放大都按此图上的像素给出，后端自动换算到真实屏幕）"
                                 + (file != null ? "，已存：" + file : "") + "。请直接描述或分析画面。")
                         .build();
                 return ToolResultBlock.of(List.of(note, imageBlock(shot.png())));
@@ -116,33 +144,102 @@ public class ComputerTools {
             }
         }
 
+        @Tool(name = "computer_zoom", description = "Crop and enlarge a region around (x, y) from the most "
+                + "recent screenshot at FULL original resolution (no downscaling), so small buttons, icons "
+                + "and dense text become clearly visible. Coordinates are pixels on the most recent image "
+                + "(same reference as computer_click). size is the region side in pixels on that image "
+                + "(200-800 recommended). Read-only, no approval needed. Call this before clicking a small "
+                + "or unclear target, then give click coordinates in the returned zoomed image's pixels.")
+        public ToolResultBlock computerZoom(
+                @ToolParam(name = "x", description = "Pixel x of the region center on the most recent image") int x,
+                @ToolParam(name = "y", description = "Pixel y of the region center on the most recent image") int y,
+                @ToolParam(name = "size", required = false,
+                        description = "Region side in pixels on the most recent image; omit for 400")
+                Integer size) {
+            BufferedImage original = lastOriginal;
+            RefFrame from = ref;
+            if (original == null || from == null) {
+                return ToolResultBlock.error("还没有可放大的截图，请先调用 computer_screenshot。");
+            }
+            int side = size == null ? 400 : size;
+            if (side < 32 || side > 2000) {
+                return ToolResultBlock.error("放大失败：size 需在 32~2000 之间（参考 200~800）。");
+            }
+            try {
+                synchronized (ComputerTools.this) {
+                    // 参照图坐标 → 真实屏幕坐标：全屏图乘比例（区域边长同比缩放），局部放大图 1:1
+                    java.awt.Dimension screen = java.awt.Toolkit.getDefaultToolkit().getScreenSize();
+                    double scale = from.zoom() ? 1.0 : (double) screen.width / from.w();
+                    double realCx = from.zoom() ? from.ox() + x : x * scale;
+                    double realCy = from.zoom() ? from.oy() + y : y * scale;
+                    double realSide = Math.max(ZOOM_MIN_SIDE, Math.min(ZOOM_MAX_SIDE, side * scale));
+                    int w = (int) Math.min(realSide, original.getWidth());
+                    int h = (int) Math.min(realSide, original.getHeight());
+                    int ox = clamp((int) Math.round(realCx) - w / 2, 0, original.getWidth() - w);
+                    int oy = clamp((int) Math.round(realCy) - h / 2, 0, original.getHeight() - h);
+                    BufferedImage crop = original.getSubimage(ox, oy, w, h);
+                    byte[] png = toPng(crop);
+                    ref = new RefFrame(true, w, h, ox, oy);
+                    Path file = saveShot(png);
+                    // 全屏缩略图上对应位置，帮模型把局部图放回全局语境
+                    int[] thumb = thumbDims(original.getWidth(), original.getHeight());
+                    int mapX = (int) Math.round((ox + w / 2.0) / original.getWidth() * thumb[0]);
+                    int mapY = (int) Math.round((oy + h / 2.0) / original.getHeight() * thumb[1]);
+                    TextBlock note = TextBlock.builder()
+                            .text("局部放大图（原始分辨率 " + w + "×" + h + "，与真实屏幕 1:1；对应屏幕区域左上角 ("
+                                    + ox + ", " + oy + ")，位于全屏缩略图中心附近 (" + mapX + ", " + mapY + ")）"
+                                    + (file != null ? "，已存：" + file : "")
+                                    + "。坐标参照系已切换到本图：后续点击按本图上的像素直接给出，后端自动换算。")
+                            .build();
+                    return ToolResultBlock.of(List.of(note, imageBlock(png)));
+                }
+            } catch (Exception e) {
+                return ToolResultBlock.error("放大失败：" + msg(e));
+            }
+        }
+
         @Tool(name = "computer_click", description = "Click at pixel (x, y) taken from the most recent "
-                + "computer_screenshot (the backend rescales screenshot pixels to the physical screen "
-                + "automatically). Coordinates MUST come from the latest screenshot. Requires user approval; "
-                + "a fresh screenshot is returned afterwards so you can verify the result.")
+                + "returned image: the full-screen screenshot OR the latest computer_zoom crop (each tool "
+                + "reply states which reference is active; the backend rescales to the physical screen "
+                + "automatically). Coordinates MUST come from that image. Prefer aiming at the geometric "
+                + "center of the target element. Requires user approval; an original-resolution crop "
+                + "centered on the landing point is returned afterwards so you can verify precisely where "
+                + "the cursor landed (the verify crop itself does NOT change the reference).")
         public ToolResultBlock computerClick(
-                @ToolParam(name = "x", description = "Pixel x on the latest screenshot") int x,
-                @ToolParam(name = "y", description = "Pixel y on the latest screenshot") int y,
+                @ToolParam(name = "x", description = "Pixel x on the most recent returned image") int x,
+                @ToolParam(name = "y", description = "Pixel y on the most recent returned image") int y,
                 @ToolParam(name = "doubleClick", required = false,
                         description = "true for double-click; omit for single click")
                 Boolean doubleClick) {
             boolean dbl = Boolean.TRUE.equals(doubleClick);
-            String desc = (dbl ? "双击" : "单击") + "屏幕坐标 (" + x + ", " + y + ")";
+            String desc = (dbl ? "双击" : "单击") + "图像坐标 (" + x + ", " + y + ")";
             if (!sink.request(OperationGrant.OP_COMPUTER, desc,
-                    "即将移动并点击鼠标，期间请勿操作键鼠；坐标基于最近一次屏幕截图估算。")) {
+                    "即将移动并点击鼠标，期间请勿操作键鼠；坐标基于最近一次回传图像估算。")) {
                 return ToolResultBlock.error(DENIED);
             }
             java.awt.Dimension screen = java.awt.Toolkit.getDefaultToolkit().getScreenSize();
-            int[] src = lastShot;
-            double sx = (src != null && src[0] > 0) ? (double) screen.width / src[0] : 1.0;
-            double sy = (src != null && src[1] > 0) ? (double) screen.height / src[1] : 1.0;
-            int cx = Math.max(0, Math.min((int) Math.round(x * sx), screen.width - 1));
-            int cy = Math.max(0, Math.min((int) Math.round(y * sy), screen.height - 1));
+            RefFrame f = ref;
+            int cx;
+            int cy;
+            if (f == null) {
+                cx = x;
+                cy = y;
+            } else if (f.zoom()) {
+                cx = f.ox() + x;
+                cy = f.oy() + y;
+            } else {
+                cx = (int) Math.round(x * (double) screen.width / f.w());
+                cy = (int) Math.round(y * (double) screen.height / f.h());
+            }
+            cx = Math.max(0, Math.min(cx, screen.width - 1));
+            cy = Math.max(0, Math.min(cy, screen.height - 1));
             try {
+                BufferedImage original;
                 synchronized (ComputerTools.this) {
                     Robot r = robot();
                     r.mouseMove(cx, cy);
                     r.waitForIdle();
+                    Thread.sleep(HOVER_PAUSE_MS);
                     r.mousePress(InputEvent.BUTTON1_DOWN_MASK);
                     r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
                     if (dbl) {
@@ -150,16 +247,21 @@ public class ComputerTools {
                         r.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
                     }
                     r.waitForIdle();
+                    original = freshOriginal();
                 }
-                Shot shot = shotPng();
-                Path file = saveShot(shot.png());
+                // 核对图：落点周围原始分辨率局部（光标就在中心附近），参照系不切换——模型下一步仍按全屏图坐标
+                BufferedImage crop = cropAround(original, cx, cy, VERIFY_CROP_SIDE);
+                byte[] png = toPng(crop);
+                Path file = saveShot(png);
                 TextBlock note = TextBlock.builder()
-                        .text("已" + (dbl ? "双击" : "单击") + "屏幕：截图坐标 (" + x + ", " + y + ") → 真实屏幕 (" + cx + ", " + cy
-                                + ")。操作后的最新屏幕截图（分辨率 " + shot.width() + "×" + shot.height()
+                        .text("已" + (dbl ? "双击" : "单击") + "屏幕：图像坐标 (" + x + ", " + y + ") → 真实屏幕 (" + cx + ", " + cy
+                                + ")。落点周围放大核对图（原始分辨率 " + crop.getWidth() + "×" + crop.getHeight()
+                                + "，光标在图中心附近，用于核对点没点准；参照系不变，仍按全屏图坐标操作）"
                                 + (file != null ? "，已存：" + file : "")
-                                + "）：请核对点击是否生效，目标元素状态是否符合预期。")
+                                + "。请核对：光标是否落在目标元素上、点击是否生效。若画面已变化（弹窗/跳转）"
+                                + "或需要全局视角，先 computer_screenshot 再继续。")
                         .build();
-                return ToolResultBlock.of(List.of(note, imageBlock(shot.png())));
+                return ToolResultBlock.of(List.of(note, imageBlock(png)));
             } catch (Exception e) {
                 return ToolResultBlock.error(desc + "失败：" + msg(e));
             }
@@ -370,17 +472,53 @@ public class ComputerTools {
     private record Shot(byte[] png, int width, int height) {
     }
 
-    /** 全屏截图并按上限降采样；坐标空间：模型给截图像素，Robot 用换算后的设备像素 */
+    /** 全屏截图：原始分辨率版缓存进 lastOriginal（zoom/核对图数据源），回传降采样图并把参照系切回全屏图 */
     private Shot shotPng() throws Exception {
         synchronized (this) {
-            Robot r = robot();
-            java.awt.Dimension screen = java.awt.Toolkit.getDefaultToolkit().getScreenSize();
-            BufferedImage img = downscale(r.createScreenCapture(new Rectangle(screen)));
-            lastShot = new int[]{img.getWidth(), img.getHeight()};
+            BufferedImage original = freshOriginal();
+            BufferedImage thumb = downscale(original);
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
-            ImageIO.write(img, "png", bos);
-            return new Shot(bos.toByteArray(), img.getWidth(), img.getHeight());
+            ImageIO.write(thumb, "png", bos);
+            return new Shot(bos.toByteArray(), thumb.getWidth(), thumb.getHeight());
         }
+    }
+
+    /** 重截全屏原始图并更新 lastOriginal 与全屏参照系（须在 synchronize 内调用）；返回原始版供裁剪 */
+    private BufferedImage freshOriginal() throws Exception {
+        Robot r = robot();
+        java.awt.Dimension screen = java.awt.Toolkit.getDefaultToolkit().getScreenSize();
+        BufferedImage original = r.createScreenCapture(new Rectangle(screen));
+        lastOriginal = original;
+        BufferedImage thumb = downscale(original);
+        ref = new RefFrame(false, thumb.getWidth(), thumb.getHeight(), 0, 0);
+        return original;
+    }
+
+    /** 以 (cx, cy) 为中心从原始截图裁边长 side 的局部（自动收敛到屏内），供点击核对图 */
+    private static BufferedImage cropAround(BufferedImage src, int cx, int cy, int side) {
+        int w = Math.min(side, src.getWidth());
+        int h = Math.min(side, src.getHeight());
+        int ox = clamp(cx - w / 2, 0, src.getWidth() - w);
+        int oy = clamp(cy - h / 2, 0, src.getHeight() - h);
+        return src.getSubimage(ox, oy, w, h);
+    }
+
+    /** 与 downscale 同公式只算尺寸：把真实屏幕坐标映射到全屏缩略图坐标时用 */
+    private static int[] thumbDims(int w, int h) {
+        double byEdge = (double) SHOT_MAX_EDGE / Math.max(w, h);
+        double byArea = Math.sqrt(SHOT_MAX_PIXELS / ((double) w * h));
+        double scale = Math.min(1.0, Math.min(byEdge, byArea));
+        return new int[]{Math.max(1, (int) (w * scale)), Math.max(1, (int) (h * scale))};
+    }
+
+    private static byte[] toPng(BufferedImage img) throws Exception {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        ImageIO.write(img, "png", bos);
+        return bos.toByteArray();
+    }
+
+    private static int clamp(int v, int min, int max) {
+        return Math.max(min, Math.min(v, max));
     }
 
     /** 降采样到长边 ≤1568 且总像素 ≤115 万（取更严者）：低于各家视觉 API 的静默重采样阈值，保证模型所见即所报 */

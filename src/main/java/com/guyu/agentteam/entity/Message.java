@@ -17,6 +17,10 @@ public class Message {
     private String conversationId;
     private String senderType;
     private String senderId;
+    /** 外部通道发送者昵称（QQ 为平台随事件下发的 author.username），本地消息为 null */
+    private String senderName;
+    /** 外部通道发送者群角色（QQ 为 author.member_role：owner/admin，普通成员为空），本地消息为 null */
+    private String senderRole;
     private String content;
     /** 附件 JSON：[{"path":"D:\\a\\b.py","type":"file","name":"b.py"}]，无附件为 null */
     private String attachments;
