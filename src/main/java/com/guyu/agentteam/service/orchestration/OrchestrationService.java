@@ -184,7 +184,6 @@ public class OrchestrationService {
             appLogs.record(AppLog.TYPE_TASK, conv.getId(), orchestrator.getId(),
                     "定时任务「" + taskTag.taskName() + "」触发轮未实际执行（编排者「" + orchestrator.getName()
                             + "」，无委派/写改等有效操作），已追加纠正指令重试");
-            compression.compactIfNeeded(conv, orchestrator);
         }
         if (taskTriggerRound && !settled && !handle.stopRequested.get()) {
             String err = taskTag.collab()
@@ -277,12 +276,20 @@ public class OrchestrationService {
             askUserTools.register(toolkit, emitter, orchestrator, () -> target.get().getId(), null, null, null);
         }
 
-        compression.compactIfNeeded(conv, orchestrator);
+        // 本轮注入上下文的字符量（系统提示 + 历史）与压缩预算在回合开始时推送，前端输入区常驻指示条随之更新
+        String sysPrompt = buildSysPrompt(orchestrator, team, conv.getId(), background, fromWechat,
+                taskTag != null && taskTag.autoBrowser());
+        // 触发判定与指示条同一总量口径：系统提示词 + 拼装输入（unscoped，含署名等拼装文本）
+        // 的真实字符量——raw 正文粗估会少算拼装部分，出现指示条 90% 了后端还没到线的错位
+        long totalChars = sysPrompt.length()
+                + ConversationStreamSupport.contextChars(null, support.singleChatInputUnscoped(conv.getId()));
+        support.compactExplicit(emitter, conv, orchestrator, totalChars);
+        List<Msg> roundInput = support.singleChatInput(conv.getId());
+        support.sendContextSize(emitter, conv.getId(), sysPrompt, roundInput);
 
         ReActAgent.Builder builder = ReActAgent.builder()
                 .name(orchestrator.getName())
-                .sysPrompt(buildSysPrompt(orchestrator, team, conv.getId(), background, fromWechat,
-                        taskTag != null && taskTag.autoBrowser()))
+                .sysPrompt(sysPrompt)
                 .model(modelFactory.create(orchestrator, preset))
                 .toolkit(toolkit);
         skillSupport.applySkills(builder, orchestrator);
@@ -296,7 +303,7 @@ public class OrchestrationService {
         handle.running.add(agent);
         boolean ok = true;
         try {
-            agent.streamEvents(support.singleChatInput(conv.getId()))
+            agent.streamEvents(roundInput)
                     .takeUntilOther(handle.cancelSignal())
                     .doOnNext(e -> {
                         if (e.getType() == AgentEventType.TEXT_BLOCK_DELTA) {
@@ -811,8 +818,11 @@ public class OrchestrationService {
                     .longTermMemoryMode(LongTermMemoryMode.AGENT_CONTROL)
                     .build();
             handle.running.add(memberAgent);
+            // 委派成员的输入是单条任务指令：注入量同样在回合开始时推送
+            UserMessage taskInput = new UserMessage(task);
+            support.sendContextSize(emitter, conv.getId(), memberSysPrompt, List.of(taskInput));
             try {
-                memberAgent.streamEvents(new UserMessage(task))
+                memberAgent.streamEvents(taskInput)
                         .takeUntilOther(handle.cancelSignal())
                         .doOnNext(ev -> {
                             if (ev.getType() == AgentEventType.TEXT_BLOCK_DELTA) {

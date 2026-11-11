@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -35,21 +36,34 @@ import java.util.stream.Collectors;
  * 后续轮次只保留文字注记（需要重看可用 view_image 工具按需重注入）。
  * 历史层（滚动摘要）：注入字符超过预算时，把水位线之后较旧的一段消息连同旧摘要
  * 一起用会话模型压缩成新摘要（digest，拼进 system prompt），水位线随之推进；
- * 摘要失败时降级为纯截断（historyMsgs 按预算从最新往回取），不阻塞回复。
+ * 压缩同步显性（compress_start/end 事件，前端气泡下方显示「正在压缩」），
+ * 失败降级为纯截断（historyMsgs 按预算从最新往回取）并进入暂缓期，恢复后自动重试。
  */
 @Service
 public class ContextCompressionService {
 
     public static final boolean DEFAULT_ENABLED = true;
-    public static final int DEFAULT_BUDGET_CHARS = 60000;
-    private static final int BUDGET_MIN = 5000;
+    public static final int DEFAULT_BUDGET_CHARS = 50000;
+    /** 预算上下限（字符）：设置页以 K 为单位输入，范围 20K-500K */
+    private static final int BUDGET_MIN = 20000;
     private static final int BUDGET_MAX = 500000;
     private static final String KEY = "context.compression";
     /** 触发压缩时保留原文的近期消息字符预算（预算的一半），其余较旧部分滚入摘要 */
     private static final double SUFFIX_KEEP_RATIO = 0.5;
+    /** 压缩触发线：注入总量（含系统提示词等不可压缩项）达到预算的 90% 即后台压缩 */
+    private static final double COMPACT_TRIGGER_RATIO = 0.9;
     /** 摘要本身的长度上限（字符）：约预算的 1/8，封顶 8000 */
     private static final int DIGEST_MAX = 8000;
-    private static final Duration SUMMARIZE_TIMEOUT = Duration.ofMinutes(2);
+    /**
+     * 摘要调用的总时长上限：须盖过 modelCallExecutionConfig 的完整重试链
+     * （3 分钟空闲超时 × 2 次尝试 + 指数退避间隔），否则外层先到期，配置的重试永远轮不到发挥。
+     */
+    private static final Duration SUMMARIZE_TIMEOUT = ConversationStreamSupport.MODEL_CALL_TIMEOUT
+            .multipliedBy(2).plus(Duration.ofSeconds(30));
+    /** 摘要失败后的暂缓期：期间回合直接按预算截断历史（毫秒级），不再每轮白等一次完整重试 */
+    private static final long COOLDOWN_MS = Duration.ofMinutes(10).toMillis();
+    /** conversationId -> 摘要失败后暂缓压缩的截止时间（内存态，重启即清零重新尝试） */
+    private final Map<String, Long> compressCooldownUntil = new ConcurrentHashMap<>();
 
     private final SettingsStore store;
     private final ConversationRepository conversations;
@@ -78,19 +92,6 @@ public class ContextCompressionService {
     public record Settings(boolean enabled, int budgetChars) {
     }
 
-    /** 压缩模型的结构化输出：digest 为合并旧摘要后的完整新摘要 */
-    public static class DigestOut {
-        private String digest;
-
-        public String getDigest() {
-            return digest;
-        }
-
-        public void setDigest(String digest) {
-            this.digest = digest;
-        }
-    }
-
     public ContextCompressionDto get() {
         Settings s = load();
         return new ContextCompressionDto(s.enabled(), s.budgetChars());
@@ -98,7 +99,7 @@ public class ContextCompressionService {
 
     public ContextCompressionDto save(boolean enabled, int budgetChars) {
         if (budgetChars < BUDGET_MIN || budgetChars > BUDGET_MAX) {
-            throw new ApiException(400, "上下文预算需在 " + BUDGET_MIN + "-" + BUDGET_MAX + " 字符之间");
+            throw new ApiException(400, "上下文预算需在 " + (BUDGET_MIN / 1000) + "K-" + (BUDGET_MAX / 1000) + "K 字符之间");
         }
         String json;
         try {
@@ -146,25 +147,83 @@ public class ContextCompressionService {
     }
 
     /**
-     * 回合开始前调用：超过预算则把较旧的一段消息滚入摘要（同步一次模型调用）。
-     * modelOwner 提供压缩用的模型预设；失败只记日志并降级为截断，绝不阻塞回复。
+     * 是否需要压缩：已启用且不在失败暂缓期、模型预设可用，且总注入量达到预算的 90%。
+     * totalChars 是「系统提示词 + 拼装输入」的真实字符量（与指示条同一口径——含署名、
+     * QQ 发送者前缀、【系统行动记录】、附件完整注记等拼装文本；raw 正文粗估会少算这些，
+     * 出现指示条 90% 了后端还没到线的错位），且须有可滚入摘要的旧消息
+     * （单条消息就超出保留预算时只交截断兜底）。
+     * 显性化提示（compress_start 是否该发）与压缩本体共用同一判定，两边口径永不打架。
      */
-    public void compactIfNeeded(Conversation conv, Agent modelOwner) {
+    public boolean needsCompact(Conversation conv, Agent modelOwner, long totalChars) {
         if (modelOwner == null || !load().enabled()) {
-            return;
+            return false;
         }
-        Optional<ModelPreset> presetOpt = presetOf(modelOwner);
-        if (presetOpt.isEmpty()) {
-            return;
+        Long until = compressCooldownUntil.get(conv.getId());
+        if (until != null && System.currentTimeMillis() < until) {
+            return false;
+        }
+        if (presetOf(modelOwner).isEmpty()) {
+            return false;
         }
         Settings s = load();
-        List<Message> all = textMessages(conv.getId());
-        List<Message> effective = afterWatermark(all, conv.getDigestWatermark());
-        long digestChars = conv.getContextDigest() == null ? 0 : conv.getContextDigest().length();
-        if (charsOf(effective) + digestChars <= s.budgetChars()) {
-            return;
+        if (totalChars < (long) (s.budgetChars() * COMPACT_TRIGGER_RATIO)) {
+            return false;
         }
-        long keepBudget = (long) (s.budgetChars() * SUFFIX_KEEP_RATIO);
+        List<Message> effective = afterWatermark(textMessages(conv.getId()), conv.getDigestWatermark());
+        return suffixStartOf(effective, s.budgetChars()) > 0;
+    }
+
+    /**
+     * 达到触发线时由后台压缩线程调用：把较旧的一段消息滚入摘要（一次摘要模型调用，
+     * 不阻塞回合——回复按预算截断历史先行）。
+     * modelOwner 提供压缩用的模型预设；失败记日志、进入暂缓期并降级为截断，后续轮照常回复。
+     * 返回是否成功写入了新摘要（显性化据此告知前端成败）。
+     */
+    public boolean compactIfNeeded(Conversation conv, Agent modelOwner, long totalChars) {
+        if (!needsCompact(conv, modelOwner, totalChars)) {
+            return false;
+        }
+        Settings s = load();
+        List<Message> effective = afterWatermark(textMessages(conv.getId()), conv.getDigestWatermark());
+        int suffixStart = suffixStartOf(effective, s.budgetChars());
+        List<Message> overflow = new ArrayList<>(effective.subList(0, suffixStart));
+        String digest = summarize(conv, modelOwner, presetOf(modelOwner).get(), overflow);
+        if (digest == null) {
+            // 失败暂缓：期间回合直接走预算截断（毫秒级），不再每轮白等一次完整的摘要重试
+            compressCooldownUntil.put(conv.getId(), System.currentTimeMillis() + COOLDOWN_MS);
+            return false;
+        }
+        conv.setContextDigest(digest);
+        conv.setDigestWatermark(overflow.get(overflow.size() - 1).getId());
+        conv.setUpdatedAt(System.currentTimeMillis());
+        conversations.save(conv);
+        lastCompactErrors.remove(conv.getId());
+        appLogs.record(AppLog.TYPE_COMPACT, conv.getId(), modelOwner.getId(),
+                "上下文已压缩：" + overflow.size() + " 条消息滚入摘要（摘要 " + digest.length() + " 字），"
+                        + "近 " + (effective.size() - suffixStart) + " 条保留原文");
+        return true;
+    }
+
+    /** 各会话最近一次压缩失败的原因（成功即清除）：compress_end 带给前端，点击叹号可看 */
+    private final Map<String, String> lastCompactErrors = new ConcurrentHashMap<>();
+
+    /** 会话最近一次压缩失败的原因，无失败记录返回 null */
+    public String lastCompactError(String conversationId) {
+        return lastCompactErrors.get(conversationId);
+    }
+
+    /** 记录会话最近一次压缩失败原因（前端点击叹号展示；完整原因已在运行日志，这里留可读摘要） */
+    private void recordCompactError(String conversationId, String reason) {
+        String t = reason == null ? "未知原因" : reason.strip();
+        lastCompactErrors.put(conversationId, t.length() > 500 ? t.substring(0, 500) + "…" : t);
+    }
+
+    /**
+     * 溢出/保留的分界下标：从最新往回累计到保留预算（预算的一半）为止，
+     * 其余较旧部分滚入摘要；最新一条永远保留原文（连它都超出保留预算时只压缩它之前的）。
+     */
+    private static int suffixStartOf(List<Message> effective, int budgetChars) {
+        long keepBudget = (long) (budgetChars * SUFFIX_KEEP_RATIO);
         int suffixStart = effective.size();
         long acc = 0;
         for (int i = effective.size() - 1; i >= 0; i--) {
@@ -174,26 +233,10 @@ public class ContextCompressionService {
             }
             suffixStart = i;
         }
-        // 最新一条永远保留原文（连它都超出保留预算时只压缩它之前的）
         if (suffixStart >= effective.size() && !effective.isEmpty()) {
             suffixStart = effective.size() - 1;
         }
-        // 没有任何可压缩的旧消息（单条消息就超出保留预算），交给 historyMsgs 的预算截断兜底
-        if (suffixStart == 0) {
-            return;
-        }
-        List<Message> overflow = new ArrayList<>(effective.subList(0, suffixStart));
-        String digest = summarize(conv, modelOwner, presetOpt.get(), overflow);
-        if (digest == null) {
-            return;
-        }
-        conv.setContextDigest(digest);
-        conv.setDigestWatermark(overflow.get(overflow.size() - 1).getId());
-        conv.setUpdatedAt(System.currentTimeMillis());
-        conversations.save(conv);
-        appLogs.record(AppLog.TYPE_COMPACT, conv.getId(), modelOwner.getId(),
-                "上下文已压缩：" + overflow.size() + " 条消息滚入摘要（摘要 " + digest.length() + " 字），"
-                        + "近 " + (effective.size() - suffixStart) + " 条保留原文");
+        return suffixStart;
     }
 
     /** 回合成功结束后调用：把会话内所有未阅的图片附件标记为已阅，后续轮次不再注入视觉块 */
@@ -234,22 +277,46 @@ public class ContextCompressionService {
                 .model(modelFactory.create(modelOwner, preset))
                 .modelExecutionConfig(ConversationStreamSupport.modelCallExecutionConfig())
                 .build()) {
-            Msg out = summarizer.call(List.of(UserMessage.builder().textContent(input.toString()).build()), DigestOut.class)
+            // 纯文本调用，不走结构化输出：部分服务商/推理模型对「工具式结构化返回」支持不稳，
+            // 模型写出摘要正文却不调工具，ReAct 循环空转到超时（曾 4 分钟静默失败）。本任务
+            // 输入即全文输出，无需结构约束
+            Msg out = summarizer.call(List.of(UserMessage.builder().textContent(input.toString()).build()))
                     .block(SUMMARIZE_TIMEOUT);
-            if (out == null || !out.hasStructuredData()) {
-                return null;
-            }
-            String digest = out.getStructuredData(DigestOut.class).getDigest();
+            String digest = out == null ? null : out.getTextContent();
             if (digest == null || digest.isBlank()) {
+                String reason = "摘要调用无文本返回（输入 " + input.length()
+                        + " 字，超时上限 " + SUMMARIZE_TIMEOUT.toMinutes() + " 分钟）";
+                appLogs.record(AppLog.TYPE_ERROR, conv.getId(), modelOwner.getId(),
+                        "上下文压缩失败，本轮按预算截断历史：" + reason);
+                recordCompactError(conv.getId(), reason);
                 return null;
             }
-            digest = digest.trim();
+            digest = stripDigest(digest);
             return digest.length() > DIGEST_MAX ? digest.substring(0, DIGEST_MAX) + "…（摘要过长已截断）" : digest;
         } catch (Exception e) {
+            String reason = ConversationStreamSupport.errorDetail(e);
             appLogs.record(AppLog.TYPE_ERROR, conv.getId(), modelOwner.getId(),
-                    "上下文压缩失败，本轮按预算截断历史：" + ConversationStreamSupport.errorDetail(e));
+                    "上下文压缩失败，本轮按预算截断历史：" + reason);
+            recordCompactError(conv.getId(), reason);
             return null;
         }
+    }
+
+    /** 摘要文本清理：剥掉 markdown 围栏与首尾空白（模型偶尔用代码块包裹输出） */
+    private static String stripDigest(String text) {
+        String t = text.trim();
+        if (t.startsWith("```")) {
+            int first = t.indexOf('\n');
+            if (first > 0) {
+                t = t.substring(first + 1);
+            }
+            int last = t.lastIndexOf("```");
+            if (last >= 0) {
+                t = t.substring(0, last);
+            }
+            t = t.trim();
+        }
+        return t;
     }
 
     private static final String COMPACTION_PROMPT = """
@@ -263,8 +330,8 @@ public class ContextCompressionService {
             3. 区分「说过」与「做过」：发言可能附带「（实际执行：…）」标注，这是系统核实的执行凭证，\
                摘要必须如实保留（谁执行了什么）；没有标注的完成式表述只是口头自述，摘要里不得写成已完成。
             4. 舍弃：寒暄、重复表述、与任务无关的闲聊。
-            5. 按主题或时间顺序组织，输出纯文本（可用短行/短列表），不要添加评论或解释。
-            6. 把结果填在 digest 字段返回。
+            5. 按主题或时间顺序组织，直接输出摘要正文（可用短行/短列表），不要添加评论或解释，
+               不要用代码块包裹，不要输出摘要以外的任何内容。
             """;
 
     /** 消息列表转纯文本记录（署名 + 附件注记），供压缩模型阅读 */

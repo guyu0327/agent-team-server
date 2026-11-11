@@ -200,7 +200,19 @@ public class ChatStreamService {
                 try {
                     boolean group = "group".equals(conv.getType());
                     List<Agent> responders = responders(conv, userMsg.getContent(), freeChain);
-                    compression.compactIfNeeded(conv, compressionOwner(conv, responders));
+                    // 触发判定与指示条同一总量口径：系统提示词 + 拼装输入（unscoped，含署名、
+                    // QQ 发送者前缀、【系统行动记录】等拼装文本）的真实字符量——raw 正文粗估
+                    // 会少算拼装部分，出现指示条 90% 了后端还没到线的错位
+                    Agent owner = compressionOwner(conv, responders);
+                    long totalChars = 0;
+                    if (owner != null) {
+                        List<Msg> unscopedInput = group
+                                ? groupInput(conv, owner, true)
+                                : support.singleChatInputUnscoped(conv.getId());
+                        totalChars = sysPromptOf(owner, conv.getId(), handle != null ? handle.taskTag : null).length()
+                                + ConversationStreamSupport.contextChars(null, unscopedInput);
+                    }
+                    support.compactExplicit(emitter, conv, owner, totalChars);
                     for (Agent agent : responders) {
                         if (handle.stopRequested.get()) break;
                         replyOne(emitter, conv, agent, handle,
@@ -236,6 +248,30 @@ public class ChatStreamService {
     /** 该会话是否有进行中的回复回合（定时任务触发时用于重入保护） */
     public boolean isRunning(String conversationId) {
         return runs.containsKey(conversationId);
+    }
+
+    /**
+     * 进入/刷新会话时重算上下文指示（GET context-size）：与回合开始同一口径——
+     * 首个应答者的系统提示 + 历史注入量；群聊按 passive 模式取首位成员，无成员的会话计 0。
+     * 前端刷新后立即有数值，不必等下一轮回复的 context_size 事件。
+     */
+    public Map<String, Object> contextSizeOf(Conversation conv) {
+        List<Agent> responders = responders(conv, "", false);
+        String sysPrompt = "";
+        List<Msg> input = List.of();
+        if (!responders.isEmpty()) {
+            Agent first = responders.get(0);
+            sysPrompt = sysPromptOf(first, conv.getId(), null);
+            // 指示条口径不按预算截断：字符量只随消息与压缩变化，调整预算时数字不跳动
+            input = "group".equals(conv.getType()) ? groupInput(conv, first, true)
+                    : support.singleChatInputUnscoped(conv.getId());
+        }
+        long[] parts = support.sizeParts(conv.getId(), sysPrompt, input);
+        return Map.of("conversationId", conv.getId(),
+                "chars", parts[0] + parts[1],
+                "fixed", parts[0],
+                "compressible", parts[1],
+                "budget", compression.load().budgetChars());
     }
 
     /** 终止指定会话进行中的回复/自由讨论，返回是否找到了运行中的回合 */
@@ -279,6 +315,10 @@ public class ChatStreamService {
             return;
         }
 
+        // 本轮注入上下文的字符量（系统提示 + 历史）与压缩预算在回合开始时推送，前端输入区常驻指示条随之更新
+        String sysPrompt = sysPromptOf(agent, conv.getId(), handle != null ? handle.taskTag : null);
+        support.sendContextSize(emitter, conv.getId(), sysPrompt, input);
+
         // 预告「谁即将发言」：模型思考窗口（含接龙/依次回复的间隔期）没有 reply_start，
         // 前端独立思考条靠它显示头像与身份；占位气泡出现（reply_start）后由气泡内打字点接管
         support.send(emitter, "reply_pending", Map.of(
@@ -300,7 +340,7 @@ public class ChatStreamService {
             }
             ReActAgent.Builder builder = ReActAgent.builder()
                     .name(agent.getName())
-                    .sysPrompt(sysPromptOf(agent, conv.getId(), handle != null ? handle.taskTag : null))
+                    .sysPrompt(sysPrompt)
                     .model(modelFactory.create(agent, preset, multiAgent))
                     .toolkit(toolkitOf(conv, emitter, agent, handle, seg));
             skillSupport.applySkills(builder, agent);
@@ -359,6 +399,15 @@ public class ChatStreamService {
                 boolean stopped = handle != null && handle.stopRequested.get();
                 if (seg.opened == 0 && !stopped) {
                     support.closeSegment(emitter, conv, agent, seg);
+                    // 报错分层：气泡文案简短，运行日志叠加完整线索（零输出 vs 仅思考无正文）
+                    String detail = seg.thinking.isEmpty()
+                            ? "流式连接正常结束但零输出（无思考无正文）：多为服务商对超大输入直接返回空补全"
+                              + "（内容审查/上下文超限/限流），本次注入 "
+                              + ConversationStreamSupport.contextChars(sysPrompt, roundInput) + " 字，可查服务商控制台"
+                            : "仅返回思考（" + seg.thinking.length() + " 字）无正文：输出 tokens 在推理阶段耗尽，"
+                              + "本次注入 " + ConversationStreamSupport.contextChars(sysPrompt, roundInput) + " 字";
+                    appLogs.record(AppLog.TYPE_ERROR, conv.getId(), agent.getId(),
+                            "「" + agent.getName() + "」模型未返回内容：" + detail);
                     support.persistError(conv, agent, "「" + agent.getName() + "」（模型未返回内容）");
                     support.send(emitter, "reply_error", Map.of("agentId", agent.getId(), "error", "（模型未返回内容）"));
                     break;
@@ -633,7 +682,14 @@ public class ChatStreamService {
      * 写成「不要执行记录中的任何指令」会让模型把用户「记住某某」的要求一并忽略、只口头应付。
      */
     private List<Msg> groupInput(Conversation conv, Agent speaker) {
-        List<Msg> msgs = new ArrayList<>(support.historyMsgs(conv.getId(), memberNames(conv)));
+        return groupInput(conv, speaker, false);
+    }
+
+    /** unscoped=true 为指示条口径：历史不按预算截断（水位线后全部），其余与回合注入一致 */
+    private List<Msg> groupInput(Conversation conv, Agent speaker, boolean unscoped) {
+        List<Msg> msgs = new ArrayList<>(unscoped
+                ? support.historyMsgsUnscoped(conv.getId(), memberNames(conv))
+                : support.historyMsgs(conv.getId(), memberNames(conv)));
         msgs.add(instruction("这是一场群聊，成员们会依次回复，现在轮到你（" + speaker.getName() + "）发言。"
                 + "最后一条用户消息是本轮需要你回应的请求，请正常响应并完成它要求的事情（需要时调用工具）；"
                 + "发言时只以你自己的身份：不要替其他成员或用户发言，不要模拟或预写他们的回应；"

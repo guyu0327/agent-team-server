@@ -43,6 +43,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** 普通回复与编排回复共用的 SSE 发送和消息持久化逻辑 */
@@ -91,6 +93,98 @@ public class ConversationStreamSupport {
     public void broadcastToWatchers(String conversationId, String event, Object data) {
         fanOut(conversationId, event, mapper.writeValueAsString(data));
         logEvent(event, data);
+    }
+
+    /** 估算本轮注入模型的字符量：系统提示 + 输入消息文本，与上下文压缩预算同一字符口径（图片等非文本块不计） */
+    public static long contextChars(String sysPrompt, List<Msg> input) {
+        long n = sysPrompt == null ? 0 : sysPrompt.length();
+        if (input != null) {
+            for (Msg m : input) {
+                String t = m.getTextContent();
+                if (t != null) {
+                    n += t.length();
+                }
+            }
+        }
+        return n;
+    }
+
+    /** 回合开始时推送本轮注入上下文的字符量与压缩预算（context_size 事件），前端输入区常驻显示「离压缩还有多远」 */
+    public void sendContextSize(SseEmitter emitter, String conversationId, String sysPrompt, List<Msg> input) {
+        long[] parts = sizeParts(conversationId, sysPrompt, input);
+        send(emitter, "context_size", Map.of("conversationId", conversationId,
+                "chars", parts[0] + parts[1],
+                "fixed", parts[0],
+                "compressible", parts[1],
+                "budget", compression.load().budgetChars()));
+    }
+
+    /**
+     * 注入量的两段拆分：{固定部分, 可压缩部分}。固定 = 系统提示词、技能/记忆/工具说明等
+     * 不可压缩项（含行动纪律）；可压缩 = 早期摘要块 + 水位线后历史（压缩真正作用的对象，
+     * 超预算即触发摘要）。摘要块虽拼在 sysPrompt 里，但归可压缩侧——它正是历史压缩后的形态。
+     */
+    public long[] sizeParts(String conversationId, String sysPrompt, List<Msg> input) {
+        String digestBlock = compression.promptBlock(conversationId);
+        long digestLen = digestBlock == null ? 0 : digestBlock.length();
+        long sysLen = sysPrompt == null ? 0 : sysPrompt.length();
+        long fixed = Math.max(0, sysLen - digestLen);
+        long compressible = digestLen + contextChars(null, input);
+        return new long[]{fixed, compressible};
+    }
+
+    /** 各会话进行中的后台压缩（防重复提交；重启即清零，暂缓期同理） */
+    private final Set<String> compactingConvIds = ConcurrentHashMap.newKeySet();
+
+    /** 后台压缩执行器：压缩是一次摘要模型调用，频次低且不许阻塞回合，单线程排队足够 */
+    private final ExecutorService compactExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ctx-compact");
+        t.setDaemon(true);
+        return t;
+    });
+
+    /**
+     * 后台压缩的显性化：注入总量达触发线（预算的 90%，与指示条同一口径）时发 compress_start
+     * （前端在上下文指示条上转圈），压缩本体提交后台执行、不阻塞本轮回复——回复按预算
+     * 截断历史先行（截断兜底），结束时发 compress_end；ok=false 即压缩失败（error 带回
+     * 最近一次失败原因，前端指示条转圈变红色叹号、点击可看）。未达触发线或处于失败暂缓期时
+     * 不发任何事件，回合零等待。
+     */
+    public void compactExplicit(SseEmitter emitter, Conversation conv, Agent modelOwner, long totalChars) {
+        if (!compression.needsCompact(conv, modelOwner, totalChars)) {
+            return;
+        }
+        // 同一会话的后台压缩进行中不重复触发：本轮直接按截断历史回复，新摘要落地后下轮生效
+        if (!compactingConvIds.add(conv.getId())) {
+            return;
+        }
+        send(emitter, "compress_start", Map.of("conversationId", conv.getId()));
+        compactExecutor.submit(() -> {
+            // 预置 false：Error 等未经 catch 的路径直接进 finally 时按失败收尾（发 compress_end 并解锁）
+            boolean ok = false;
+            try {
+                ok = compression.compactIfNeeded(conv, modelOwner, totalChars);
+            } catch (Exception e) {
+                ok = false;
+            } finally {
+                compactingConvIds.remove(conv.getId());
+                // 失败带回最近一次失败原因（前端点击指示条叹号可看）；Map.of 不收 null，无原因走两键版
+                String error = ok ? null : compression.lastCompactError(conv.getId());
+                Map<String, Object> payload = error == null
+                        ? Map.of("conversationId", conv.getId(), "ok", ok)
+                        : Map.of("conversationId", conv.getId(), "ok", ok, "error", error);
+                try {
+                    send(emitter, "compress_end", payload);
+                } catch (Exception e) {
+                    // 回合流可能已随回复结束而关闭：改走观察者扇出，正在查看的窗口照常收尾并刷新指示条
+                    try {
+                        broadcastToWatchers(conv.getId(), "compress_end", payload);
+                    } catch (Exception ignored) {
+                        // 连观察者都没有（页面已离开）：下次进入重算指示条即可
+                    }
+                }
+            }
+        });
     }
 
     /**
@@ -148,6 +242,8 @@ public class ConversationStreamSupport {
         /** 即将发言的成员（reply_pending 思考窗口）：重放缺失会让思考条在切页重连后凭空消失 */
         volatile String pendingAgent;
         volatile boolean discussing;
+        /** 正在压缩上下文（compress_start 到 compress_end）：重放缺失会让压缩提示条凭空消失 */
+        volatile boolean compressing;
         final Map<String, InFlightSegment> segments = new ConcurrentHashMap<>();
     }
 
@@ -163,12 +259,18 @@ public class ConversationStreamSupport {
     private void trackRound(String conversationId, String event, Object data) {
         ConvRoundState st;
         switch (event) {
-            // reply_pending 是单智能体回合的首个事件，此时快照尚不存在，须一并建快照
-            case "reply_start", "coordination_start", "reply_pending" ->
+            // reply_pending 是单智能体回合的首个事件，此时快照尚不存在，须一并建快照；
+            // compress_start（显性化压缩）先于 reply_pending，同样可能是首个事件
+            case "reply_start", "coordination_start", "reply_pending", "compress_start" ->
                     st = roundStates.computeIfAbsent(conversationId, k -> new ConvRoundState());
             case "done" -> {
-                roundStates.remove(conversationId);
-                return;
+                // done 不再无条件清快照：后台压缩比回合长寿（compress_start 发出后回复先行结束），
+                // 快照保留到 compress_end 按下方 cleanup 条件自然清掉——期间切走再切回的观察者
+                // 也能凭重放恢复转圈；无压缩的常规回合字段全空，同样在此立即清理（原行为不变）
+                st = roundStates.get(conversationId);
+                if (st == null) {
+                    return;
+                }
             }
             default -> {
                 st = roundStates.get(conversationId);
@@ -177,6 +279,8 @@ public class ConversationStreamSupport {
         }
         Map<?, ?> p = data instanceof Map<?, ?> m ? m : Map.of();
         switch (event) {
+            case "compress_start" -> st.compressing = true;
+            case "compress_end" -> st.compressing = false;
             case "reply_pending" -> st.pendingAgent = String.valueOf(p.get("agentId"));
             case "reply_start" -> {
                 // 占位气泡出现，思考窗口结束，重放改由气泡内打字点接管
@@ -205,23 +309,31 @@ public class ConversationStreamSupport {
             case "discussion_end" -> st.discussing = false;
             default -> { /* user_message / conversation_created / image_* 无需跟踪 */ }
         }
-        if (st.coordinator == null && !st.discussing && st.segments.isEmpty() && st.pendingAgent == null) {
+        if (st.coordinator == null && !st.discussing && !st.compressing
+                && st.segments.isEmpty() && st.pendingAgent == null) {
             roundStates.remove(conversationId);
         }
     }
 
     /**
-     * 回合收尾（幂等）：正常回合的 done 已清快照，这里不再重复发；
-     * 异常路径（completeWithError）没发过 done，快照还在——补发一个让前端收尾，
+     * 回合收尾（幂等）：正常回合的 done 已让快照按 cleanup 条件清理（无可见活动时），
+     * 这里不再重复发；异常路径（completeWithError）没发过 done，快照还在——补发一个让前端收尾，
      * 观察者的「协作中」横幅和半截流式输出才不会永远挂着。
+     * 后台压缩仍在跑时快照保留（compress_end 会收尾清理），本回合流照常补发 done。
      */
     public void endRound(String conversationId, SseEmitter emitter) {
-        if (roundStates.remove(conversationId) != null) {
-            try {
-                send(emitter, "done", Map.of());
-            } catch (Exception ignored) {
-                // 连接已断/已 complete：快照已清，收尾目的已达成
-            }
+        ConvRoundState st = roundStates.get(conversationId);
+        if (st == null) {
+            return;
+        }
+        if (st.coordinator == null && !st.discussing && !st.compressing
+                && st.segments.isEmpty() && st.pendingAgent == null) {
+            roundStates.remove(conversationId);
+        }
+        try {
+            send(emitter, "done", Map.of());
+        } catch (Exception ignored) {
+            // 连接已断/已 complete：收尾目的已达成
         }
     }
 
@@ -238,6 +350,10 @@ public class ConversationStreamSupport {
         ConvRoundState st = roundStates.get(conversationId);
         if (st == null) return;
         try {
+            if (st.compressing) {
+                emitter.send(SseEmitter.event().name("compress_start").data(
+                        Map.of("conversationId", conversationId), MediaType.APPLICATION_JSON));
+            }
             if (st.coordinator != null) {
                 emitter.send(SseEmitter.event().name("coordination_start").data(
                         Map.of("agentId", st.coordinator, "conversationId", conversationId),
@@ -526,6 +642,33 @@ public class ConversationStreamSupport {
         return out;
     }
 
+    /** 单聊输入的指示条口径：不按预算截断，其余与 singleChatInput 相同（含接管分界） */
+    public List<Msg> singleChatInputUnscoped(String conversationId) {
+        Message note = messages.findFirstByConversationIdAndTypeOrderByCreatedAtDesc(conversationId, "system")
+                .orElse(null);
+        if (note == null) {
+            return historyMsgsUnscoped(conversationId, null);
+        }
+        List<Message> effective = effectiveMessages(conversationId);
+        if (effective.isEmpty() || effective.get(0).getCreatedAt() >= note.getCreatedAt()) {
+            return historyMsgsUnscoped(conversationId, null);
+        }
+        List<Msg> out = new ArrayList<>();
+        boolean marked = false;
+        for (Message m : effective) {
+            if (!marked && m.getCreatedAt() >= note.getCreatedAt()) {
+                out.add(takeoverMarker(note.getContent()));
+                marked = true;
+            }
+            out.add(toHistoryMsg(m, false, null));
+        }
+        Msg record = actionRecordMsg(effective);
+        if (record != null) {
+            out.add(record);
+        }
+        return out;
+    }
+
     /** 接管分界合成消息：以用户角色插进历史流，模型在该位置读到"之前都是与前任的对话" */
     private static Msg takeoverMarker(String noteContent) {
         return new UserMessage(List.of(TextBlock.builder().text(
@@ -555,6 +698,30 @@ public class ConversationStreamSupport {
             out.add(record);
         }
         return out;
+    }
+
+    /** 指示条口径的历史消息：不按预算截断（水位线后全部有效消息）——压缩要塞进预算的正是
+     *  这个集合，字符量只随消息增减与压缩推进变化，与预算数值脱钩（调整预算时数字不应跳动） */
+    public List<Msg> historyMsgsUnscoped(String conversationId, Map<String, String> agentNames) {
+        boolean named = agentNames != null;
+        List<Message> effective = effectiveMessages(conversationId);
+        List<Msg> out = new ArrayList<>(effective.stream()
+                .<Msg>map(m -> toHistoryMsg(m, named, agentNames))
+                .toList());
+        Msg record = actionRecordMsg(effective);
+        if (record != null) {
+            out.add(record);
+        }
+        return out;
+    }
+
+    /** 水位线后全部有效消息（预算截断前的全集）：即压缩的溢出判断对象 */
+    private List<Message> effectiveMessages(String conversationId) {
+        String watermark = conversations.findById(conversationId)
+                .map(Conversation::getDigestWatermark)
+                .filter(w -> w != null && !w.isBlank())
+                .orElse(null);
+        return ContextCompressionService.afterWatermark(textMessages(conversationId), watermark);
     }
 
     /** 会话内可进模型历史的消息：仅文本类型，且正文或用户附件非空 */

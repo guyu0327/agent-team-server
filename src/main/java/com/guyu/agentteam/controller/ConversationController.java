@@ -166,6 +166,12 @@ public class ConversationController {
         return conversationService.page(id, before, limit, taskId);
     }
 
+    /** 进入/刷新会话时重算上下文指示：与回合开始同一口径（系统提示 + 历史注入量），刷新后不必等下一轮回复 */
+    @GetMapping("/{id}/context-size")
+    public Map<String, Object> contextSize(@PathVariable String id) {
+        return chatStreamService.contextSizeOf(conversationService.getEntity(id));
+    }
+
     /**
      * 常驻事件订阅（EventSource）：会话有定时任务触发时，扇出该回合全部 SSE 事件，
      * 正在查看此会话的前端无需刷新即可实时看到输出。
