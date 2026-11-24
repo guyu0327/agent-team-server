@@ -491,7 +491,7 @@ public class OrchestrationService {
         if (team.isEmpty()) {
             sb.append("6. 当前团队没有其他成员，你自己完成任务后调用 finish 总结。\n");
         } else {
-            sb.append("6. 所有工作完成后必须调用 finish，summary 写给用户的最终总结答复，总结会发回用户发起请求的会话。\n");
+            sb.append("6. 所有工作完成后必须调用 finish，summary 写给用户的最终总结答复，总结会先完整公示在项目群（如有），再发回用户发起请求的会话。\n");
         }
         sb.append("7. 如果任务要求把成果写到文件，委派时要把期望的输出路径（相对工作区根目录）写进任务描述，并提醒成员调用 write_file 完成写入。\n");
         // 微信发起的协作轮不注入定时任务机制（工具同样不挂）：任务结果微信侧不可见
@@ -638,7 +638,7 @@ public class OrchestrationService {
             String joined = picked.stream().map(Agent::getName).collect(Collectors.joining("、"));
             return "项目群「" + dto.name() + "」已创建，成员：" + joined
                     + "。后续你的安排和委派成员的输出都会展示在该群里，请继续用 delegate 推进任务；"
-                    + "完成后调用 finish，总结会自动发回与用户的单聊。";
+                    + "完成后调用 finish，总结会先完整公示在本群，再自动发回与用户的单聊。";
         }
 
         @Tool(name = "add_member", concurrencySafe = false, description =
@@ -977,13 +977,32 @@ public class OrchestrationService {
             return t;
         }
 
-        @Tool(name = "finish", description = "任务完成后调用，把给用户的最终总结答复提交出来，结束本次协作。总结会发回用户发起请求的会话")
+        @Tool(name = "finish", description = "任务完成后调用，把给用户的最终总结答复提交出来，结束本次协作。总结会先完整公示在协作群（如有），再发回用户发起请求的会话")
         public String finish(
                 @ToolParam(name = "summary", required = true, description = "给用户的最终总结答复") String summary) {
             if (finished.getAndSet(true)) {
                 return "任务已结束";
             }
             closeSegment();
+            // 先在项目群完整公示总结，再发回发起会话：群里的主持/引导语之后紧接着结论，
+            // 不再出现「如下——」悬空、结论只在单聊可见的断裂
+            String groupId = createdGroupId.get();
+            if (groupId != null && !groupId.equals(originConv.getId())) {
+                Conversation group = target.get();
+                Message g = support.saveMessage(group, orchestrator, "", "text", handle.taskTag);
+                support.send(emitter, "reply_start", Map.of(
+                        "messageId", g.getId(),
+                        "agentId", orchestrator.getId(),
+                        "conversationId", group.getId()));
+                g.setContent(summary);
+                support.persist(g);
+                support.touchConversation(group, orchestrator, summary);
+                support.send(emitter, "reply_end", Map.of(
+                        "messageId", g.getId(),
+                        "agentId", orchestrator.getId(),
+                        "content", summary,
+                        "conversationId", group.getId()));
+            }
             Message m = support.saveMessage(originConv, orchestrator, "", "text", handle.taskTag);
             support.send(emitter, "reply_start", Map.of(
                     "messageId", m.getId(),

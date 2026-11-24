@@ -77,6 +77,10 @@ public class AgentAutoFillService {
             Msg out = generator.call(List.of(UserMessage.builder().textContent(userText).build()), AgentDraftOut.class)
                     .block(GENERATE_TIMEOUT);
             if (out == null || !out.hasStructuredData()) {
+                // 报错分层：用户只见简短提示，模型返回原文全量落运行日志，便于定位供应商不配合的情形
+                appLogs.record(AppLog.TYPE_ERROR, "", "",
+                        "智能体自动生成未拿到结构化结果，模型原文："
+                                + (out == null ? "（空）" : out.getTextContent()));
                 throw ApiException.badRequest("模型未返回有效结果，请重试或换一个模型");
             }
             AgentDraftOut draft = out.getStructuredData(AgentDraftOut.class);

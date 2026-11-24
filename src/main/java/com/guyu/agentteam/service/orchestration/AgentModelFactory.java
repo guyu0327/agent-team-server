@@ -55,6 +55,12 @@ public class AgentModelFactory {
                 .baseUrl(preset.getBaseUrl())
                 .modelName(preset.getName())
                 .stream(true)
+                // 结构化输出强制走框架的合成工具路径：OpenAI 扩展不配置时默认 nativeStructuredOutput=true，
+                // 无工具结构化调用（自动生成、群聊裁决等）会发 response_format=json_schema(strict)，
+                // 部分兼容供应商不理会该参数、照常回普通文本，框架解析失败按原样返回且不抛异常，
+                // 「原生失败→合成工具兜底」永不触发，接口只能报「模型未返回有效结果」。
+                // 合成工具路径与会话主链路的工具调用同一机制，对所有供应商都稳定
+                .nativeStructuredOutput(false)
                 .formatter(multiAgent ? new OpenAIMultiAgentFormatter() : new OpenAIChatFormatter())
                 .generateOptions(options.build())
                 .httpTransport(MODEL_TRANSPORT)
