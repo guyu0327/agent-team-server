@@ -7,7 +7,6 @@ import com.guyu.agentteam.dto.AnySearchStatusDto;
 import com.guyu.agentteam.dto.AsrStreamStatusDto;
 import com.guyu.agentteam.dto.BrowserSettingsDto;
 import com.guyu.agentteam.dto.BrowserSettingsRequest;
-import com.guyu.agentteam.dto.ComputerSettingsRequest;
 import com.guyu.agentteam.dto.ContextCompressionDto;
 import com.guyu.agentteam.dto.ContextCompressionRequest;
 import com.guyu.agentteam.dto.CoordinationLimitsDto;
@@ -19,7 +18,6 @@ import com.guyu.agentteam.service.AnySearchService;
 import com.guyu.agentteam.service.AsrStreamService;
 import com.guyu.agentteam.service.BrowserService;
 import com.guyu.agentteam.service.BrowserSettingsService;
-import com.guyu.agentteam.service.ComputerSettingsService;
 import com.guyu.agentteam.service.ContextCompressionService;
 import com.guyu.agentteam.service.CoordinationLimitsService;
 import com.guyu.agentteam.service.tool.WorkspaceFileTools;
@@ -54,7 +52,6 @@ public class SettingsController {
     private final CoordinationLimitsService coordinationLimits;
     private final ContextCompressionService compression;
     private final BrowserSettingsService browserSettings;
-    private final ComputerSettingsService computerSettings;
     private final BrowserService browserService;
     private final DataSource dataSource;
     private final Environment env;
@@ -64,7 +61,6 @@ public class SettingsController {
                               CoordinationLimitsService coordinationLimits,
                               ContextCompressionService compression,
                               BrowserSettingsService browserSettings, BrowserService browserService,
-                              ComputerSettingsService computerSettings,
                               DataSource dataSource, Environment env) {
         this.workspace = workspace;
         this.asrStream = asrStream;
@@ -72,7 +68,6 @@ public class SettingsController {
         this.coordinationLimits = coordinationLimits;
         this.compression = compression;
         this.browserSettings = browserSettings;
-        this.computerSettings = computerSettings;
         this.browserService = browserService;
         this.dataSource = dataSource;
         this.env = env;
@@ -155,17 +150,6 @@ public class SettingsController {
             browserService.clearStoredLoginState();
         }
         return dto;
-    }
-
-    /** 本机键鼠操控开关：默认关闭；开启后新回合才挂上 computer_* 工具（进行中的回合不受影响） */
-    @GetMapping("/computer")
-    public ComputerSettingsService.ComputerSettings computer() {
-        return computerSettings.load();
-    }
-
-    @PutMapping("/computer")
-    public ComputerSettingsService.ComputerSettings updateComputer(@RequestBody ComputerSettingsRequest req) {
-        return computerSettings.save(req.enabled());
     }
 
     /**

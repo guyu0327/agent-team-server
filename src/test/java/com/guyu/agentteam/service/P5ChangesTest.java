@@ -95,8 +95,8 @@ class P5ChangesTest {
 
     @Test
     void clampSymmetric() throws Exception {
-        assertEquals(5000, clamp(100));
-        assertEquals(5000, clamp(4999));
+        assertEquals(20000, clamp(100));
+        assertEquals(20000, clamp(19999));
         assertEquals(500000, clamp(999999));
         assertEquals(60000, clamp(60000));
     }

@@ -447,18 +447,14 @@ public class WechatChannelService {
             return;
         }
         long deadline = System.currentTimeMillis() + s.roundTimeoutMinutes() * 60_000L;
-        // 与定时任务相同的重入保护：上一轮未结束先等空闲，避免两轮流交错
-        while (stream.isRunning(conv.getId()) && System.currentTimeMillis() < deadline) {
-            sleepQuiet(500);
-        }
-        // 后台回合：无人盯审批，按通道配置自动放行或立即拒绝（默认都不放行），决定记运行日志；
-        // 微信轮浏览器操作始终不放行（autoBrowser=false），提示词里已引导改用 web_search/fetch_webpage
-        stream.stream(new ConversationStreamSupport.Broadcast(conv.getId()), conv, userMsg,
-                new ConversationStreamSupport.TaskTag(null, null, s.autoWrite(), s.autoShell(), false, false));
-        // 等回合真正开跑（executor 异步提交，isRunning 置位在任务线程里；超时兜底防卡死）
-        long startWait = System.currentTimeMillis();
-        while (!stream.isRunning(conv.getId()) && System.currentTimeMillis() - startWait < 10_000) {
-            sleepQuiet(100);
+        // 与定时任务相同的重入保护：上一轮未结束先等空闲，避免两轮流交错。
+        // 开轮为 putIfAbsent 原子占位：等待空闲后仍撞上新回合的极小竞态里，等空闲再试
+        while (!stream.stream(new ConversationStreamSupport.Broadcast(conv.getId()), conv, userMsg,
+                new ConversationStreamSupport.TaskTag(null, null, s.autoWrite(), s.autoShell(), false, false))
+                && System.currentTimeMillis() < deadline) {
+            while (stream.isRunning(conv.getId()) && System.currentTimeMillis() < deadline) {
+                sleepQuiet(500);
+            }
         }
         // 逐段推送：文本段在应用内落定（含 finish 总结）即发微信，与桌面端节奏一致。
         // 不再整轮拼一条长文本等轮次结束一次发——协作轮动辄分钟级，长文本迟发久了我方无感、
@@ -650,9 +646,9 @@ public class WechatChannelService {
             }
         }
         List<Agent> all = agents.findAll();
-        return all.stream().filter(a -> Boolean.TRUE.equals(a.getIsOrchestrator())).findFirst()
-                .orElseGet(() -> all.stream().findFirst()
-                        .orElseThrow(() -> ApiException.badRequest("请先创建至少一个智能体")));
+        // 未指定处理智能体时取第一个（编排者已改为会话角色，不再有全局身份可优先）
+        return all.stream().findFirst()
+                .orElseThrow(() -> ApiException.badRequest("请先创建至少一个智能体"));
     }
 
     // ---------- 杂项 ----------

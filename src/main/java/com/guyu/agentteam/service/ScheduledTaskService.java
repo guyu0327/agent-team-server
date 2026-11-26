@@ -547,6 +547,9 @@ public class ScheduledTaskService {
         long now = System.currentTimeMillis();
         Conversation c = conversationService.getObject()
                 .newConversation(userId, "group", ConversationService.CATEGORY_TASK, "任务：" + taskName);
+        // 发起智能体即该任务群的编排者（会话角色）：协作轮由他协调委派
+        c.setHostAgentId(agentId);
+        conversations.save(c);
         members.save(new ConversationMember(c.getId(), agentId, now));
         for (String id : ids) {
             members.save(new ConversationMember(c.getId(), id, now));
@@ -711,10 +714,15 @@ public class ScheduledTaskService {
         if (!saved.get()) {
             return;
         }
-        if (stream != null) {
-            stream.stream(new ConversationStreamSupport.Broadcast(conv.getId()), conv, m);
-        }
-        if (!ScheduledTask.KIND_ONCE.equals(t.getKind())) {
+        if (stream != null && !stream.stream(new ConversationStreamSupport.Broadcast(conv.getId()), conv, m)) {
+            // 极小竞态：忙闲检查后仍撞上新开轮（开轮为 putIfAbsent 原子占位）——顺延一分钟重触发
+            t.setNextRunAt(System.currentTimeMillis() + POSTPONE_MS);
+            if (saveIfPresent(t)) {
+                schedule(t);
+            }
+            appLogs.record(AppLog.TYPE_TASK, conv.getId(), t.getAgentId(),
+                    "定时任务「" + t.getName() + "」开轮时撞上新回合，已顺延 1 分钟");
+        } else if (!ScheduledTask.KIND_ONCE.equals(t.getKind())) {
             schedule(t);
         }
     }

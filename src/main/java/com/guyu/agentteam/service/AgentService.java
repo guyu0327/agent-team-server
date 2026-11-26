@@ -89,6 +89,11 @@ public class AgentService {
                 deleteConversation(conv);
             } else {
                 members.delete(m);
+                // 编排者是会话角色且必须在成员中：被删成员若正任编排者，一并清空
+                if (id.equals(conv.getHostAgentId())) {
+                    conv.setHostAgentId(null);
+                    conversations.save(conv);
+                }
                 if (members.findByConversationIdOrderByCreatedAtAsc(conv.getId()).isEmpty()) {
                     deleteConversation(conv);
                 }
@@ -130,9 +135,10 @@ public class AgentService {
         a.setDescription(req.description() == null ? "" : req.description());
         a.setPresetId(req.presetId());
         a.setImagePresetId(req.imagePresetId() == null || req.imagePresetId().isBlank() ? null : req.imagePresetId());
-        a.setIsOrchestrator(Boolean.TRUE.equals(req.isOrchestrator()));
         a.setSystemPrompt(req.systemPrompt() == null ? "" : req.systemPrompt());
         a.setTemperature(req.temperature() == null ? 0.7 : req.temperature());
+        a.setReplyMinChars(req.replyMinChars() == null ? 0 : Math.max(0, req.replyMinChars()));
+        a.setReplyMaxChars(req.replyMaxChars() == null ? 120 : req.replyMaxChars());
         a.setSkillIds(req.skillIds() == null ? ""
                 : req.skillIds().stream().map(String::trim).filter(s -> !s.isEmpty()).distinct()
                         .collect(Collectors.joining(",")));

@@ -25,7 +25,6 @@ import com.guyu.agentteam.service.FileGrantService;
 import com.guyu.agentteam.service.MessageService;
 import com.guyu.agentteam.service.OpApprovalService;
 import com.guyu.agentteam.service.SkillSupport;
-import com.guyu.agentteam.service.ComputerSettingsService;
 import com.guyu.agentteam.service.tool.BrowserTools;
 import com.guyu.agentteam.service.tool.ComputerTools;
 import com.guyu.agentteam.service.tool.ImageGenerationTools;
@@ -55,6 +54,7 @@ import reactor.core.publisher.Mono;
 import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.Map;
@@ -97,7 +97,6 @@ public class OrchestrationService {
     private final com.guyu.agentteam.service.tool.SkillTools skillTools;
     private final BrowserTools browserTools;
     private final ComputerTools computerTools;
-    private final ComputerSettingsService computerSettings;
     private final com.guyu.agentteam.service.tool.AskUserTools askUserTools;
     private final com.guyu.agentteam.service.AskUserService askUsers;
     /** 进行中的编排运行：会话ID（含协作中创建的项目群ID）→ 运行句柄，用于用户终止 */
@@ -119,7 +118,7 @@ public class OrchestrationService {
                                 BrowserTools browserTools,
                                 com.guyu.agentteam.service.tool.AskUserTools askUserTools,
                                 com.guyu.agentteam.service.AskUserService askUsers,
-                                ComputerTools computerTools, ComputerSettingsService computerSettings) {
+                                ComputerTools computerTools) {
         this.agents = agents;
         this.members = members;
         this.support = support;
@@ -144,7 +143,6 @@ public class OrchestrationService {
         this.askUserTools = askUserTools;
         this.askUsers = askUsers;
         this.computerTools = computerTools;
-        this.computerSettings = computerSettings;
     }
 
     public void run(SseEmitter emitter, Conversation conv, Agent orchestrator, ModelPreset preset,
@@ -160,7 +158,10 @@ public class OrchestrationService {
         AtomicReference<Conversation> target = new AtomicReference<>(conv);
         AtomicReference<String> createdGroupId = new AtomicReference<>();
 
-        sendCoordination(emitter, "coordination_start", orchestrator, conv.getId());
+        // 单聊横幅显示「执行任务」：编排者还没真正协调谁；建群（create_team）后才切「协调团队」。
+        // 任务协作群（collab 轮的 group 会话）从一开始就是团队协作
+        sendCoordination(emitter, "coordination_start", orchestrator, conv.getId(),
+                "single".equals(conv.getType()) ? "task" : "team");
         // 最多三轮（首次 + 两次纠正）：任务触发轮若没有真实执行证据（纯文本收场、只调用了被拒绝/只读的工具、
         // 或协作任务没委派成员自己包揽），追加纠正指令自动重试；重试预算耗尽仍在群里明确报错，不留无声结束。
         // 仅限真正的定时任务轮（taskId 非空）：微信等后台通道只是借 TaskTag 携带放行策略，闲聊无需执行证据
@@ -202,7 +203,7 @@ public class OrchestrationService {
         if (!handle.stopRequested.get()) {
             compression.markImagesConsumed(conv.getId());
         }
-        sendCoordination(emitter, "coordination_end", orchestrator, conv.getId());
+        sendCoordination(emitter, "coordination_end", orchestrator, conv.getId(), null);
         String groupId = createdGroupId.get();
         if (groupId != null) {
             sendCoordinationForGroup(emitter, "coordination_end", orchestrator, groupId);
@@ -259,8 +260,8 @@ public class OrchestrationService {
             browserTools.register(toolkit, () -> target.get().getId(), sink,
                     support.browserListener(emitter, () -> target.get().getId(), orchestrator, seg.browseLog));
         }
-        // 本机键鼠操控：默认关闭；后台轮（定时任务/微信）无人审批，一律不挂
-        if (!background && computerSettings.load().enabled()) {
+        // 本机键鼠操控：后台轮（定时任务/微信）无人审批，一律不挂
+        if (!background) {
             computerTools.register(toolkit, () -> target.get().getId(), sink);
         }
         skillTools.register(toolkit, orchestrator, sink);
@@ -316,6 +317,8 @@ public class OrchestrationService {
                                     "messageId", seg.msg.get().getId(),
                                     "delta", delta,
                                     "conversationId", target.get().getId()));
+                            // 字数限制开启的智能体：正文按独立行 --- 分隔符切成多条消息（长内容分条发出）
+                            support.splitSegmentOnMarker(emitter, target.get(), orchestrator, seg, handle.taskTag);
                         } else if (e.getType() == AgentEventType.THINKING_BLOCK_DELTA) {
                             seg.thinking.append(((ThinkingBlockDeltaEvent) e).getDelta());
                             // 推理模型的思考过程流式透出：气泡未打开时前端显示在思考条，打开后显示在气泡内
@@ -438,10 +441,19 @@ public class OrchestrationService {
                 "conversationId", conv.getId()));
     }
 
-    /** 协调状态事件：客户端断开后静默忽略 */
-    private void sendCoordination(SseEmitter emitter, String event, Agent agent, String conversationId) {
+    /**
+     * 协调状态事件：客户端断开后静默忽略。coordination_start 携带 mode：task=单聊执行任务
+     * （编排者自己干活），team=团队协作（已建群/在群里协调）——前端据此显示不同横幅文案
+     */
+    private void sendCoordination(SseEmitter emitter, String event, Agent agent, String conversationId, String mode) {
         try {
-            support.send(emitter, event, Map.of("agentId", agent.getId(), "conversationId", conversationId));
+            Map<String, Object> data = new HashMap<>();
+            data.put("agentId", agent.getId());
+            data.put("conversationId", conversationId);
+            if (mode != null) {
+                data.put("mode", mode);
+            }
+            support.send(emitter, event, data);
         } catch (UncheckedIOException ignored) {
             // 客户端已断开
         }
@@ -450,8 +462,13 @@ public class OrchestrationService {
     /** 协调状态事件发往协作中新建的项目群：另按群登记快照并扇出给群观察者，群里的协调条切换/重进后可恢复 */
     private void sendCoordinationForGroup(SseEmitter emitter, String event, Agent agent, String conversationId) {
         try {
-            support.sendCrossConversation(emitter, event, conversationId,
-                    Map.of("agentId", agent.getId(), "conversationId", conversationId));
+            Map<String, Object> data = new HashMap<>();
+            data.put("agentId", agent.getId());
+            data.put("conversationId", conversationId);
+            if ("coordination_start".equals(event)) {
+                data.put("mode", "team");
+            }
+            support.sendCrossConversation(emitter, event, conversationId, data);
         } catch (UncheckedIOException ignored) {
             // 客户端已断开
         }
@@ -516,12 +533,17 @@ public class OrchestrationService {
         if (!fromWechat) {
             sb.append("\n\n").append(browserTools.promptNote(background, autoBrowser));
         }
-        if (!background && computerSettings.load().enabled()) {
+        if (!background) {
             sb.append("\n\n").append(computerTools.promptNote());
         }
         sb.append("\n");
         // 行动纪律同样约束编排者本人：亲自执行的简单请求不许用「我去安排」空承诺收尾
         sb.append('\n').append(support.ACTION_DISCIPLINE).append('\n');
+        // 回复字数软引导（max≤0 不注入）：教模型简明发言、长内容按 --- 分隔成多条消息
+        String lengthHint = ConversationStreamSupport.replyLengthHint(orchestrator, true);
+        if (!Str.isBlank(lengthHint)) {
+            sb.append('\n').append(lengthHint).append('\n');
+        }
         String digestBlock = compression.promptBlock(conversationId);
         if (digestBlock != null) {
             sb.append('\n').append(digestBlock).append('\n');
@@ -624,7 +646,7 @@ public class OrchestrationService {
                 memberIds.add(orchestrator.getId());
             }
             ConversationDto dto = conversationService.createGroup(
-                    originConv.getUserId(), new GroupChatRequest(name.trim(), memberIds, null));
+                    originConv.getUserId(), new GroupChatRequest(name.trim(), memberIds, null, orchestrator.getId()));
             createdGroupId.set(dto.id());
             executed.set(true);
             // 项目群沿用发起会话的文件授权：群里可见、直接 @ 成员时也能访问同一批目录
@@ -635,6 +657,8 @@ public class OrchestrationService {
             target.set(conversationService.getEntity(dto.id()));
             support.send(emitter, "conversation_created", dto);
             sendCoordinationForGroup(emitter, "coordination_start", orchestrator, dto.id());
+            // 发起单聊的横幅从「执行任务」切到「协调团队」：delegate 在单聊被禁，建群是协作唯一入口
+            sendCoordination(emitter, "coordination_start", orchestrator, originConv.getId(), "team");
             String joined = picked.stream().map(Agent::getName).collect(Collectors.joining("、"));
             return "项目群「" + dto.name() + "」已创建，成员：" + joined
                     + "。后续你的安排和委派成员的输出都会展示在该群里，请继续用 delegate 推进任务；"
@@ -771,8 +795,8 @@ public class OrchestrationService {
                 browserTools.register(memberToolkit, conv::getId, memberSink,
                         support.browserListener(emitter, conv::getId, targetAgent, memberBrowse));
             }
-            // 本机键鼠操控：默认关闭；后台轮无人审批，不挂
-            if (!memberBackground && computerSettings.load().enabled()) {
+            // 本机键鼠操控：后台轮无人审批，不挂
+            if (!memberBackground) {
                 computerTools.register(memberToolkit, conv::getId, memberSink);
             }
             ConversationStreamSupport.WebActivityLog memberTools = new ConversationStreamSupport.WebActivityLog();
@@ -792,13 +816,18 @@ public class OrchestrationService {
             if (!memberFromWechat) {
                 memberNote += "\n\n" + browserTools.promptNote(memberBackground, tag != null && tag.autoBrowser());
             }
-            if (!memberBackground && computerSettings.load().enabled()) {
+            if (!memberBackground) {
                 memberNote += "\n\n" + computerTools.promptNote();
             }
             String memberSysPrompt = Str.isBlank(targetAgent.getSystemPrompt())
                     ? memberNote
                     : targetAgent.getSystemPrompt().trim() + "\n\n" + memberNote;
             memberSysPrompt += "\n\n" + support.ACTION_DISCIPLINE;
+            // 委派成员是单占位消息回合、不支持分段：只注入字数引导，不带分隔符教学（切不动会原样漏进正文）
+            String memberLengthHint = ConversationStreamSupport.replyLengthHint(targetAgent, false);
+            if (!Str.isBlank(memberLengthHint)) {
+                memberSysPrompt += "\n\n" + memberLengthHint;
+            }
             String memberMemory = memoryService.promptBlock(targetAgent.getId());
             if (!Str.isBlank(memberMemory)) {
                 memberSysPrompt += "\n\n" + memberMemory;

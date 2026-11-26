@@ -45,6 +45,7 @@ import reactor.core.publisher.Mono;
 import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -52,14 +53,18 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 /**
  * 回复规则：@了谁只有被@的人回复，没@则群里全员依次回复（后一个人能看到前一个人的发言）。
- * 编排者例外：被点名或群里存在编排者时，由编排者单独运行 AgentScope 协作循环，按需调用其他成员。
- * 自由模式（群聊 chat_mode=free 且无编排者）：首轮回复结束后由「主持人」模型逐轮选出下一位发言人
- * 接龙讨论，直到主持人判定结束、总超时或用户终止。
+ * 编排者是会话角色（conversations.host_agent_id）：单聊一律走编排路径（人人可建群协作）；
+ * 群聊设置了编排者时由他单独运行 AgentScope 协作循环，按需调用其他成员，未设置则全员依次回复。
+ * 自由模式（群聊 chat_mode=free）：全员接龙（编排者角色休眠），由虚拟「编排器」逐轮选出下一位
+ * 发言人接龙讨论——上下文关联度为主、发言次数加权，首选+备选按 7:3 加权随机，直到编排器判定
+ * 结束、总超时或用户终止。
  * 所有回复都走 AgentScope ReAct 循环，智能体可调用工作区文件工具（write_file/read_file/list_dir）。
  */
 @Service
@@ -116,7 +121,6 @@ public class ChatStreamService {
     private final BrowserTools browserTools;
     private final AskUserTools askUserTools;
     private final ComputerTools computerTools;
-    private final ComputerSettingsService computerSettings;
     private final AskUserService askUsers;
 
     public ChatStreamService(ConversationMemberRepository members,
@@ -131,7 +135,7 @@ public class ChatStreamService {
                              SkillSupport skillSupport, WebTools webTools,
                              SkillTools skillTools, BrowserTools browserTools,
                              AskUserTools askUserTools, AskUserService askUsers,
-                             ComputerTools computerTools, ComputerSettingsService computerSettings) {
+                             ComputerTools computerTools) {
         this.members = members;
         this.agents = agents;
         this.modelFactory = modelFactory;
@@ -154,78 +158,70 @@ public class ChatStreamService {
         this.askUserTools = askUserTools;
         this.askUsers = askUsers;
         this.computerTools = computerTools;
-        this.computerSettings = computerSettings;
     }
 
-    public void stream(SseEmitter emitter, Conversation conv, Message userMsg) {
-        stream(emitter, conv, userMsg, null);
+    /** 开启回复回合。返回 false = 已有进行中的回合（本次未开启），调用方可对其发起插话或稍后重试 */
+    public boolean stream(SseEmitter emitter, Conversation conv, Message userMsg) {
+        return stream(emitter, conv, userMsg, null);
     }
 
     /**
      * 带外部回合标注的触发：微信通道等后台触发方自带的审批放行策略（taskId 为空即消息不落任务徽标，
      * 只继承 background 语义——写改/命令按外部策略自动放行或立即拒绝）。
+     * 开轮用 putIfAbsent 原子占位：并发发送只有一个真正开轮，输家拿到回合仍在跑的信号走插话。
+     * 插话（回复进行中收到的新消息）：当前成员说完手头这条回复后，剩余原计划作废，以插话消息
+     * 为新触发开子回合——单聊同一智能体接着回，被动群聊按插话内容重新确定应答者（@谁谁回），
+     * 自由讨论由编排器看到插话重新选人。子回合内可继续被插话，循环消化。
      */
-    public void stream(SseEmitter emitter, Conversation conv, Message userMsg,
+    public boolean stream(SseEmitter emitter, Conversation conv, Message userMsg,
                        ConversationStreamSupport.TaskTag externalTag) {
+        boolean freeChain = isFreeDiscussion(conv);
+        // 每个回合都登记取消句柄：普通回复（单聊/群聊依次回复）与自由讨论一样支持随时终止
+        RunHandle handle = new RunHandle();
+        handle.discussion = freeChain;
+        if (externalTag != null) {
+            handle.taskTag = externalTag;
+        } else if (userMsg.getTaskId() != null) {
+            // 定时任务触发的回合（合成用户消息带 taskId）：本轮全部落库消息继承任务标注，
+            // 并携带任务的审批放行策略（后台无人盯审批，写改/命令/网页按任务配置自动放行或快速拒绝）
+            boolean autoWrite = true;
+            boolean autoShell = false;
+            boolean autoBrowser = false;
+            boolean collab = false;
+            ScheduledTask task = tasks.findById(userMsg.getTaskId()).orElse(null);
+            if (task != null) {
+                autoWrite = task.isAutoWrite();
+                autoShell = task.isAutoShell();
+                autoBrowser = task.isAutoBrowser();
+                collab = ScheduledTask.MODE_COLLAB.equals(task.getMode());
+            }
+            handle.taskTag = new ConversationStreamSupport.TaskTag(
+                    userMsg.getTaskId(), userMsg.getTaskName(), autoWrite, autoShell, autoBrowser, collab);
+        }
+        if (runs.putIfAbsent(conv.getId(), handle) != null) {
+            return false;
+        }
         support.send(emitter, "user_message", MessageDto.from(userMsg));
         executor.submit(() -> {
             try {
-                boolean freeChain = isFreeDiscussion(conv);
-                // 每个回合都登记取消句柄：普通回复（单聊/群聊依次回复）与自由讨论一样支持随时终止
-                RunHandle handle = new RunHandle();
-                handle.discussion = freeChain;
-                if (externalTag != null) {
-                    handle.taskTag = externalTag;
-                } else if (userMsg.getTaskId() != null) {
-                    // 定时任务触发的回合（合成用户消息带 taskId）：本轮全部落库消息继承任务标注，
-                    // 并携带任务的审批放行策略（后台无人盯审批，写改/命令/网页按任务配置自动放行或快速拒绝）
-                    boolean autoWrite = true;
-                    boolean autoShell = false;
-                    boolean autoBrowser = false;
-                    boolean collab = false;
-                    ScheduledTask task = tasks.findById(userMsg.getTaskId()).orElse(null);
-                    if (task != null) {
-                        autoWrite = task.isAutoWrite();
-                        autoShell = task.isAutoShell();
-                        autoBrowser = task.isAutoBrowser();
-                        collab = ScheduledTask.MODE_COLLAB.equals(task.getMode());
-                    }
-                    handle.taskTag = new ConversationStreamSupport.TaskTag(
-                            userMsg.getTaskId(), userMsg.getTaskName(), autoWrite, autoShell, autoBrowser, collab);
-                }
-                runs.put(conv.getId(), handle);
                 if (freeChain) {
                     support.send(emitter, "discussion_start", Map.of("conversationId", conv.getId()));
                 }
+                Message trigger = userMsg;
                 try {
-                    boolean group = "group".equals(conv.getType());
-                    List<Agent> responders = responders(conv, userMsg.getContent(), freeChain);
-                    // 触发判定与指示条同一总量口径：系统提示词 + 拼装输入（unscoped，含署名、
-                    // QQ 发送者前缀、【系统行动记录】等拼装文本）的真实字符量——raw 正文粗估
-                    // 会少算拼装部分，出现指示条 90% 了后端还没到线的错位
-                    Agent owner = compressionOwner(conv, responders);
-                    long totalChars = 0;
-                    if (owner != null) {
-                        List<Msg> unscopedInput = group
-                                ? groupInput(conv, owner, true)
-                                : support.singleChatInputUnscoped(conv.getId());
-                        totalChars = sysPromptOf(owner, conv.getId(), handle != null ? handle.taskTag : null).length()
-                                + ConversationStreamSupport.contextChars(null, unscopedInput);
-                    }
-                    support.compactExplicit(emitter, conv, owner, totalChars);
-                    for (Agent agent : responders) {
-                        if (handle.stopRequested.get()) break;
-                        replyOne(emitter, conv, agent, handle,
-                                freeChain ? discussionInput(conv, agent)
-                                        : group ? groupInput(conv, agent)
-                                        : support.singleChatInput(conv.getId()),
-                                group);
-                    }
-                    if (freeChain) {
-                        runDiscussionChain(emitter, conv, handle);
+                    // 退出判定全在句柄锁内：终止与插话消费互斥，requestInterject 置位成功必然被消费，
+                    // 或看到回合已注销改开新轮——不存在「受理了插话却没人消费」的窗口
+                    while (true) {
+                        runRoundBody(emitter, conv, handle, trigger, freeChain);
+                        synchronized (handle) {
+                            trigger = handle.stopRequested.get() ? null : handle.interjected.getAndSet(null);
+                            if (trigger == null) {
+                                runs.remove(conv.getId());
+                                break;
+                            }
+                        }
                     }
                 } finally {
-                    runs.remove(conv.getId());
                     if (freeChain) {
                         support.send(emitter, "discussion_end", Map.of("conversationId", conv.getId()));
                     }
@@ -240,14 +236,76 @@ public class ChatStreamService {
                 emitter.completeWithError(e);
             } finally {
                 // 异常路径没有 done 事件：补一次幂等收尾，观察者重放的「协作中」横幅才能落地
+                runs.remove(conv.getId());
                 support.endRound(conv.getId(), emitter);
             }
         });
+        return true;
+    }
+
+    /** 一轮回复主体：压缩检查 + 应答者依次回复，自由讨论先首棒再接龙。插话子回合复用同一主体 */
+    private void runRoundBody(SseEmitter emitter, Conversation conv, RunHandle handle, Message trigger,
+                              boolean freeChain) {
+        boolean group = "group".equals(conv.getType());
+        List<Agent> responders = responders(conv, trigger.getContent(), freeChain);
+        // 触发判定与指示条同一总量口径：系统提示词 + 拼装输入（unscoped，含署名、
+        // QQ 发送者前缀、【系统行动记录】等拼装文本）的真实字符量——raw 正文粗估
+        // 会少算拼装部分，出现指示条 90% 了后端还没到线的错位
+        Agent owner = compressionOwner(conv, responders);
+        long totalChars = 0;
+        if (owner != null) {
+            List<Msg> unscopedInput = group
+                    ? groupInput(conv, owner, true)
+                    : support.singleChatInputUnscoped(conv.getId());
+            totalChars = sysPromptOf(owner, conv.getId(), handle.taskTag).length()
+                    + ConversationStreamSupport.contextChars(null, unscopedInput);
+        }
+        support.compactExplicit(emitter, conv, owner, totalChars);
+        for (Agent agent : responders) {
+            if (handle.stopRequested.get()) break;
+            replyOne(emitter, conv, agent, handle,
+                    freeChain ? discussionInput(conv, agent)
+                            : group ? groupInput(conv, agent)
+                            : support.singleChatInput(conv.getId()),
+                    group);
+        }
+        if (freeChain) {
+            runDiscussionChain(emitter, conv, handle);
+        }
     }
 
     /** 该会话是否有进行中的回复回合（定时任务触发时用于重入保护） */
     public boolean isRunning(String conversationId) {
         return runs.containsKey(conversationId);
+    }
+
+    /**
+     * 插话置位：回合仍在注册表才接受。与回合尾的消费同持句柄锁互斥——置位成功则插话必然
+     * 被子回合消费；置位失败（false）即回合恰好结束，发起方应改开新轮（消息已落库，直接 stream）。
+     */
+    public boolean requestInterject(String conversationId, Message msg) {
+        RunHandle handle = runs.get(conversationId);
+        if (handle == null) {
+            return false;
+        }
+        synchronized (handle) {
+            if (runs.get(conversationId) != handle) {
+                return false;
+            }
+            handle.interjected.set(msg);
+            return true;
+        }
+    }
+
+    /**
+     * 插话回执：发送方只收 user_message + done 的极小流立即结束，不再挂着等回复——
+     * 本轮回复事件仍走原回合的响应流/观察者通道。done 带 interjected 标记，
+     * 前端据此跳过回合收尾（不能清掉仍在流式中的主轮思考/接龙状态）。
+     */
+    public void acknowledgeInterject(SseEmitter emitter, Message userMsg) {
+        support.send(emitter, "user_message", MessageDto.from(userMsg));
+        support.send(emitter, "done", Map.of("interjected", true));
+        emitter.complete();
     }
 
     /**
@@ -308,9 +366,13 @@ public class ChatStreamService {
         }
 
         // 非机主的外部通道回合（noTools）不进编排：编排提示词全是委派/建群/工具指令，
-        // 空工具箱下只会幻觉调用，退化为普通纯聊天路径
+        // 空工具箱下只会幻觉调用，退化为普通纯聊天路径。
+        // 编排者是会话角色：单聊一律走编排（人人可 create_team 拉群协作）；群聊仅编排者协调，
+        // 自由讨论接龙中角色休眠（即使主持人选到他也按普通成员回复）
         boolean noTools = handle != null && handle.taskTag != null && handle.taskTag.noTools();
-        if (isOrchestrator(agent) && !noTools) {
+        boolean orchestrate = "single".equals(conv.getType())
+                || (isHost(conv, agent) && !isFreeDiscussion(conv));
+        if (orchestrate && !noTools) {
             orchestration.run(emitter, conv, agent, preset, handle != null ? handle.taskTag : null);
             return;
         }
@@ -367,6 +429,9 @@ public class ChatStreamService {
                                         "messageId", seg.msg.get().getId(),
                                         "delta", delta,
                                         "conversationId", conv.getId()));
+                                // 字数限制开启的智能体：正文按独立行 --- 分隔符切成多条消息（长内容分条发出）
+                                support.splitSegmentOnMarker(emitter, conv, agent, seg,
+                                        handle != null ? handle.taskTag : null);
                             } else if (ev.getType() == AgentEventType.THINKING_BLOCK_DELTA) {
                                 String think = ((ThinkingBlockDeltaEvent) ev).getDelta();
                                 seg.thinking.append(think);
@@ -481,7 +546,7 @@ public class ChatStreamService {
             if (!fromWechat) {
                 note += "\n\n" + browserTools.promptNote(background, tag != null && tag.autoBrowser());
             }
-            if (!background && computerSettings.load().enabled()) {
+            if (!background) {
                 note += "\n\n" + computerTools.promptNote();
             }
             sys = Str.isBlank(base) ? note : base + "\n\n" + note;
@@ -496,6 +561,11 @@ public class ChatStreamService {
                     sys += "\n" + ScheduledTaskTools.triggerHint(false);
                 }
             }
+        }
+        // 回复字数软引导（max≤0 不注入）：教模型简明发言、长内容按 --- 分隔成多条消息
+        String lengthHint = ConversationStreamSupport.replyLengthHint(agent, true);
+        if (!Str.isBlank(lengthHint)) {
+            sys += "\n\n" + lengthHint;
         }
         String digestBlock = compression.promptBlock(conversationId);
         if (digestBlock != null) {
@@ -550,8 +620,8 @@ public class ChatStreamService {
             browserTools.register(toolkit, conv::getId, sink,
                     support.browserListener(emitter, conv::getId, agent, seg.browseLog));
         }
-        // 本机键鼠操控：默认关闭；后台轮（定时任务/微信）无人审批，一律不挂
-        if (!background && computerSettings.load().enabled()) {
+        // 本机键鼠操控：后台轮（定时任务/微信）无人审批，一律不挂
+        if (!background) {
             computerTools.register(toolkit, conv::getId, sink);
         }
         skillTools.register(toolkit, agent, sink);
@@ -585,23 +655,37 @@ public class ChatStreamService {
         }
         List<Agent> mentioned = list.stream().filter(a -> mentions(content, a.getName())).toList();
         if (!mentioned.isEmpty()) {
-            // 被点名的若是编排者，由他单独协调；否则被点名的依次回复
-            return mentioned.stream().filter(this::isOrchestrator).findFirst()
-                    .map(List::of)
-                    .orElse(mentioned);
+            // 被点名的若是编排者，由他单独协调；否则被点名的依次回复（自由讨论忽略编排者角色，全员按普通成员接龙）
+            if (!freeChain) {
+                return mentioned.stream().filter(a -> isHost(conv, a)).findFirst()
+                        .map(List::of)
+                        .orElse(mentioned);
+            }
+            return mentioned;
         }
-        // 没人被点名：群里有编排者则由编排者协调；自由讨论模式交给主持人选第一棒；否则全员依次回复
-        return list.stream().filter(this::isOrchestrator).findFirst()
-                .map(List::of)
-                .orElseGet(() -> freeChain ? List.of() : list);
+        // 没人被点名：自由讨论交给编排器选第一棒；群聊设置了编排者则由他协调；否则全员依次回复
+        if (freeChain) {
+            return List.of();
+        }
+        return hostOf(conv).map(List::of).orElse(list);
     }
 
-    /** 自由讨论仅对没有编排者的群聊生效：有编排者时保持编排协调的现有行为 */
+    /** 自由讨论（群聊 chat_mode=free）：全员接龙，编排者角色休眠，切回被动自动恢复 */
     private boolean isFreeDiscussion(Conversation conv) {
-        if (!"group".equals(conv.getType()) || !"free".equals(conv.getChatMode())) {
-            return false;
+        return "group".equals(conv.getType()) && "free".equals(conv.getChatMode());
+    }
+
+    /** 群聊编排者（会话角色）：设置了 host 且该成员仍有效时返回他 */
+    private Optional<Agent> hostOf(Conversation conv) {
+        String hostId = conv.getHostAgentId();
+        if (hostId == null || hostId.isBlank()) {
+            return Optional.empty();
         }
-        return memberAgents(conv).stream().noneMatch(this::isOrchestrator);
+        return memberAgents(conv).stream().filter(a -> a.getId().equals(hostId)).findFirst();
+    }
+
+    private boolean isHost(Conversation conv, Agent a) {
+        return a.getId().equals(conv.getHostAgentId());
     }
 
     private List<Agent> memberAgents(Conversation conv) {
@@ -713,47 +797,105 @@ public class ChatStreamService {
         return msgs;
     }
 
-    /** 主持人决策：返回下一位发言人；返回 null 表示讨论结束，结束原因记 type=discussion 运行日志 */
-    private Agent selectNextSpeaker(Conversation conv, List<Agent> pool, Agent lastSpeaker, RunHandle handle) {
-        // 主持人复用上一位发言人（或第一个配置完整的成员）的模型预设
-        Agent modelOwner = lastSpeaker != null ? lastSpeaker
-                : pool.stream().filter(this::hasUsablePreset).findFirst().orElse(null);
-        if (modelOwner == null) {
-            appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), null, "自由讨论中止：没有配置完整的成员可充当主持人模型");
-            return null;
+    /** 编排器运行身份：虚拟角色（不落库、不进群成员名单、无人设），自由讨论每轮选人由它决策 */
+    private record Orchestrator(Agent owner, ModelPreset preset) {}
+
+    /**
+     * 编排器身份解析：默认用指挥的模型预设；指挥缺失或预设不可用时退回第一个配置完整的成员。
+     * owner 与 preset 成对取同一人，避免拿 A 的密钥/温度发 B 的模型。
+     */
+    private Optional<Orchestrator> orchestratorOf(Conversation conv, List<Agent> pool) {
+        Agent owner = hostOf(conv).filter(this::hasUsablePreset)
+                .orElseGet(() -> pool.stream().filter(this::hasUsablePreset).findFirst().orElse(null));
+        if (owner == null) {
+            return Optional.empty();
         }
-        Optional<ModelPreset> presetOpt = support.presetOf(modelOwner);
-        if (presetOpt.isEmpty()) {
-            appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), modelOwner.getId(), "自由讨论中止：主持人模型预设缺失");
+        return support.presetOf(owner).map(p -> new Orchestrator(owner, p));
+    }
+
+    /** 编排器决策：返回下一位发言人；返回 null 表示讨论结束，结束原因记 type=discussion 运行日志 */
+    private Agent selectNextSpeaker(Conversation conv, List<Agent> pool, Agent lastSpeaker, RunHandle handle) {
+        Optional<Orchestrator> orch = orchestratorOf(conv, pool);
+        if (orch.isEmpty()) {
+            appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), null,
+                    "自由讨论中止：指挥与成员均无可用模型预设，无法进行编排选人");
             return null;
         }
         String raw = null;
         for (int attempt = 1; attempt <= 2; attempt++) {
-            ModeratorPick pick = askModerator(conv, pool, modelOwner, presetOpt.get(), handle, attempt > 1);
+            ModeratorPick pick = askOrchestrator(conv, pool, orch.get(), handle, attempt > 1);
             if (pick == null) {
                 // 用户终止或调用异常：日志已处理，不再记「讨论结束」
                 return null;
             }
-            if (pick.next() != null) {
-                return pick.next();
-            }
             if (pick.ended()) {
-                appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), null, "主持人判定讨论结束");
+                appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), null, "编排器判定讨论结束");
                 return null;
             }
+            if (pick.next() != null) {
+                // 首选+备选 7:3 加权随机：给接龙注入变化，避免每次重置后走出完全相同的发言序列
+                if (pick.alternate() != null && ThreadLocalRandom.current().nextInt(10) >= 7) {
+                    return pick.alternate();
+                }
+                return pick.next();
+            }
             raw = pick.raw();
-            // 人选无法解析（模型没按结构化格式作答、或给的名字匹配不上）：重试一次，仍失败才收场
+            // 人选无法解析（模型没按结构化格式作答、或给的名字匹配不上）：重试一次，仍失败走无状态兜底
         }
-        if (lastSpeaker == null) {
-            // 首轮保底：讨论还没人开口就因解析失败收场，观感即「谁都不说话」；自动指定主持人模型的归属成员开场
-            appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), modelOwner.getId(),
-                    "主持人未给出有效发言人选，自动指定 " + modelOwner.getName() + " 开场");
-            return modelOwner;
+        Agent fallback = leastSpoken(conv, pool, lastSpeaker);
+        if (fallback == null) {
+            String hint = Str.isBlank(raw) ? "" : "（模型答复「" + ellipsis(raw.trim(), 60) + "」无法解析为成员）";
+            appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), null,
+                    "编排器未给出有效发言人选" + hint + "，讨论结束");
+            return null;
         }
-        String hint = Str.isBlank(raw) ? "" : "（模型答复「" + ellipsis(raw.trim(), 60) + "」无法解析为成员）";
-        appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), null,
-                "主持人未给出有效发言人选" + hint + "，讨论结束");
-        return null;
+        appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), fallback.getId(),
+                "编排器未给出有效发言人选，按发言最少原则自动指定 " + fallback.getName()
+                        + (lastSpeaker == null ? "开场" : "接棒"));
+        return fallback;
+    }
+
+    /**
+     * 无状态兜底选人：从带署名历史现场统计发言次数，指定最少的成员（上一位发言人除外）。
+     * 只依赖当轮历史，群成员中途进出自动反映在统计里；全员都没发过言时等价于指定第一棒开场。
+     */
+    private Agent leastSpoken(Conversation conv, List<Agent> pool, Agent lastSpeaker) {
+        String excludeId = lastSpeaker != null ? lastSpeaker.getId() : null;
+        Map<String, Long> counts = speakCounts(support.historyMsgs(conv.getId(), memberNames(conv)), pool);
+        Agent best = null;
+        for (Agent a : pool) {
+            if (a.getId().equals(excludeId)) {
+                continue;
+            }
+            if (best == null || counts.getOrDefault(a.getName(), 0L) < counts.getOrDefault(best.getName(), 0L)) {
+                best = a;
+            }
+        }
+        return best;
+    }
+
+    /** 从带署名历史现场统计各成员发言次数（成员名在 Msg.name 上）；无状态，随历史重置自动归零 */
+    private Map<String, Long> speakCounts(List<Msg> history, List<Agent> pool) {
+        Set<String> names = pool.stream().map(Agent::getName).collect(Collectors.toSet());
+        Map<String, Long> counts = new HashMap<>();
+        for (Msg m : history) {
+            String name = m.getName();
+            if (name != null && names.contains(name)) {
+                counts.merge(name, 1L, Long::sum);
+            }
+        }
+        return counts;
+    }
+
+    /** 发言统计行：拼进编排器输入末尾，模型不用自己数；×0 即从未发言 */
+    private String speakStatsLine(List<Msg> history, List<Agent> pool) {
+        Map<String, Long> counts = speakCounts(history, pool);
+        List<String> parts = new ArrayList<>();
+        for (Agent a : pool) {
+            long c = counts.getOrDefault(a.getName(), 0L);
+            parts.add(a.getName() + "×" + c + (c == 0 ? "（从未发言）" : ""));
+        }
+        return "发言统计：" + String.join("、", parts);
     }
 
     /**
@@ -820,19 +962,19 @@ public class ChatStreamService {
         }
     }
 
-    /** 主持人一次决策调用；返回 null 表示用户终止或调用异常（日志均已处理）；strict=重试时强调必须按字段作答 */
-    private ModeratorPick askModerator(Conversation conv, List<Agent> pool, Agent modelOwner, ModelPreset preset,
-                                       RunHandle handle, boolean strict) {
+    /** 编排器一次决策调用；返回 null 表示用户终止或调用异常（日志均已处理）；strict=重试时强调必须按字段作答 */
+    private ModeratorPick askOrchestrator(Conversation conv, List<Agent> pool, Orchestrator orch,
+                                          RunHandle handle, boolean strict) {
         try (ReActAgent judge = ReActAgent.builder()
-                .name("moderator")
-                .sysPrompt(moderatorPrompt(pool))
-                .model(modelFactory.create(modelOwner, preset, true))
+                .name("orchestrator")
+                .sysPrompt(orchestratorPrompt(pool))
+                .model(modelFactory.create(orch.owner(), orch.preset(), true))
                 .build()) {
             if (handle != null) handle.running.add(judge);
             try {
                 // 带署名历史经 MultiAgentFormatter 合并为 <history>，thinking 模型下不会因裸 assistant 轮 400；
                 // 结构化输出由框架适配端点能力：原生 response_format 失败自动降级为工具式输出
-                Msg decision = judge.call(moderatorInput(conv, pool, strict), ModeratorDecision.class)
+                Msg decision = judge.call(orchestratorInput(conv, pool, strict), ModeratorDecision.class)
                         .takeUntilOther(handle.cancelSignal())
                         .block(SELECT_TIMEOUT);
                 if (handle != null && handle.stopRequested.get()) {
@@ -847,24 +989,35 @@ public class ChatStreamService {
             if (handle == null || !handle.stopRequested.get()) {
                 String err = e.getMessage() == null ? e.toString() : e.getMessage();
                 appLogs.record(AppLog.TYPE_DISCUSSION, conv.getId(), null,
-                        "主持人决策失败（" + ellipsis(err, 200) + "），讨论保险结束");
+                        "编排器决策失败（" + ellipsis(err, 200) + "），讨论保险结束");
             }
             return null;
         }
     }
 
-    /** 解析主持人回复：结构化数据优先；模型偶尔不调结构化工具、直接文字回答，用原文兜底匹配成员名 */
+    /** 解析编排器回复：结构化数据优先；模型偶尔不调结构化工具、直接文字回答，用原文兜底匹配成员名 */
     private ModeratorPick parsePick(Msg decision, List<Agent> pool) {
         if (decision != null && decision.hasStructuredData()) {
-            String name = String.valueOf(decision.getStructuredData(ModeratorDecision.class).getSpeaker()).trim();
+            ModeratorDecision data = decision.getStructuredData(ModeratorDecision.class);
+            String name = data.getSpeaker() == null ? "" : data.getSpeaker().trim();
             // 全等判定：名字里恰好带「结束/END」子串的成员（如「终结者END」）不能被误判为讨论结束
             if ("END".equalsIgnoreCase(name) || "结束".equals(name)) {
                 return ModeratorPick.end();
             }
-            if (!name.isEmpty()) {
-                Agent next = matchSpeaker(name, pool);
-                return next != null ? ModeratorPick.of(next) : ModeratorPick.unparsed(name);
+            Agent next = name.isEmpty() ? null : matchSpeaker(name, pool);
+            String altName = data.getAlternate() == null ? "" : data.getAlternate().trim();
+            Agent alt = altName.isEmpty() ? null : matchSpeaker(altName, pool);
+            if (alt != null && alt.equals(next)) {
+                alt = null; // 备选与首选相同等于没备选
             }
+            if (next == null && alt != null) {
+                // 首选没给出或匹配不上、备选有效：备选直接顶上
+                return ModeratorPick.of(alt, null);
+            }
+            if (next != null) {
+                return ModeratorPick.of(next, alt);
+            }
+            return ModeratorPick.unparsed(name);
         }
         if (decision != null) {
             String text = decision.getTextContent();
@@ -872,7 +1025,7 @@ public class ChatStreamService {
                 // 成员名优先于结束关键词：宁可多聊一轮，也不把提及成员的结束语误判成收场
                 Agent next = matchSpeaker(text.trim(), pool);
                 if (next != null) {
-                    return ModeratorPick.of(next);
+                    return ModeratorPick.of(next, null);
                 }
                 if (text.toLowerCase().contains("end") || text.contains("结束")) {
                     return ModeratorPick.end();
@@ -883,24 +1036,26 @@ public class ChatStreamService {
         return ModeratorPick.unparsed(null);
     }
 
-    /** 主持人单次决策的解析结果：next=选中成员；ended=明确判定结束；两者皆空=无法解析（raw 为模型原答） */
-    private record ModeratorPick(Agent next, boolean ended, String raw) {
-        static ModeratorPick of(Agent next) {
-            return new ModeratorPick(next, false, null);
+    /** 编排器单次决策的解析结果：next=首选成员；alternate=备选（供 7:3 加权随机）；ended=明确判定结束；
+     * 两者皆空=无法解析（raw 为模型原答） */
+    private record ModeratorPick(Agent next, Agent alternate, boolean ended, String raw) {
+        static ModeratorPick of(Agent next, Agent alternate) {
+            return new ModeratorPick(next, alternate, false, null);
         }
 
         static ModeratorPick end() {
-            return new ModeratorPick(null, true, null);
+            return new ModeratorPick(null, null, true, null);
         }
 
         static ModeratorPick unparsed(String raw) {
-            return new ModeratorPick(null, false, raw);
+            return new ModeratorPick(null, null, false, raw);
         }
     }
 
-    /** 主持人的结构化决策输出：speaker 填下一位发言人名字，END/空 表示讨论结束 */
+    /** 编排器的结构化决策输出：speaker 填首选发言人名字（END/空 表示讨论结束），alternate 填备选名字 */
     public static class ModeratorDecision {
         private String speaker;
+        private String alternate;
 
         public String getSpeaker() {
             return speaker;
@@ -908,6 +1063,14 @@ public class ChatStreamService {
 
         public void setSpeaker(String speaker) {
             this.speaker = speaker;
+        }
+
+        public String getAlternate() {
+            return alternate;
+        }
+
+        public void setAlternate(String alternate) {
+            this.alternate = alternate;
         }
     }
 
@@ -932,16 +1095,19 @@ public class ChatStreamService {
         return found;
     }
 
-    /** 主持人的输入：带署名的群聊历史 + 绕过合并的选人指令；strict=重试时强调必须按字段作答 */
-    private List<Msg> moderatorInput(Conversation conv, List<Agent> pool, boolean strict) {
-        List<Msg> msgs = new ArrayList<>(support.historyMsgs(conv.getId(), memberNames(conv)));
+    /** 编排器的输入：带署名的群聊历史 + 绕过合并的选人指令（末尾附发言统计行）；strict=重试时强调必须按字段作答 */
+    private List<Msg> orchestratorInput(Conversation conv, List<Agent> pool, boolean strict) {
+        List<Msg> history = support.historyMsgs(conv.getId(), memberNames(conv));
+        List<Msg> msgs = new ArrayList<>(history);
         String members = pool.stream().map(Agent::getName).collect(Collectors.joining("、"));
-        String ask = "请根据以上记录决定下一位发言人，重点看最近几条消息："
-                + "有成员的发言是在向其他人提问或期待回应的，优先填被提到的那位；"
-                + "最新的用户消息或成员发言还没被实质回应时，填能接住话的成员，不要填 END；"
-                + "只有最近的话都已回应、没有悬而未决的提问，才填 END。可选成员：" + members;
+        String ask = "请根据以上记录决定下一位发言人：speaker 填首选成员，alternate 填一个不同的备选成员。"
+                + "上下文关联度优先——被提问、被点名或发言里明确期待回应的成员排前面；"
+                + "同时参考发言统计，关联度相近时把机会让给发言少的成员，不要让同样两三个人包办整场讨论；"
+                + "最新的用户消息或成员发言还没被实质回应时，不要填 END；"
+                + "只有最近的话都已回应、没有悬而未决的提问，才填 END（alternate 留空）。可选成员：" + members
+                + "。" + speakStatsLine(history, pool);
         if (strict) {
-            ask += "。注意：必须通过工具在 speaker 字段填入结果，不要用普通文字回答";
+            ask += "。注意：必须通过工具在 speaker/alternate 字段填入结果，不要用普通文字回答";
         }
         msgs.add(instruction(ask));
         return msgs;
@@ -953,25 +1119,24 @@ public class ChatStreamService {
                 .orElse(false);
     }
 
-    private String moderatorPrompt(List<Agent> pool) {
+    private String orchestratorPrompt(List<Agent> pool) {
         String names = pool.stream().map(Agent::getName).collect(Collectors.joining("、"));
-        return "你是群聊主持人，负责决定下一个发言的成员。自由讨论里，成员之间互相提问、接话与观点交锋，"
-                + "和回应用户的最新消息同样重要。根据群聊记录判断："
-                + "优先看最近的发言——最新消息（无论来自用户还是成员）还没被实质回应、有成员被提问或被期待跟进但还没回答、"
-                + "或有明确的实质性内容需要补充，在 speaker 字段填他的名字；"
-                + "只有当最近的这些话都已得到回应、没有悬而未决的提问、再发言只会是客套与重复时，才在 speaker 字段填 END；"
+        return "你是群聊的编排器：一个不参与讨论、不出现在群成员名单里的虚拟角色，职责是每轮选出下一位发言人，"
+                + "让讨论既贴合话题走向，又不让任何人被晾在一边。综合两个因素排序："
+                + "一、上下文关联度——被提问、被点名、发言里明确期待回应或能自然接住话头的成员优先；"
+                + "二、发言次数——输入末尾附有各成员发言统计，次数越少越应优先获得机会，"
+                + "关联度相近时把机会让给发言更少的成员；不要让同样两三个人包办整场讨论，也不要选刚发言的成员。"
+                + "speaker 填首选成员名，alternate 填一个不同的备选成员名；"
+                + "只有话题聊尽、最近的话都已回应、再发言只会是客套与重复时，才在 speaker 填 END、alternate 留空；"
                 + "以往讨论中的话题聊完，不代表本轮讨论该结束。"
-                + "尽量不要连续选同一位成员，除非讨论明确需要他跟进。"
                 + "可选成员：" + names;
-    }
-
-    private boolean isOrchestrator(Agent a) {
-        return Boolean.TRUE.equals(a.getIsOrchestrator());
     }
 
     /** 一次回复回合的取消句柄：登记运行中的 ReActAgent，终止时用框架 interrupt 中断其流式循环 */
     private static final class RunHandle {
         final AtomicBoolean stopRequested = new AtomicBoolean(false);
+        /** 用户插话（回复进行中收到的新消息）：回合尾消费，以它为新触发开子回合；置位/消费以本对象为锁互斥 */
+        final AtomicReference<Message> interjected = new AtomicReference<>();
         /** 本回合是否为自由讨论（终止时据此记运行日志） */
         boolean discussion;
         /** 定时任务回合标注：本轮所有落库消息继承任务来源 */

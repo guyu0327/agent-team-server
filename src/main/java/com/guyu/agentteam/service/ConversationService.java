@@ -104,14 +104,37 @@ public class ConversationService {
         for (String agentId : req.memberIds()) {
             agents.findById(agentId).orElseThrow(() -> ApiException.badRequest("智能体不存在: " + agentId));
         }
+        List<String> ids = req.memberIds().stream().distinct().toList();
         long now = System.currentTimeMillis();
         Conversation c = newConversation(userId, "group", CATEGORY_CHAT,
                 req.name() == null ? "" : req.name().trim());
         c.setChatMode(validateMode(req.chatMode()));
-        for (String agentId : req.memberIds().stream().distinct().toList()) {
+        // 编排者是会话角色：必须在群成员中；不传即未设置（被动模式下全员依次回复，运行时随时可换）
+        String hostId = req.hostAgentId() == null || req.hostAgentId().isBlank() ? null : req.hostAgentId().trim();
+        if (hostId != null && !ids.contains(hostId)) {
+            throw ApiException.badRequest("编排者必须在群成员中");
+        }
+        c.setHostAgentId(hostId);
+        for (String agentId : ids) {
             members.save(new ConversationMember(c.getId(), agentId, now));
         }
         return toDto(c);
+    }
+
+    /** 设置/更换群聊编排者（会话角色）：传空串/null 表示清除，回到全员依次回复 */
+    @Transactional
+    public void setHost(String id, String agentId) {
+        Conversation c = getEntity(id);
+        if (!"group".equals(c.getType())) {
+            throw ApiException.badRequest("仅群聊支持设置编排者");
+        }
+        String trimmed = agentId == null ? "" : agentId.trim();
+        if (!trimmed.isEmpty() && !memberIds(id).contains(trimmed)) {
+            throw ApiException.badRequest("编排者必须在群成员中");
+        }
+        c.setHostAgentId(trimmed.isEmpty() ? null : trimmed);
+        c.setUpdatedAt(System.currentTimeMillis());
+        conversations.save(c);
     }
 
     @Transactional
@@ -183,6 +206,10 @@ public class ConversationService {
     public Map<String, Object> removeMember(String id, String agentId) {
         Conversation c = getEntity(id);
         members.findById(new ConversationMemberId(id, agentId)).ifPresent(members::delete);
+        // 编排者是会话角色且必须在成员中：被移出即视为未设置，避免悬空
+        if (agentId != null && agentId.equals(c.getHostAgentId())) {
+            c.setHostAgentId(null);
+        }
         c.setUpdatedAt(System.currentTimeMillis());
         conversations.save(c);
         if (memberIds(id).isEmpty()) {
@@ -279,10 +306,15 @@ public class ConversationService {
         }
         String name = c.getName();
         String chatMode = c.getChatMode();
+        String hostId = c.getHostAgentId();
         List<String> memberIds = memberIds(id);
         archive(id);
         Conversation fresh = newConversation(c.getUserId(), "group", CATEGORY_CHAT, name);
         fresh.setChatMode(validateMode(chatMode));
+        // 编排者仍在新群成员中原样保留
+        if (hostId != null && memberIds.contains(hostId)) {
+            fresh.setHostAgentId(hostId);
+        }
         long now = System.currentTimeMillis();
         for (String agentId : memberIds) {
             members.save(new ConversationMember(fresh.getId(), agentId, now));
@@ -319,7 +351,7 @@ public class ConversationService {
         return new ConversationDto(c.getId(), c.getType(),
                 c.getCategory() == null ? CATEGORY_CHAT : c.getCategory(),
                 c.getName() == null ? "" : c.getName(), agentId,
-                ids, c.getChatMode() == null ? "passive" : c.getChatMode(), c.isPinned(),
+                ids, c.getChatMode() == null ? "passive" : c.getChatMode(), c.getHostAgentId(), c.isPinned(),
                 c.getLastMessage() == null ? "" : c.getLastMessage(),
                 c.getLastMessageAt(), unread, c.getArchivedAt(), c.getChannel(), c.getWechatPeer(), c.getQqPeer(),
                 c.getQqKind());

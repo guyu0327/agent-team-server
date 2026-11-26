@@ -239,6 +239,8 @@ public class ConversationStreamSupport {
 
     private static final class ConvRoundState {
         volatile String coordinator;
+        /** 协调横幅模式（coordination_start 携带）：task=单聊执行任务 / team=团队协作 */
+        volatile String coordinationMode;
         /** 即将发言的成员（reply_pending 思考窗口）：重放缺失会让思考条在切页重连后凭空消失 */
         volatile String pendingAgent;
         volatile boolean discussing;
@@ -303,8 +305,16 @@ public class ConversationStreamSupport {
                     st.pendingAgent = null;
                 }
             }
-            case "coordination_start" -> st.coordinator = String.valueOf(p.get("agentId"));
-            case "coordination_end" -> st.coordinator = null;
+            case "coordination_start" -> {
+                st.coordinator = String.valueOf(p.get("agentId"));
+                // 旧快照/缺省回退 team：群聊协作横幅保持原样，只有单聊执行任务需要区分
+                Object mode = p.get("mode");
+                st.coordinationMode = mode != null ? String.valueOf(mode) : "team";
+            }
+            case "coordination_end" -> {
+                st.coordinator = null;
+                st.coordinationMode = null;
+            }
             case "discussion_start" -> st.discussing = true;
             case "discussion_end" -> st.discussing = false;
             default -> { /* user_message / conversation_created / image_* 无需跟踪 */ }
@@ -356,7 +366,8 @@ public class ConversationStreamSupport {
             }
             if (st.coordinator != null) {
                 emitter.send(SseEmitter.event().name("coordination_start").data(
-                        Map.of("agentId", st.coordinator, "conversationId", conversationId),
+                        Map.of("agentId", st.coordinator, "conversationId", conversationId,
+                                "mode", st.coordinationMode != null ? st.coordinationMode : "team"),
                         MediaType.APPLICATION_JSON));
             }
             if (st.discussing) {
@@ -1008,6 +1019,8 @@ public class ConversationStreamSupport {
         public final Map<String, StringBuilder> toolArgBuf = new ConcurrentHashMap<>();
         /** 已开启的段数（含进行中），用于判断整次回复是否完全空白；跨线程读写需 volatile */
         public volatile int opened;
+        /** 消息分隔符扫描进度（累积文本内已查过的位置）：delta 逐笔流入时避免整段重扫 */
+        public int markerScanned;
     }
 
     /** 落库的思考过程上限：纯回看用途，超出截断防止单条消息过大 */
@@ -1050,6 +1063,10 @@ public class ConversationStreamSupport {
         if (m == null) return;
         String content = seg.text.getAccumulated();
         seg.text.reset();
+        // 末尾未触发的消息分隔符（其后无内容、切分未发生）剥离，不原样进正文；仅字数限制开启的智能体剥离
+        if (lengthLimited(agent)) {
+            content = stripTrailingMarker(content);
+        }
         // 无论本段是否空白都取走思考缓冲，避免残留进下一段
         m.setThinking(drainThinking(seg.thinking));
         if (content.isBlank()) {
@@ -1077,6 +1094,120 @@ public class ConversationStreamSupport {
         if (toolActivity != null) payload.put("toolActivity", toolActivity);
         if (m.getThinking() != null) payload.put("thinking", m.getThinking());
         send(emitter, "reply_end", payload);
+    }
+
+    /** 消息分隔符：独立成行的 ---（提示词要求模型用它把长内容拆成多条消息） */
+    private static final String SPLIT_MARKER = "---";
+
+    /**
+     * 单条回复字数提示（提示词软引导，非硬截断）：max≤0 视为不限制、返回空串不注入。
+     * withSplit=true 时附带「多条消息」教学（流式侧 splitSegmentOnMarker 据此切分落库）；
+     * 不支持切分的链路（如委派成员的单占位消息回合）传 false，避免教了分隔符却切不动、原样漏进正文。
+     */
+    public static String replyLengthHint(Agent agent, boolean withSplit) {
+        int min = agent.getReplyMinChars() == null ? 0 : agent.getReplyMinChars();
+        int max = agent.getReplyMaxChars() == null ? 120 : agent.getReplyMaxChars();
+        if (max <= 0) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("【回复字数】每条回复尽量");
+        if (min > 0) {
+            sb.append("控制在 ").append(min).append("～").append(max).append(" 字");
+        } else {
+            sb.append("控制在 ").append(max).append(" 字以内");
+        }
+        sb.append("，简明扼要、说清即止，不要长篇大论或总结式罗列");
+        if (withSplit) {
+            sb.append("；内容较多时分多条消息发送：在每条消息的结尾另起一行单独写 ---，下一条消息从新一行开始；")
+                    .append("--- 只用于分隔消息，不要作为正文里的分隔线使用");
+        }
+        sb.append("。");
+        return sb.toString();
+    }
+
+    /** 是否启用了回复字数限制（max≤0 未启用）：分隔符剥离等配套行为据此开关 */
+    public static boolean lengthLimited(Agent agent) {
+        return agent.getReplyMaxChars() != null && agent.getReplyMaxChars() > 0;
+    }
+
+    /**
+     * 流式分段：累积文本里出现独立成行的 --- 且其后还有非空内容时，把当前段以分隔符前的内容收尾，
+     * 再为同一智能体开启新段、把余量作为首笔 delta 移交（前端 reply_start/ delta / reply_end
+     * 本就支持一轮多气泡，工具分段即先例）。delta 逐笔调用：分隔符跨增量拼接也能在后续检查中命中；
+     * 分隔符后暂无内容时先不切（可能是末尾分隔符，由 closeSegment 剥离）。返回是否发生了切分。
+     */
+    public boolean splitSegmentOnMarker(SseEmitter emitter, Conversation conv, Agent agent,
+                                        SegState seg, TaskTag tag) {
+        if (seg.msg.get() == null) {
+            return false;
+        }
+        String acc = seg.text.getAccumulated();
+        int lineStart = findMarkerLine(acc, seg.markerScanned);
+        if (lineStart < 0) {
+            seg.markerScanned = Math.max(0, acc.length() - 4);
+            return false;
+        }
+        int lineEnd = acc.indexOf('\n', lineStart);
+        if (lineEnd < 0) {
+            lineEnd = acc.length();
+        }
+        String after = acc.substring(lineEnd).strip();
+        if (after.isEmpty()) {
+            return false;
+        }
+        String before = acc.substring(0, lineStart);
+        if (before.isBlank()) {
+            // 分隔符开头的正文（前段无内容）：直接吃掉分隔符，不开新段。
+            // 前面已流给前端的 delta 含分隔符残影，回填全量快照纠正（前端 replay 语义为替换而非追加）
+            seg.text.replace(after);
+            seg.markerScanned = 0;
+            send(emitter, "delta", Map.of(
+                    "messageId", seg.msg.get().getId(),
+                    "delta", after,
+                    "replay", true,
+                    "conversationId", conv.getId()));
+            return true;
+        }
+        seg.text.replace(before);
+        seg.markerScanned = 0;
+        closeSegment(emitter, conv, agent, seg);
+        openSegment(emitter, conv, agent, seg, tag);
+        seg.text.replace(after);
+        send(emitter, "delta", Map.of(
+                "messageId", seg.msg.get().getId(),
+                "delta", after,
+                "conversationId", conv.getId()));
+        return true;
+    }
+
+    /** 找独立成行的 ---（整行剥掉空白后恰好等于分隔符），返回该行起点；from 为扫描起点（小回退防跨增量漏检） */
+    private static int findMarkerLine(String s, int from) {
+        int search = Math.max(0, from - 4);
+        while (true) {
+            int idx = s.indexOf(SPLIT_MARKER, search);
+            if (idx < 0) {
+                return -1;
+            }
+            int lineStart = s.lastIndexOf('\n', idx) + 1;
+            int lineEnd = s.indexOf('\n', idx);
+            if (lineEnd < 0) {
+                lineEnd = s.length();
+            }
+            if (s.substring(lineStart, lineEnd).strip().equals(SPLIT_MARKER)) {
+                return lineStart;
+            }
+            search = idx + 1;
+        }
+    }
+
+    /** 收尾时剥掉正文末尾未触发的分隔符（其后无内容，切分未发生）：连同行后空白反复吞 */
+    private static String stripTrailingMarker(String s) {
+        String t = s.stripTrailing();
+        while (t.equals(SPLIT_MARKER) || t.endsWith("\n" + SPLIT_MARKER)) {
+            t = t.substring(0, t.length() - (SPLIT_MARKER.length() + (t.equals(SPLIT_MARKER) ? 0 : 1)))
+                    .stripTrailing();
+        }
+        return t;
     }
 
     /**

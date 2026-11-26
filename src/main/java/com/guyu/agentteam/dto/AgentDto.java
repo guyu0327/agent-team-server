@@ -6,15 +6,18 @@ import java.util.Arrays;
 import java.util.List;
 
 public record AgentDto(String id, String name, String avatar, String groupName, String description,
-                       String presetId, String imagePresetId, boolean isOrchestrator, String systemPrompt,
-                       Double temperature, List<String> skillIds) {
+                       String presetId, String imagePresetId, String systemPrompt,
+                       Double temperature, List<String> skillIds,
+                       Integer replyMinChars, Integer replyMaxChars) {
 
     public static AgentDto from(Agent a) {
         return new AgentDto(a.getId(), a.getName(), a.getAvatar(), a.getGroupName(), a.getDescription(),
                 a.getPresetId() == null ? "" : a.getPresetId(),
                 a.getImagePresetId() == null ? "" : a.getImagePresetId(),
-                Boolean.TRUE.equals(a.getIsOrchestrator()), a.getSystemPrompt(), a.getTemperature(),
-                skillIdsOf(a));
+                a.getSystemPrompt(), a.getTemperature(),
+                skillIdsOf(a),
+                a.getReplyMinChars() == null ? 0 : a.getReplyMinChars(),
+                a.getReplyMaxChars() == null ? 120 : a.getReplyMaxChars());
     }
 
     /** 逗号分隔存储转列表；空白返回空列表 */

@@ -6,8 +6,10 @@ import com.guyu.agentteam.dto.AddMembersRequest;
 import com.guyu.agentteam.dto.AskAnswerRequest;
 import com.guyu.agentteam.dto.ConversationDto;
 import com.guyu.agentteam.dto.FileGrantDto;
+import com.guyu.agentteam.dto.HostRequest;
 import com.guyu.agentteam.dto.OpGrantDto;
 import com.guyu.agentteam.dto.GroupChatRequest;
+import com.guyu.agentteam.dto.MessageDto;
 import com.guyu.agentteam.dto.MessagePageDto;
 import com.guyu.agentteam.dto.ModeRequest;
 import com.guyu.agentteam.dto.NameRequest;
@@ -108,6 +110,13 @@ public class ConversationController {
         conversationService.setMode(id, req.mode());
     }
 
+    /** 群聊编排者（会话角色）：agentId 为空串/null 表示清除，回到全员依次回复 */
+    @PutMapping("/{id}/host")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void setHost(@PathVariable String id, @RequestBody HostRequest req) {
+        conversationService.setHost(id, req.agentId());
+    }
+
     @PostMapping("/{id}/read")
     public ConversationDto markRead(@PathVariable String id) {
         return conversationService.markRead(id);
@@ -192,6 +201,9 @@ public class ConversationController {
     /**
      * 发送消息并流式接收智能体回复。SSE 事件：
      * user_message / reply_start / delta / reply_end / reply_error / done
+     * 上一轮还在跑时发送 = 插话：消息立即落库并扇出给观察者（气泡即时可见），本请求只回执
+     * user_message+done 立即结束；进行中的成员说完手头回复后剩余原计划作废，以插话为新触发继续
+     * （单聊接着回，被动群聊按插话重新选人，自由讨论由编排器重新选人）。
      */
     @PostMapping(value = "/{id}/messages", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter send(@PathVariable String id, @RequestBody SendRequest req) {
@@ -205,11 +217,6 @@ public class ConversationController {
         if ("wechat".equals(conv.getChannel())) {
             throw ApiException.badRequest("微信会话请在微信中继续对话");
         }
-        // 前端仅禁用同会话发送中连发，刷新页面/多窗口后仍可重发；任务触发轮与桌面轮
-        // 也靠这里互斥——服务端必须兜底，否则两轮交错且停止句柄被覆盖
-        if (chatStreamService.isRunning(id)) {
-            throw ApiException.badRequest("上一轮回复尚未结束，请稍候再发");
-        }
         long now = System.currentTimeMillis();
         // 附件全部校验通过才继续：任何一个路径无效都直接拒绝，避免半发送状态
         List<ConversationFileGrant> grants = paths.stream()
@@ -220,7 +227,22 @@ public class ConversationController {
         }
         Message userMsg = messageService.createUserMessage(conv, hasContent ? req.content().trim() : "", grants);
         SseEmitter emitter = new SseEmitter(0L);
-        chatStreamService.stream(emitter, conv, userMsg);
+        boolean started = chatStreamService.stream(emitter, conv, userMsg);
+        boolean interjected = false;
+        while (!started && !interjected) {
+            // 上一轮还在跑：转为插话。置位失败即回合恰好结束 → 改开新轮（消息已落库不会重复落库），
+            // 若又撞上新开轮则回到插话尝试——两个后台级竞态叠加才会循环，实际一次即中
+            if (chatStreamService.requestInterject(id, userMsg)) {
+                interjected = true;
+            } else {
+                started = chatStreamService.stream(emitter, conv, userMsg);
+            }
+        }
+        if (interjected) {
+            // 插话受理：消息实时扇出给观察者（其他窗口/任务扇出订阅即时可见），本请求即刻回执结束
+            streamSupport.broadcastToWatchers(id, "user_message", MessageDto.from(userMsg));
+            chatStreamService.acknowledgeInterject(emitter, userMsg);
+        }
         return emitter;
     }
 
@@ -258,6 +280,12 @@ public class ConversationController {
     @DeleteMapping("/{id}/op-grants/{opType}")
     public Map<String, Object> revokeOpGrant(@PathVariable String id, @PathVariable String opType) {
         return Map.of("revoked", opApproval.revokeGrant(id, opType));
+    }
+
+    /** 手动开启本会话某类工具授权（工具授权弹层开关）：等同审批卡「本会话允许」，开启后同类操作不再弹卡 */
+    @PutMapping("/{id}/op-grants/{opType}")
+    public Map<String, Object> grantOp(@PathVariable String id, @PathVariable String opType) {
+        return Map.of("granted", opApproval.grantDirectly(id, opType));
     }
 
     /** 提问卡片回答：answer 为所选项文本或「其他」自由输入；applied=false 表示问题已超时失效 */

@@ -29,6 +29,8 @@ public class Conversation {
     private String qqKind;
     /** 聊天模式：passive（默认）| free，仅群聊有意义 */
     private String chatMode;
+    /** 群聊编排者（会话角色，不再绑定智能体全局身份）：被动模式由他协调，谁拉群谁默认是编排者；空=未设置，全员依次回复 */
+    private String hostAgentId;
     private boolean pinned;
     private String lastMessage;
     private Long lastMessageAt;

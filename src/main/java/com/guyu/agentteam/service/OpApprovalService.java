@@ -208,6 +208,28 @@ public class OpApprovalService {
                 .toList();
     }
 
+    /** 手动开启某类工具授权（前端「工具授权」开关打开）：等同审批卡「本会话允许」，落库后同类操作不再弹卡；opType 非法返回 false */
+    public boolean grantDirectly(String conversationId, String opType) {
+        if (!isKnownOp(opType)) {
+            return false;
+        }
+        if (grants.existsById(new OperationGrantId(conversationId, opType))) {
+            return true;
+        }
+        grants.save(new OperationGrant(conversationId, opType, System.currentTimeMillis()));
+        appLogs.record(AppLog.TYPE_OP_DECISION, conversationId, null,
+                "「手动授权」" + opTypeName(opType) + "，本会话同类操作自动放行");
+        return true;
+    }
+
+    private static boolean isKnownOp(String opType) {
+        return switch (opType == null ? "" : opType) {
+            case OperationGrant.OP_WRITE, OperationGrant.OP_EDIT, OperationGrant.OP_SHELL,
+                    OperationGrant.OP_BROWSER, OperationGrant.OP_COMPUTER -> true;
+            default -> false;
+        };
+    }
+
     /** 撤销该会话某一类工具授权（审批判定每次调用实时查库，撤销即时生效）；返回是否确有此授权 */
     @org.springframework.transaction.annotation.Transactional
     public boolean revokeGrant(String conversationId, String opType) {

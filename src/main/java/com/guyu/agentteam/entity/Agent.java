@@ -23,12 +23,13 @@ public class Agent {
     private String presetId;
     /** 可选关联的图像预设（文生图类），绑定的智能体才注册 generate_image 工具 */
     private String imagePresetId;
-    /** 为 true 时在聊天中作为团队编排者运行 AgentScope ReAct 循环 */
-    private Boolean isOrchestrator;
     /** 启用的技能 ID（skill 目录名），逗号分隔；空串=未启用任何技能 */
     private String skillIds = "";
     private String systemPrompt;
     private Double temperature;
+    /** 单条回复字数范围（提示词软引导，非硬截断）：min 0=不限下限；max≤0=不限不注入；默认 0–120 */
+    private Integer replyMinChars = 0;
+    private Integer replyMaxChars = 120;
     private Long createdAt;
     private Long updatedAt;
 }

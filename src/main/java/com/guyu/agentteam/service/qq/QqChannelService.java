@@ -475,19 +475,15 @@ public class QqChannelService {
             logQq(conv.getId(), "发送者 " + shortId(sender) + " 非机主，本回合禁用一切工具，仅纯聊天");
         }
         long deadline = System.currentTimeMillis() + s.roundTimeoutMinutes() * 60_000L;
-        // 与定时任务相同的重入保护：上一轮未结束先等空闲，避免两轮流交错
-        while (stream.isRunning(conv.getId()) && System.currentTimeMillis() < deadline) {
-            sleepQuiet(500);
-        }
-        // 后台回合：无人盯审批，机主回合按通道配置自动放行或立即拒绝（默认都不放行）；
-        // 浏览器与键鼠操控始终不放行（autoBrowser=false），QQ 侧不提供电脑操控入口
-        stream.stream(new ConversationStreamSupport.Broadcast(conv.getId()), conv, userMsg,
+        // 与定时任务相同的重入保护：上一轮未结束先等空闲，避免两轮流交错。
+        // 开轮为 putIfAbsent 原子占位：等待空闲后仍撞上新回合的极小竞态里，等空闲再试
+        while (!stream.stream(new ConversationStreamSupport.Broadcast(conv.getId()), conv, userMsg,
                 new ConversationStreamSupport.TaskTag(null, null, s.autoWrite() && operator, s.autoShell() && operator,
-                        false, false, !operator));
-        // 等回合真正开跑（executor 异步提交，isRunning 置位在任务线程里；超时兜底防卡死）
-        long startWait = System.currentTimeMillis();
-        while (!stream.isRunning(conv.getId()) && System.currentTimeMillis() - startWait < 10_000) {
-            sleepQuiet(100);
+                        false, false, !operator))
+                && System.currentTimeMillis() < deadline) {
+            while (stream.isRunning(conv.getId()) && System.currentTimeMillis() < deadline) {
+                sleepQuiet(500);
+            }
         }
         Pusher pusher = new Pusher(reply);
         // 出段即推：段落文本落库（=该段完整）就发给 QQ，不等回合结束（多智能体回合可拖几十秒）；
@@ -692,10 +688,10 @@ public class QqChannelService {
                 return a;
             }
         }
+        // 未指定处理智能体时取第一个（编排者已改为会话角色，不再有全局身份可优先）
         List<Agent> all = agents.findAll();
-        return all.stream().filter(a -> Boolean.TRUE.equals(a.getIsOrchestrator())).findFirst()
-                .orElseGet(() -> all.stream().findFirst()
-                        .orElseThrow(() -> ApiException.badRequest("请先创建至少一个智能体")));
+        return all.stream().findFirst()
+                .orElseThrow(() -> ApiException.badRequest("请先创建至少一个智能体"));
     }
 
     // ---------- 附件 ----------
